@@ -10,11 +10,17 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = ["cryptography==46.0.3"]
 
+[project.optional-dependencies]
+connector = ["trading-connector-library @ git+https://github.com/hzminhzz/trading-connector.git@ec3f03a5d24a2db3b0c75fe61e3a3fbfa662b343"]
+
 [dependency-groups]
 dev = ["pytest==8.4.2", "ruff==0.14.3", "mypy==1.18.2"]
 
 [project.scripts]
 prop-production = "prop_production.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/prop_production"]
