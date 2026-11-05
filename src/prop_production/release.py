@@ -33,7 +33,11 @@ class ReleaseFloor:
         if not initialize and not path.is_file():
             raise ValueError("MISSING_ROLLBACK_AUTHORITY")
         self.path = path
-        self.con = sqlite3.connect(path, timeout=0.1, isolation_level=None)
+        self.con = (sqlite3.connect(path, timeout=0.1, isolation_level=None) if initialize else
+                    sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True,
+                                    timeout=0.1, isolation_level=None))
+        if not initialize:
+            self.con.execute("PRAGMA query_only=ON")
         self.con.execute("PRAGMA synchronous=FULL")
         if initialize:
             self.con.execute("CREATE TABLE IF NOT EXISTS releases "
@@ -49,6 +53,13 @@ class ReleaseFloor:
         if row and (p["generation"] < row[0] or
                     (p["generation"] == row[0] and release.release_sha != row[1])):
             raise ValueError("RELEASE_ROLLBACK_OR_EQUIVOCATION")
+
+    def require_active(self, release: VerifiedRelease) -> None:
+        self.check(release)
+        row = self.con.execute("SELECT generation,sha FROM releases WHERE account=?",
+                               (release.payload["account_binding"],)).fetchone()
+        if row != (release.payload["generation"], release.release_sha):
+            raise ValueError("RELEASE_NOT_ACTIVATED")
 
     def accept(self, release: VerifiedRelease) -> None:
         self.con.execute("BEGIN IMMEDIATE")
