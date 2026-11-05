@@ -187,7 +187,9 @@ class FakeBroker:
                               gross * Decimal("0.1"), gross * self.maintenance_rate,
                               positions, orders, fills,
                               cutoff=f"fake-genesis-through-{self.__truth['epoch']}" if self.history_complete else None,
-                              history_complete=self.history_complete, connected=True, financial_complete=True)
+                              history_complete=self.history_complete, connected=True, financial_complete=True,
+                              market_marks=tuple((m, decimal(price), max(0, now_ms - self.stale_by_ms))
+                                                 for m, price in sorted(self.__truth["marks"].items())))
 
     def close(self) -> None:
         self.con.close()

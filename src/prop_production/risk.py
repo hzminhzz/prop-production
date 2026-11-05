@@ -199,7 +199,10 @@ def _size(pods: list[dict[str, Any]], quotes: dict[str, Any], markets: dict[str,
             pod_cost = sum((costs_by_market.get(m, ZERO) for m in pbounds), ZERO)
             pod_loss = _loss(pbounds, prices, policy["scenarios"]) + pod_cost
             pod_losses[name] = str(pod_loss)
-            if pod_loss > decimal(policy["pod_loss_budget"]):
+            used = decimal(finance.get("pod_loss_used", {}).get(name, "0"))
+            if used < 0:
+                raise ValueError("POD_BUDGET_ACCOUNTING_INVALID")
+            if pod_loss + used > decimal(policy["pod_loss_budget"]):
                 valid = False
                 reasons.add("POD_LOSS_BUDGET")
         if loss > limit:

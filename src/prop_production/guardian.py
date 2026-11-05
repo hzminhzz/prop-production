@@ -40,6 +40,14 @@ class Guardian:
                 or rules.sha != release.payload["rulebook_sha"]):
             raise ValueError("POLICY_BINDING")
         floor.require_active(release)
+        active = journal.snapshot().get("active_release_sha")
+        if active != release.release_sha:
+            def bind(s: State) -> None:
+                if active is not None:
+                    _halt(s, "RELEASE_CHANGED_REQUIRES_REVIEW")
+                s["active_release_sha"] = release.release_sha
+                s["runtime"]["permit"] = None
+            journal.update("BIND_RELEASE_DISARMED", 0, bind)
 
     def _boundary(self, name: str) -> None:
         if self.fault:
@@ -76,6 +84,15 @@ class Guardian:
             reasons.append("CAUSAL_CLOCK")
         if p["quote_sha"] != digest(quotes):
             reasons.append("QUOTE_BINDING")
+        for market, quote in quotes.items():
+            try:
+                mark = decimal(state.get("last_marks", {})[market])
+                if not decimal(quote["bid"]) <= mark <= decimal(quote["ask"]):
+                    raise ValueError("QUOTE_NOT_BROKER_MARK_BOUND")
+                if decimal(quote["ask"]) / decimal(quote["bid"]) > Decimal("1.01"):
+                    raise ValueError("SPREAD_OUTSIDE_ENVELOPE")
+            except (KeyError, ValueError, TypeError, ZeroDivisionError):
+                reasons.append("INDEPENDENT_MARKET_EVIDENCE_MISMATCH")
         if state["halts"]:
             reasons.extend(state["halts"])
         if state["runtime"]["certainty"] != "COHERENT":
@@ -101,7 +118,8 @@ class Guardian:
         if not reasons:
             pending = [{"market": i["market"], "remaining": str(decimal(i["quantity"]) - decimal(i["filled"]))}
                        for i in state["intents"].values() if i["status"] not in TERMINAL]
-            risk = size_book(p["pods"], quotes, self.markets, self.policy, state["finance"],
+            risk = size_book(p["pods"], quotes, self.markets, self.policy,
+                             dict(state["finance"], pod_loss_used=state.get("pod_loss_used", {})),
                              state["positions"], state["pod_positions"], pending, now_ms=now_ms)
             status = "PREVIEW" if risk["status"] == "ACCEPTED" else risk["status"]
             reasons.extend(risk["reasons"])
@@ -133,7 +151,8 @@ class Guardian:
             return list(record["intent_ids"])
         receipt = record["receipt"]
         reasons = self._scope(now_ms)
-        if (reasons or receipt["status"] != "PREVIEW" or state["halts"]
+        if (reasons or receipt["release_sha"] != self.release.release_sha
+                or receipt["status"] != "PREVIEW" or state["halts"]
                 or state["runtime"]["certainty"] != "COHERENT"
                 or receipt["broker_epoch"] != state["runtime"]["broker_epoch"]
                 or receipt["journal_epoch"] != state["runtime"]["boot_epoch"]
@@ -154,7 +173,7 @@ class Guardian:
             slip = decimal(self.policy["shortfall_bps"]) / 10000
             price = decimal(quote["ask"]) * (1 + slip) if quantity > 0 else decimal(quote["bid"]) * (1 - slip)
             tick = decimal(self.markets[market]["price_tick"])
-            price = (price / tick).to_integral_value(rounding=ROUND_CEILING if quantity > 0 else ROUND_FLOOR) * tick
+            price = (price / tick).to_integral_value(rounding=ROUND_FLOOR if quantity > 0 else ROUND_CEILING) * tick
             intent_id = digest({"account": state["account_binding"], "decision": decision_id,
                                 "market": market, "quantity": str(quantity)})
             changes = {pod: str(decimal(target.get(market, "0")) -
@@ -194,7 +213,8 @@ class Guardian:
         state = self.journal.snapshot()
         intent = state["intents"][intent_id]
         permit = state["runtime"]["permit"]
-        if (self._scope(now_ms) or state["halts"] or intent["status"] != "QUEUED"
+        if (self._scope(now_ms) or intent["release_sha"] != self.release.release_sha
+                or state["halts"] or intent["status"] != "QUEUED"
                 or not permit or self.gateway.synthetic is not True
                 or intent["boot_epoch"] != state["runtime"]["boot_epoch"]
                 or intent["broker_epoch"] != state["runtime"]["broker_epoch"]
@@ -269,6 +289,22 @@ class Guardian:
 
     def _reconcile_economics(self, state: State, snapshot: BrokerSnapshot, now_ms: int) -> None:
         errors = []
+        used = state.setdefault("pod_loss_used", {})
+        previous_marks = state.setdefault("last_marks", {})
+        marks = {m: price for m, price, _ in snapshot.market_marks}
+        for position in snapshot.positions:
+            if position.market in marks and marks[position.market] != position.mark_price:
+                errors.append("BROKER_MARK_CONFLICT")
+            marks[position.market] = position.mark_price
+        cash_debit = max(ZERO, decimal(state["finance"].get("cash", str(snapshot.cash))) - snapshot.cash) if snapshot.cash is not None else ZERO
+        # Charge every adverse move; gains never refill a pod budget during the day.
+        for pod, book in state["pod_positions"].items():
+            adverse = sum((max(ZERO, -decimal(q) * (marks[m] - decimal(previous_marks[m])))
+                           for m, q in book.items() if m in marks and m in previous_marks), ZERO)
+            if any(decimal(q) and m not in marks for m, q in book.items()):
+                errors.append("POD_MARK_UNKNOWN")
+            # Charging unexplained cash debits to every pod is intentionally conservative.
+            used[pod] = str(decimal(used.get(pod, "0")) + adverse + cash_debit)
         for fill in sorted(snapshot.fills, key=lambda f: (f.known_at_ms, f.execution_id)):
             body = {"execution_id": fill.execution_id, "intent_id": fill.intent_id, "market": fill.market,
                     "quantity": str(fill.quantity), "price": str(fill.price), "fee": str(fill.fee),
@@ -293,8 +329,11 @@ class Guardian:
             state["positions"][fill.market] = str(decimal(state["positions"].get(fill.market, "0")) + fill.quantity)
             for pod, change in intent.get("pod_changes", {}).items():
                 book = state["pod_positions"].setdefault(pod, {})
-                book[fill.market] = str(decimal(book.get(fill.market, "0"))
-                    + decimal(change) * fill.quantity / decimal(intent["quantity"]))
+                allocated = decimal(change) * fill.quantity / decimal(intent["quantity"])
+                book[fill.market] = str(decimal(book.get(fill.market, "0")) + allocated)
+                fee = fill.fee * abs(decimal(change) / decimal(intent["quantity"]))
+                execution_loss = max(ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price))
+                used[pod] = str(decimal(used.get(pod, "0")) + fee + execution_loss)
         known_orders: dict[str, BrokerOrder] = {}
         for order in snapshot.orders:
             if order.intent_id in known_orders and order != known_orders[order.intent_id]:
@@ -327,8 +366,14 @@ class Guardian:
         if observed != expected or len(observed) != len(snapshot.positions):
             errors.append("ORPHAN_POSITION")
         finance, finance_errors = account_step(state["finance"], snapshot, self.rules, now_ms)
+        previous_day = state["finance"].get("day")
         state["finance"] = finance
         errors.extend(finance_errors)
+        if any(decimal(amount) >= decimal(self.policy["pod_loss_budget"]) for amount in used.values()):
+            errors.append("POD_DAILY_STOP")
+        if previous_day is not None and finance.get("day") != previous_day:
+            state["pod_loss_used"] = {pod: "0" for pod in used}
+        previous_marks.update({m: str(price) for m, price in marks.items()})
         if errors:
             for reason in errors:
                 _halt(state, reason)

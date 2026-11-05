@@ -207,7 +207,8 @@ class Journal:
             target.close()
         os.chmod(destination, 0o600)
         return {"sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
-                "sequence": seq, "head": head, "account_binding": self._state["account_binding"]}
+                "sequence": seq, "head": head, "account_binding": self._state["account_binding"],
+                "release_sha": self._state.get("active_release_sha")}
 
     @staticmethod
     def restore(source: Path, destination: Path, proof: dict[str, Any]) -> None:
@@ -217,7 +218,8 @@ class Journal:
             raise StorageUnavailable("BACKUP_DIGEST_MISMATCH")
         restored = Journal.read(source)
         if (restored["sequence"] != proof["sequence"] or
-                restored["account_binding"] != proof["account_binding"]):
+                restored["account_binding"] != proof["account_binding"] or
+                restored.get("active_release_sha") != proof.get("release_sha")):
             raise StorageUnavailable("BACKUP_SCOPE_MISMATCH")
         src = sqlite3.connect(f"file:{source.resolve()}?mode=ro", uri=True)
         dst = sqlite3.connect(destination)
@@ -231,6 +233,9 @@ class Journal:
             dst.close()
             src.close()
         os.chmod(destination, 0o600)
+        # A historical backup is not proof of current HWM or broker history.
+        with Journal(destination, proof["account_binding"]) as recovered:
+            recovered.halt("RESTORE_REQUIRES_INDEPENDENT_HISTORY", 0)
 
     @staticmethod
     def read(path: Path) -> State:

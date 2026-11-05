@@ -23,7 +23,8 @@ def test_halt_finance_and_outbox_survive_restart(tmp_path):
         assert journal.verify()["integrity"] == "VERIFIED"
     Journal.restore(backup, tmp_path / "restored.sqlite", proof)
     with Journal(tmp_path / "restored.sqlite", "fixture-account") as restored:
-        assert restored.snapshot()["halts"] == ["MANUAL"]
+        assert restored.snapshot()["halts"] == ["MANUAL", "RESTORE_REQUIRES_INDEPENDENT_HISTORY"]
+        assert restored.snapshot()["runtime"]["permit"] is None
 
 
 def test_second_writer_lock_busy_and_failed_commit_never_authorize(tmp_path):

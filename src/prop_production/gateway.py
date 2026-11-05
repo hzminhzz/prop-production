@@ -59,14 +59,41 @@ class BrokerSnapshot:
     history_complete: bool = False
     connected: bool = False
     financial_complete: bool = False
+    market_marks: tuple[tuple[str, Decimal, int], ...] = ()
 
     def ready(self, now_ms: int, max_age_ms: int) -> bool:
         amounts = (self.cash, self.equity, self.unrealized,
                    self.initial_margin, self.maintenance_margin)
-        if any(v is None or not v.is_finite() for v in amounts):
+        if any(not isinstance(v, Decimal) or not v.is_finite() for v in amounts):
             return False
+        if any(type(v) is not int for v in (self.epoch, self.observed_at_ms, self.received_at_ms)):
+            return False
+        for market, price, known_ms in self.market_marks:
+            if (not market or not isinstance(price, Decimal) or not price.is_finite() or price <= 0
+                    or type(known_ms) is not int or not 0 <= self.observed_at_ms - known_ms <= 5000):
+                return False
+        for position in self.positions:
+            if (not position.market or any(not isinstance(v, Decimal) or not v.is_finite()
+                    for v in (position.quantity, position.entry_price, position.mark_price))
+                    or position.entry_price < 0 or position.mark_price <= 0):
+                return False
+        for order in self.orders:
+            if (not order.intent_id or not order.broker_id or not order.market
+                    or any(not isinstance(v, Decimal) or not v.is_finite()
+                           for v in (order.quantity, order.filled))
+                    or order.quantity == 0 or abs(order.filled) > abs(order.quantity)
+                    or order.filled * order.quantity < 0 or type(order.reduce_only) is not bool):
+                return False
+        for fill in self.fills:
+            if (not fill.execution_id or not fill.intent_id or not fill.market
+                    or any(not isinstance(v, Decimal) or not v.is_finite()
+                           for v in (fill.quantity, fill.price, fill.fee))
+                    or fill.quantity == 0 or fill.price <= 0 or fill.fee < 0
+                    or type(fill.known_at_ms) is not int or not 0 <= fill.known_at_ms <= self.observed_at_ms):
+                return False
         return bool(
-            self.connected and self.financial_complete and self.history_complete and self.cutoff
+            self.connected is True and self.financial_complete is True
+            and self.history_complete is True and isinstance(self.cutoff, str) and self.cutoff
             and self.epoch > 0
             and 0 <= self.observed_at_ms <= self.received_at_ms <= now_ms
             and now_ms - self.observed_at_ms <= max_age_ms
@@ -131,14 +158,16 @@ def snapshot_from_wire(raw: dict[str, Any]) -> BrokerSnapshot:
                           raw["received_at_ms"], raw["epoch"], amount("cash"), amount("equity"),
                           amount("unrealized"), amount("initial_margin"),
                           amount("maintenance_margin"), positions, orders, fills, raw["cutoff"],
-                          raw["history_complete"], raw["connected"], raw["financial_complete"])
+                          raw["history_complete"], raw["connected"], raw["financial_complete"],
+                          tuple((m, decimal(price), known) for m, price, known in raw.get("market_marks", [])))
 
 
 def fixture_snapshot(now_ms: int = 1000) -> BrokerSnapshot:
     return BrokerSnapshot("fixture-account", "fake://broker", now_ms, now_ms, 1,
                           Decimal("10000"), Decimal("10000"), Decimal("0"), Decimal("0"),
                           Decimal("0"), cutoff="fixture-cut-0", history_complete=True,
-                          connected=True, financial_complete=True)
+                          connected=True, financial_complete=True,
+                          market_marks=(("BTC", Decimal("10000"), now_ms), ("ETH", Decimal("1000"), now_ms)))
 
 
 async def inspect_propr_readonly(rest: Any, account_id: str, endpoint: str,
@@ -164,7 +193,7 @@ async def inspect_propr_readonly(rest: Any, account_id: str, endpoint: str,
         positions.append(Position(p.asset, qty, p.entry_price, p.mark_price))
     orders = tuple(BrokerOrder(o.intent_id or "", o.id, o.asset,
                                o.quantity if o.side == "buy" else -o.quantity,
-                               o.filled, str(o.status), bool(o.reduce_only))
+                               o.filled if o.side == "buy" else -o.filled, str(o.status), bool(o.reduce_only))
                    for o in inventory.orders)
     cash = (financial.equity - financial.unrealized_pnl
             if financial.equity is not None and financial.unrealized_pnl is not None else None)
