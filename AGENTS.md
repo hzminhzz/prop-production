@@ -10,6 +10,12 @@ Preserve other sessions' changes. Use isolated worktrees when upstream is dirty.
 
 Research metadata belongs to copytrade-pm SQLite. Provider protocol code belongs
 to trading-connector. Guardian account finance belongs to this application.
+Consume Propr read-only provider data exclusively through the versioned native
+evidence contract in connectors/propr/native_evidence.py via BrokerGateway. Never
+manufacture Guardian cash as equity minus unrealized PnL or treat matching REST
+snapshots as a coherent provider history cutoff. Preserve provider financial
+provenance, native identity, timestamps and RECONCILIATION_UNCERTAIN. No
+connector-owned journal may replace a Guardian-committed production intent.
 Planner cannot supply trusted broker equity, grant permits or access credentials.
 
 Default SHADOW / NO_TRADE. No real broker mutations, credentials, wallet identities,
@@ -19,7 +25,12 @@ owner authorization. A mode flag, test result or service restart never grants it
 
 ## Verification
 
-Use the locked install and verification commands in README. Test behavior through
+For this private program, GitHub Actions is not required. Use the commit-bound
+local verification script and acceptance contract in docs/LOCAL-VERIFICATION.md;
+require a clean reviewed revision and both pinned companion suites before a merge.
+Record exact commands, SHAs, counts, skips and reviewer. Never confuse a locally
+passing suite with an independent safety certificate or trading authorization.
+Test behavior through
 CLI, TargetBatchProposal -> DecisionReceipt -> durable intent -> BrokerGateway.
 Use exact decimal accounting; the Outside Judge must not import Guardian risk or
 finance functions as its oracle. Never do network I/O in a SQL transaction.
