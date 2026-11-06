@@ -14,7 +14,7 @@ UMask=0077
 EnvironmentFile=/etc/prop-production/observer.env
 Environment=PROP_OBSERVER_STATE=/var/lib/prop-production/observer
 Environment=PYTHONPATH=/opt/prop-production/connector
-ExecStart=/opt/prop-production/venv/bin/python -m prop_production.observer
+ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.observer
 Restart=always
 RestartSec=5
 TimeoutStopSec=10

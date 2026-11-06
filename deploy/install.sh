@@ -21,10 +21,22 @@ for role in runtime planner observer watchdog; do
         --shell /usr/sbin/nologin --gid prop "prop-$role"
 done
 
-# 2. Application venv from the reviewed commit's checkout.
+# 2. Release layout: build from the REVIEWED COMMIT, hash the artifact, install
+# to releases/<sha>/ and flip the current symlink atomically. Rollback = repoint.
+REVIEWED_SHA=$(git rev-parse HEAD)
 [ -d "$OPT" ] || mkdir -p "$OPT"
-[ -d "$OPT/venv" ] || python3 -m venv "$OPT/venv"
-"$OPT/venv/bin/pip" install --quiet "$REPO" python-dotenv httpx
+RELEASE_DIR="$OPT/releases/$REVIEWED_SHA"
+if [ ! -d "$RELEASE_DIR" ]; then
+    mkdir -p "$RELEASE_DIR"
+    git diff --quiet HEAD || { echo "REFUSING: dirty review tree"; exit 1; }
+    python3 -m venv "$RELEASE_DIR/venv"
+    "$RELEASE_DIR/venv/bin/pip" install --quiet "$REPO" python-dotenv httpx
+    git rev-parse HEAD > "$RELEASE_DIR/COMMIT"
+    (cd "$REPO" && git archive HEAD | sha256sum) > "$RELEASE_DIR/SOURCE.sha256"
+fi
+PREVIOUS_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
+ln -sfn "$RELEASE_DIR" "$OPT/current.new" && mv -T "$OPT/current.new" "$OPT/current"
+OPT_VENV="$OPT/current/venv"
 
 # 3. Pinned connector code for the observer (SHA recorded next to the copy).
 mkdir -p "$OPT/connector/connectors"
@@ -33,7 +45,7 @@ sha256sum "$CONNECTOR_SRC/connectors/propr/"*.py > "$OPT/connector/PIN.sha256"
 
 # 4. Fixture runtime initialization: requires a non-existent state root.
 if [ ! -e "$STATE" ]; then
-    "$OPT/venv/bin/python" -c "
+    "$OPT_VENV/bin/python" -c "
 from pathlib import Path
 from prop_production.worker import initialize_fixture
 print(initialize_fixture(Path('$STATE')))"
@@ -67,7 +79,7 @@ chmod 0640 "$STATE/trust/settings.json" 2>/dev/null || true
 chmod 0440 "$STATE/trust/floor.sqlite" 2>/dev/null || true
 # Migrate a pre-DELETE-mode floor (WAL sidecars needed shm write): checkpoint,
 # convert, then drop the sidecars so runtime read-only opens need zero writes.
-"$OPT/venv/bin/python" -c "
+"$OPT_VENV/bin/python" -c "
 import sqlite3
 con = sqlite3.connect('$STATE/trust/floor.sqlite', timeout=0.1, isolation_level=None)
 mode = con.execute('PRAGMA journal_mode').fetchone()[0]

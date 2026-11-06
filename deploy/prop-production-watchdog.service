@@ -10,7 +10,7 @@ User=prop-watchdog
 Group=prop
 UMask=0077
 Environment=PROP_STATE_ROOT=/var/lib/prop-production
-ExecStart=/opt/prop-production/venv/bin/python -m prop_production.watchdog
+ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.watchdog
 Restart=always
 RestartSec=5
 TimeoutStopSec=10
