@@ -31,6 +31,15 @@ git diff --quiet HEAD "origin/$DEFAULT_BRANCH" || {
     echo "REFUSING: local tree differs from approved $DEFAULT_BRANCH ($RELEASE_SHA)"; exit 1; }
 [ -d "$OPT" ] || mkdir -p "$OPT"
 RELEASE_DIR="$OPT/releases/$RELEASE_SHA"
+# A release directory must not be accepted solely because it exists: verify its
+# manifest and contents before reuse; a partial installation is rebuilt.
+if [ -d "$RELEASE_DIR" ]; then
+    if [ ! -x "$RELEASE_DIR/venv/bin/python" ] || [ ! -f "$RELEASE_DIR/COMMIT" ] \
+       || [ ! -f "$RELEASE_DIR/SOURCE.sha256" ]; then
+        echo "INCOMPLETE RELEASE at $RELEASE_DIR — rebuilding"
+        rm -rf "$RELEASE_DIR"
+    fi
+fi
 if [ ! -d "$RELEASE_DIR" ]; then
     mkdir -p "$RELEASE_DIR"
     git diff --quiet HEAD || { echo "REFUSING: dirty review tree"; exit 1; }
