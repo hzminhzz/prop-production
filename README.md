@@ -13,19 +13,22 @@ No live broker mutation route is installed or authorized.
 The Planner has no broker credentials. Only a separately isolated Guardian could
 hold financial mutation authority; this release provides zero-capital interfaces.
 
-## Reproduce
+## Reproduce and verify locally
 
-Python 3.13 or 3.14 and uv 0.12.15:
+GitHub Actions is optional and **not required** for this private VPS program.
+Python 3.13/3.14 and uv 0.12.15 are used. From a clean reviewed commit,
+verify the full application + two companion repositories:
 
 ```bash
-uv sync --frozen --group dev
-uv run --frozen prop-production status
-uv run --frozen prop-production smoke
-uv run --frozen pytest -q
-uv run --frozen ruff check src tests
-uv run --frozen mypy
-uv build --no-sources
+export PROP_RESEARCH_ROOT=/home/quant/.devspace/worktrees/copytrade-pm-dade3502
+export PROP_CONNECTOR_ROOT=/home/quant/.devspace/worktrees/trading-connector-829a9992
+bash scripts/verify-local.sh all
 ```
+
+Application-only checks: `bash scripts/verify-local.sh app`. These are
+**not** sufficient for cross-repository acceptance. See
+[local verification requirements](docs/LOCAL-VERIFICATION.md) for pin/clean
+checks, evidence logging and the fail-closed limits of passing tests.
 
 Invalid modes exit 2. Smoke data are synthetic and carry no profitability claim.
 

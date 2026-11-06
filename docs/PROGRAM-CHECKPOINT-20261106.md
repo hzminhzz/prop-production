@@ -16,14 +16,14 @@ This is an engineering checkpoint, **not** a release approval or completion cert
 - Application `uv run --frozen ruff check src tests`, `uv run --frozen mypy`, `uv build --no-sources`, `git diff --check`: passed after the verdict-label correction.
 - Connector pinned worktree: `.venv/bin/python -m pytest -q connectors/propr/tests` — **138 passed, 2 skipped**.
 - Research pinned worktree: `uv run --frozen --extra actuary --group dev pytest -q` — **1,068 passed, 12 skipped**; `uv run --frozen --group dev copytrade-pm capabilities validate` — **93 capabilities, 0 errors**.
-- GitHub Actions jobs on all three PR heads failed before any job steps; local checks do not establish green GitHub CI. Prior billing-lock diagnosis is consistent but requires external resolution.
+- GitHub Actions jobs on all three PR heads previously failed before job steps. **Superseded operator decision 2026-11-06:** remote Actions are optional for this private program. Local pinned checks, recorded under docs/LOCAL-VERIFICATION.md, are the engineering acceptance mechanism; the billing/startup issue is no longer a blocker. Any actual branch-protection requirement still applies.
 - Synthetic black-box Judge scenarios cover NORMAL, ACCEPT_THEN_TIMEOUT, OUT_OF_ENVELOPE. The extreme gap breaches the synthetic contract and now yields `NOT_EVALUATED`, not a bounded safety approval. These scenarios **do not** cover the required full fault/mutant matrix or create an independently signed G2 certificate.
 
 ## Issue disposition matrix
 
 | Issue | Implemented / verified evidence | Disposition and unmet acceptance |
 | --- | --- | --- |
-| #2 | Runnable credential-free shadow app, status/smoke, build and local test matrix | OPEN; fresh-machine and GitHub CI evidence incomplete |
+| #2 | Runnable credential-free shadow app, status/smoke, build and local test matrix | OPEN; fresh-machine repeatability and local verification evidence must be reviewed. GitHub Actions is no longer an acceptance requirement. |
 | #3 | Ed25519 signed release verifier, anti-rollback floor and negative tests | OPEN; complete approval/provenance review pending |
 | #4 | Pinned read-only research SQLite exporter and app's signed consumer fixture integration | OPEN; real source NAV/scope and final registry approval missing |
 | #5 | Single-writer SQLite FULL/WAL journal, replay, HALT, backup and fault tests | OPEN; complete long-reader/throughput/production storage fault matrix pending |
@@ -52,7 +52,7 @@ This is an engineering checkpoint, **not** a release approval or completion cert
 3. No protected production watchdog, independent service identities, root-installed `prop-production` systemd units, or complete operational rollback rehearsal was observed on the VPS. Existing copytrade research observers are not production execution workers.
 4. Real signed source account-wide NAV and position scope, exact authenticated provider rulebook and endpoint permissions, prospective executable follower tapes and independently certified risk envelopes remain missing.
 5. `BLOCKED_PAPER_ADMISSION`, `BLOCKED_ECONOMICS`, and G0–G4 `BLOCKED` are correct fail-closed outcomes. Green synthetic tests cannot promote them.
-6. GitHub Actions billing/job-startup blocker must be resolved without bypassing required PR protections. No PR was merged in this batch.
+6. GitHub Actions is optional and its startup/billing issue is **not a blocker** by owner decision. Preserve real branch protections, continue GitHub PR review and record local commit-bound verification. No PR was merged in this batch.
 
 ## Final boundary
 

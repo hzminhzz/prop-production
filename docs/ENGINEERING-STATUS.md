@@ -1,6 +1,7 @@
 # Engineering evidence and remaining gates
 
-This is an evolving program, not a readiness approval.
+This is a historical engineering status; see PROGRAM-CHECKPOINT-20261106.md
+for later commits and test counts. It is not a readiness approval.
 
 ## Published changes
 
@@ -23,8 +24,10 @@ This is an evolving program, not a readiness approval.
 
 ## External blockers
 
-- GitHub Actions run 42096201254 did not start: account locked due to a billing
-  issue. This is not green CI. Do not bypass protected checks.
+- Historical: GitHub Actions run 42096201254 did not start due to billing.
+  Effective 2026-11-06, the owner selected **local pinned verification** rather than
+  GitHub Actions; the billing issue is not an acceptance blocker. See
+  docs/LOCAL-VERIFICATION.md. Do not bypass actual branch protections.
 - Non-interactive sudo cannot authenticate. Separate root-provisioned service
   identities and protected system units have not been installed.
 - Real account terms, margin/lot evidence and provider coherence/demo semantics

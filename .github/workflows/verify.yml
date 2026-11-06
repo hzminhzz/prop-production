@@ -1,5 +1,7 @@
-name: verify
-on: [push, pull_request]
+# Optional manual diagnostics only; authoritative engineering checks run on the VPS.
+# This workflow is not a required gate and never auto-runs on push or PR.
+name: verify-manual
+on: workflow_dispatch
 permissions:
   contents: read
 jobs:

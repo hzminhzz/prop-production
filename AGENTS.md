@@ -19,7 +19,12 @@ owner authorization. A mode flag, test result or service restart never grants it
 
 ## Verification
 
-Use the locked install and verification commands in README. Test behavior through
+For this private program, GitHub Actions is not required. Use the commit-bound
+local verification script and acceptance contract in docs/LOCAL-VERIFICATION.md;
+require a clean reviewed revision and both pinned companion suites before a merge.
+Record exact commands, SHAs, counts, skips and reviewer. Never confuse a locally
+passing suite with an independent safety certificate or trading authorization.
+Test behavior through
 CLI, TargetBatchProposal -> DecisionReceipt -> durable intent -> BrokerGateway.
 Use exact decimal accounting; the Outside Judge must not import Guardian risk or
 finance functions as its oracle. Never do network I/O in a SQL transaction.
