@@ -2,11 +2,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 def test_missing_evidence_ci_green_and_ambiguous_beta_never_authorize():
+    from prop_production.compatibility import CONNECTOR_COMMIT
     from prop_production.qualification import demo_report, readiness
     demo = demo_report({"mode": "Beta Trial", "endpoint": "unknown"})
     assert demo["verdict"] == "BLOCKED_DEMO_PROVIDER"
     assert demo["mutations"] == 0
-    assert demo["connector_commit"] == "b28aa8522c51830a4b389a61b20ceb539b7a89ca"
+    assert demo["connector_commit"] == CONNECTOR_COMMIT
     result = readiness({}, {}, account_binding="fixture-account", release_sha="a" * 64,
                        engine_sha="b" * 64, now_ms=1000)
     assert all(g["verdict"] == "BLOCKED" for g in result["gates"].values())

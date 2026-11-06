@@ -13,7 +13,8 @@ UMask=0077
 # Credentials are injected by systemd from a root-only environment file.
 EnvironmentFile=/etc/prop-production/observer.env
 Environment=PROP_OBSERVER_STATE=/var/lib/prop-production/observer
-Environment=PYTHONPATH=/opt/prop-production/connector
+Environment=PYTHONPATH=/opt/prop-production/current/connector
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.observer
 Restart=always
 RestartSec=5

@@ -4,6 +4,10 @@
 
 Inspect Git status, remotes, worktrees and the current GitHub ticket before edits.
 Read `README.md`, then the owning module and its public behavioral tests.
+ChatGPT executes directly; do not delegate unless the user explicitly asks.
+Complete the OptMem wake pagination; use memory for durable navigation, then verify
+live GitHub, SQLite and OS evidence. The actual default branch is currently
+`feat/account-guardian-program`; recheck before publication.
 Preserve other sessions' changes. Use isolated worktrees when upstream is dirty.
 
 ## Authority
@@ -40,6 +44,11 @@ owner authorization. A mode flag, test result or service restart never grants it
 For this private program, GitHub Actions is not required. Use the commit-bound
 local verification script and acceptance contract in docs/LOCAL-VERIFICATION.md;
 require a clean reviewed revision and both pinned companion suites before a merge.
+`src/prop_production/compatibility.json` is the only companion/schema pin authority;
+package constraints, runtime bridge, verifier and deployment must agree with it.
+Read `docs/DEPLOYMENT-RUNBOOK.md` before protected installation. Bundle the app,
+connector and units together; use named compatible rollback and never rewind journals
+or the trust floor. The current symlink alone does not prove running process code.
 Record exact commands, SHAs, counts, skips and reviewer. Never confuse a locally
 passing suite with an independent safety certificate or trading authorization.
 Test behavior through

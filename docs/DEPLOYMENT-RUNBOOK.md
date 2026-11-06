@@ -1,101 +1,138 @@
-# Deployment and operations runbook — prop-production
+# Deployment and recovery — prop-production
 
-Last updated: 2026-11-06.
+## Authority and current state
 
-**Active release**: read `/opt/prop-production/current/COMMIT` (at last writing:
-`bd850c4` — docs-inclusive revision, merge lineage `73d8ce2` = PR #36 +
-installer corrections + release-manifest validation).
-**Rollback target**: the previous verified release — list
-`/opt/prop-production/releases/` and use the newest one other than active.
-The CLI is authoritative; prose SHAs here go stale the moment a release ships.
+The reviewed default branch is `feat/account-guardian-program`. Inspect GitHub's
+actual default branch before a release. The single
+[compatibility manifest](../src/prop_production/compatibility.json) binds companion
+commits and schemas; [local verification](LOCAL-VERIFICATION.md) binds that manifest
+to the containing application commit.
 
-## Terminology (do not conflate)
+`/opt/prop-production/current/COMMIT` identifies the selected installed artifact.
+It alone cannot prove which code a running PID loaded. Verify the complete bundle,
+service identity, process start and fresh role evidence. Dated checkpoint reports
+are historical; do not copy their account values or SHAs into this guide.
 
-- **Source commit** — the Git commit the release was built from.
-- **Git tree** — the content snapshot (`git rev-parse HEAD^{tree}`); two commits
-  may share a tree. The installer verifies trees, not just SHAs.
-- **Merge commit** — the approved commit on `feat/account-guardian-program` after
-  a PR merge. This is the release identity.
-- **Installed artifact digest** — the wheel's SHA-256, recorded in
-  `releases/<sha>/dist/SHA256SUMS` and verified before installation.
+Default SHADOW / DISARMED / NO_TRADE. A deployment never authorizes orders.
 
-## Deployed layout
+## Immutable bundle
 
-- Releases: `/opt/prop-production/releases/<merge-sha>/` — each contains
-  `venv/`, `dist/` (wheel + SHA256SUMS), `COMMIT`, `TREE`, `SOURCE.sha256`, `PINS`.
-- Active release: `/opt/prop-production/current` (symlink, flipped atomically).
-- Durable state (never inside a release): `/var/lib/prop-production/` —
-  `guardian/` (journal), `broker/`, `planner/`, `trust/` (settings + floor),
-  `observer/`, `watchdog/`, `health/{guardian,observer,watchdog}/` (role-owned
-  heartbeats, 0750 dirs, 0640 files).
-- Credentials: `/etc/prop-production/observer.env` (0600 root:root, injected via
-  systemd EnvironmentFile). Bybit uses a separate `/etc/prop-production/bybit.env`
-  (0600 root:root) copied only from the pre-existing dedicated Demo file. Never in Git or logs.
-- Bybit private state: `/var/lib/prop-production/bybit/`; heartbeat:
-  `/var/lib/prop-production/health/bybit/heartbeat.json` (role-owned, read-only to watchdog).
+New releases live at `/opt/prop-production/releases/<approved-commit>/` and contain:
 
-## Services
+| Artifact | Purpose |
+| --- | --- |
+| COMMIT / TREE / SOURCE.tar / SOURCE.sha256 | Exact approved Git identity and archived source |
+| source/ | Build source extracted from that Git object |
+| compatibility.json | Copy of the authoritative commit-bound contract manifest |
+| connector/ | Tracked connector source at the exact companion commit, including native SDK |
+| venv/ / dist/ | Non-editable frozen dependencies and built application wheel |
+| units/ | The six unit definitions that belong to this code bundle |
+| BUNDLE.json | Derived hashes, modes and symlink targets for the complete installed code set |
 
-| Unit | Runs as | Role |
-|---|---|---|
-| `prop-production-broker` | `prop-runtime` | synthetic SHADOW broker (socket server) |
-| `prop-production-guardian` | `prop-runtime` | Guardian worker + driver (reconcile cadence 4s) |
-| `prop-production-planner` | `prop-planner` | Planner worker |
-| `prop-production-observer` | `prop-observer` | read-only Propr `propr_native_evidence_v1` polling |
-| `prop-production-watchdog` | `prop-watchdog` | independent `watchdog_assessment_v2` evidence |
-| `prop-production-bybit-observer` | `prop-bybit` | separate Bybit Demo read-only account/position/order observation |
+Runtime provider PYTHONPATH points inside `current/connector`. No deployment
+mutates a shared connector directory. Older releases may still use the legacy
+shared directory; retain it until no service or rollback depends on it.
 
-Broker+Guardian share one uid by the IPC peer-credential contract — a deliberate
-temporary limitation; it does NOT establish acceptable isolation for future
-authenticated order execution.
+The bundle receipt is generated evidence, not a second configuration authority.
+Verification rejects changed/missing/added code, wrong commit, altered contracts,
+partial artifacts and an unavailable interpreter. Runtime bytecode caches are
+excluded from code identity. Root owns protected code and its resolved interpreter.
 
-## Operator commands
+## Protected installation
+
+Complete the clean commit-bound `bash scripts/verify-local.sh all` gate first.
+This operation requires root deployment authority and dedicated existing read-only
+provider credentials. If root access is unavailable, stop only the protected
+installation; continue source verification and retain the running release.
+
+From the exact merged application checkout, supply the clean pinned connector:
 
 ```bash
-# Status (authoritative, versioned JSON)
-sudo /opt/prop-production/current/venv/bin/python -m prop_production status \
-    --journal /var/lib/prop-production/guardian/account.sqlite
-
-# Emergency halt (audited)
-sudo ... -m prop_production halt --journal <path>
-
-# Evidence-gated recovery (operator + incident + evidence digest required)
-sudo ... -m prop_production recover BROKER_UNREACHABLE --journal <path> \
-    --operator <name> --incident <id> --evidence-sha <sha256-of-evidence>
-# BROKER_UNREACHABLE additionally requires a fresh guardian heartbeat with
-# certainty == COHERENT; the CLI derives the evidence digest from it.
-
-# Deploy a new release (from a checkout matching origin's default branch)
-sudo bash deploy/install.sh
-
-# Rollback: repoint and restart (journal and trust floor are never touched)
-sudo ln -sfn /opt/prop-production/releases/<old-sha> /opt/prop-production/current.new \
-  && sudo mv -T /opt/prop-production/current.new /opt/prop-production/current
-sudo systemctl restart prop-production-*
+sudo env PROP_CONNECTOR_ROOT=/absolute/path/to/pinned-trading-connector \
+  bash deploy/install.sh "$PWD"
 ```
 
-## Current operational state (2026-11-06)
+The installer fetches the approved default branch and requires exact HEAD equality
+and clean app/connector source. Fetch failures are fatal. It checks Demo/read-only
+credential scope without printing values, and requires a root-owned Python >=3.13.
+It archives Git objects, builds a non-editable frozen environment, verifies the
+bundle, and preserves the previous release before activation. An incomplete or
+changed existing release is preserved for inspection; it is not deleted or reused.
 
-- Watchdog: `OPERATIONAL_BUT_BLOCKED` — `market_status: UNKNOWN` (no market
-  source connected), guardian `COHERENT`, journal sequence advancing.
-- Observer: `propr_native_evidence_v1` live; account bound (`challenge`);
-  equity $4,999.225661 (`DERIVED_SDK_FORMULA`); `ledger_cash: UNKNOWN`;
-  `RECONCILIATION_UNCERTAIN`; `history_complete: false`; `opening_ready: false`.
-- Trading: **never authorized**. `trading_authorized: false` in every surface.
-  The connector mutation guard is intact; no real order route exists.
+The installer takes a deployment lock. Activation snapshots the previous pointer,
+unit bytes and active-service set to root-private recovery storage, then stops
+exactly the six listed services. It installs the candidate units, switches the
+pointer atomically, starts them, checks activity and requires fresh Guardian,
+Propr, Bybit and watchdog heartbeat files. A failed step restores the exact old
+pointer/unit set and starts only the previously active services. Financial journals
+and the monotonic trust floor are never rolled back.
 
-## Bybit Demo (additional read-only venue)
+The trust floor must already use DELETE journaling. Legacy WAL conversion is a
+separate reviewed offline migration; the installer never checkpoints inside a
+transaction, raw-copies a live WAL database, or deletes sidecars. Its pre-upgrade
+trust backup uses SQLite's online backup API and independent integrity checks.
 
-A sixth service, `prop-production-bybit-observer.service`, authenticates the dedicated Bybit Demo key and expected UID against `api-demo.bybit.com`, reads account USD equity/available buying power, supported live positions and open orders, and writes a separate private tape. No trades are sent. Watchdog `bybit_status=OBSERVED_READ_ONLY` means only a fresh authenticated bounded REST read; it does not prove a coherent cutoff, actual available cash, or execution readiness. Run the credential-free tests and protected single-observation smoke described in `docs/BYBIT-DEMO-INTEGRATION.md`.
+## Verification and rollback
 
-## Safety invariants
+Verify a named installed release using reviewed source:
 
-1. HALTs persist across restarts and midnight; only evidence-gated `recover`
-   clears them, and never into a falsely reconciled state.
-2. The trust floor is root-owned 0440; runtime opens it read-only (DELETE
-   journal mode). Only the deploy-time authority advances it.
-3. Cross-role heartbeat writes are impossible (verified: observer/planner cannot
-   write guardian evidence; guardian cannot write watchdog assessments).
-4. A failed trust migration aborts the install and preserves the previous
-   database; sidecars are removed only after proven success.
-5. Missing market/source evidence is never reported as healthy.
+```bash
+PYTHONPATH=src python3 -m prop_production.deployment verify \
+  /opt/prop-production/releases/APP_SHA --commit APP_SHA
+systemctl show prop-production-guardian.service \
+  -p User -p Group -p MainPID -p ActiveState -p SubState -p NRestarts -p ExecMainStartTimestamp
+```
+
+Bundle receipts and private health evidence may require root read access. Check all
+six exact units, their journal errors and fresh role evidence. The Guardian account
+journal has a separate read-only status surface:
+
+```bash
+sudo /opt/prop-production/current/venv/bin/python -m prop_production status \
+  --journal /var/lib/prop-production/guardian/account.sqlite
+```
+
+A process crash during activation leaves a durable PREPARED record. A new activation
+refuses to proceed until that exact previous state is recovered:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" /usr/bin/python3 -m prop_production.deployment \
+  recover /opt/prop-production
+```
+
+For an intentional rollback, choose a **named, verified, schema-compatible** bundle
+and use the same activation command. Never choose the newest directory by timestamp:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" /usr/bin/python3 -m prop_production.deployment \
+  activate /opt/prop-production/releases/VERIFIED_ROLLBACK_SHA
+```
+
+Manual rollback requires the target's bundle receipt and compatible journal/trust
+contracts. The automatic failed-upgrade recovery restores the captured prior code
+and units, including a legacy currently running release, without rewriting its files.
+A successful code rollback does not clear HALT, reverse fills or lower the trust floor.
+
+## Service and state ownership
+
+| Unit suffix (prop-production-) | Identity | Responsibility |
+| --- | --- | --- |
+| broker | prop-runtime | Synthetic SHADOW broker/socket server |
+| guardian | prop-runtime | Guardian finance, durable intent and risk authority |
+| planner | prop-planner | Unprivileged proposals |
+| observer | prop-observer | Read-only Propr native account evidence |
+| watchdog | prop-watchdog | Independent operational assessment |
+| bybit-observer | prop-bybit | Dedicated Bybit Demo read-only observation |
+
+Broker and Guardian share one uid under the existing IPC contract. This is not a
+claim of acceptable isolation for future authenticated order execution.
+
+Durable financial state stays under `/var/lib/prop-production/`. Guardian, observer
+and Bybit heartbeats are under `health/<role>/heartbeat.json`; watchdog evidence is
+under `watchdog/`. Role-owned directories and root-protected trust permissions
+remain mandatory. Root-only credential files stay under `/etc/prop-production/`.
+Never publish their contents or private account responses.
+
+Missing market/source evidence can leave the watchdog OPERATIONAL_BUT_BLOCKED even
+when all processes are active. Provider inventory is not coherent fill history or
+trusted ledger cash. Preserve RECONCILIATION_UNCERTAIN, G0–G4 blocks and NO_TRADE.

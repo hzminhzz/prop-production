@@ -7,9 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .compatibility import RESEARCH_COMMIT
 from .evidence import load_json
-
-RESEARCH_COMMIT = "fcf79b8e4d8012b46cdf8d2ad190af06a6e8dd5e"
 
 
 def verify_checkout(root: Path) -> None:
@@ -33,8 +32,7 @@ def verify_checkout(root: Path) -> None:
             "--porcelain=v1",
             "--untracked-files=all",
             "--",
-            "src",
-            "pyproject.toml",
+            ".",
         ],
         check=True,
         capture_output=True,

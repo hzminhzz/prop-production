@@ -1,0 +1,26 @@
+{
+  "schema": "prop_production_compatibility_v1",
+  "application_revision": "CONTAINING_GIT_COMMIT",
+  "repositories": {
+    "copytrade-pm": {
+      "repository": "hzminhzz/copytrade-pm",
+      "commit": "6b6db3540776c403f33a8e503a0398fa84a549f5"
+    },
+    "trading-connector": {
+      "repository": "hzminhzz/trading-connector",
+      "commit": "2db29b50af301741821781dedf64e4d8194fc125"
+    }
+  },
+  "contracts": {
+    "portfolio_release": "portfolio_release_v1",
+    "propr_evidence": "propr_native_evidence_v1",
+    "bybit_evidence": "bybit_demo_snapshot_v1",
+    "default_sizing_policy": "FIXED_K_NATIVE_QUANTITY",
+    "legacy_sizing_policy": "ALLOCATION_OVER_LIVE_NAV",
+    "execution_mode": "SHADOW",
+    "trading_authorized": false
+  },
+  "dependencies": {
+    "bybit_ccxt": "4.5.74"
+  }
+}
