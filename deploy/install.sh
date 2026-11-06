@@ -33,12 +33,17 @@ git diff --quiet HEAD "origin/$DEFAULT_BRANCH" || {
 RELEASE_DIR="$OPT/releases/$RELEASE_SHA"
 # A release directory must not be accepted solely because it exists: verify its
 # manifest and contents before reuse; a partial installation is rebuilt.
-if [ -d "$RELEASE_DIR" ]; then
-    if [ ! -x "$RELEASE_DIR/venv/bin/python" ] || [ ! -f "$RELEASE_DIR/COMMIT" ] \
-       || [ ! -f "$RELEASE_DIR/SOURCE.sha256" ]; then
-        echo "INCOMPLETE RELEASE at $RELEASE_DIR — rebuilding"
-        rm -rf "$RELEASE_DIR"
-    fi
+release_complete() {
+    [ -x "$1/venv/bin/python" ] || return 1
+    [ -f "$1/COMMIT" ] || return 1
+    [ -f "$1/SOURCE.sha256" ] || return 1
+    [ -f "$1/dist/SHA256SUMS" ] || return 1
+    ls "$1"/dist/*.whl >/dev/null 2>&1 || return 1
+    (cd "$1/dist" && sha256sum -c SHA256SUMS) >/dev/null 2>&1
+}
+if [ -d "$RELEASE_DIR" ] && ! release_complete "$RELEASE_DIR"; then
+    echo "INCOMPLETE RELEASE at $RELEASE_DIR — rebuilding"
+    rm -rf "$RELEASE_DIR"
 fi
 if [ ! -d "$RELEASE_DIR" ]; then
     mkdir -p "$RELEASE_DIR"
