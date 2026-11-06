@@ -32,6 +32,24 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _read_last_assessment(path: Path) -> dict[str, Any] | None:
+    """Most recent persisted assessment, for sequence-advancement tracking."""
+    try:
+        lines = path.read_text().strip().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
     """One fail-closed assessment of the deployed runtime. Read-only."""
     reasons: list[str] = []
@@ -57,6 +75,18 @@ def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
     certainty = guardian.get("certainty") if guardian else None
     if reasons == [] and certainty != "COHERENT":
         reasons.append("RECONCILIATION_UNCERTAIN")
+    # Progress contract: the driver reconciles on a cadence shorter than the
+    # watchdog window, so the journal sequence must advance across consecutive
+    # assessments. Unchanged sequence across two windows (same boot epoch) is a
+    # hung worker, not legitimate quiet state — the deployed cadence is 4s.
+    previous = _read_last_assessment(state_root / "watchdog" / "assessments.jsonl")
+    boot_epoch = guardian.get("boot_epoch") if guardian else None
+    if (reasons == [] and previous is not None
+            and previous.get("guardian_journal_sequence") == sequence
+            and previous.get("guardian_boot_epoch") == boot_epoch
+            and isinstance(previous.get("assessed_at_ms"), int)
+            and 0 <= now_ms - previous["assessed_at_ms"] <= 2 * WATCH_INTERVAL_S * 1000):
+        reasons.append("SEQUENCE_NOT_ADVANCING")
     if observer and observer.get("healthy") is False:
         reasons.append("OBSERVER_UNHEALTHY")
 
@@ -88,6 +118,7 @@ def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
             "guardian_heartbeat_ms": guardian_ms, "observer_heartbeat_ms": observer_ms,
             "guardian_last_progress_ms": guardian.get("last_progress_ms") if guardian else None,
             "guardian_journal_sequence": guardian.get("journal_sequence") if guardian else None,
+            "guardian_boot_epoch": boot_epoch,
             "guardian_certainty": guardian.get("certainty") if guardian else None,
             "disk_free_bytes": free, "trading_authorized": False}
 

@@ -87,11 +87,14 @@ async def observe_once() -> dict[str, Any]:
         raise PermissionError("OBSERVER_KEY_MISSING")
     reader = ReadOnlyAccount(ProprConfig(Environment.PRODUCTION, account_id=None,
                                          api_key=key, api_url=endpoint))
-    binding = await discover_account(reader.rest)
-    native = await inspect_native_evidence(
-        reader.rest, account_id=binding.account_id, endpoint=endpoint,
-        known_at_ms=int(time.time() * 1000), stream_connected=False)
-    return asdict(native)
+    try:
+        binding = await discover_account(reader.rest)
+        native = await inspect_native_evidence(
+            reader.rest, account_id=binding.account_id, endpoint=endpoint,
+            known_at_ms=int(time.time() * 1000), stream_connected=False)
+        return asdict(native)
+    finally:
+        await reader.close()  # connection cleanup on every path
 
 
 async def observe_loop(state_dir: Path, *, poll_seconds: int = POLL_SECONDS) -> None:
