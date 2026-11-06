@@ -16,5 +16,6 @@ def test_blackbox_unknown_post_and_out_of_envelope_breach_are_explicit(tmp_path)
     assert timeout["sends"] == 1
     crash = run_fixture(tmp_path / "gap", seed=19, scenario="OUT_OF_ENVELOPE")
     assert crash["market_outcome"] == "BREACH_OBSERVED"
+    assert crash["verdict"] == "NOT_EVALUATED"
     assert crash["trading_authorized"] is False
-    assert crash["scope"] == "DECLARED_SYNTHETIC_ENVELOPE"
+    assert crash["scope"] == "OUTSIDE_DECLARED_STRESS_ENVELOPE"

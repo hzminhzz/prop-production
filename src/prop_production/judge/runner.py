@@ -128,10 +128,12 @@ def run_fixture(root: Path, *, seed: int = 17, scenario: str = "NORMAL") -> dict
                   and checked["verdict"] == "PROTOCOL_TRACE_VERIFIED"
                   and projection["verdict"] == "GUARDIAN_REFERENCE_MATCH"
                   and model["verdict"] == "BOUNDED_PROTOCOL_VERIFIED")
+        outside = scenario == "OUT_OF_ENVELOPE" or bool(report["breaches"])
+        verdict = "FAIL" if not passed else "NOT_EVALUATED" if outside else "BOUNDED_SAFETY_VERIFIED"
         result = {
             "schema": "judge_run_v1", "seed": seed, "scenario": scenario,
-            "scope": "DECLARED_SYNTHETIC_ENVELOPE",
-            "verdict": "BOUNDED_SAFETY_VERIFIED" if passed else "FAIL",
+            "scope": "OUTSIDE_DECLARED_STRESS_ENVELOPE" if outside else "DECLARED_SYNTHETIC_ENVELOPE",
+            "verdict": verdict,
             "accounting": accounting, "guardian_projection": projection,
             "protocol": checked, "model": model,
             "market_outcome": "BREACH_OBSERVED" if report["breaches"] else "NO_BREACH_OBSERVED",
