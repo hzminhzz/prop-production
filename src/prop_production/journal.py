@@ -183,6 +183,15 @@ class Journal:
             state["runtime"].update(state="HALTED", permit=None)
         return self.update("HALT_" + reason, at_ms, apply)
 
+    def recover(self, reason: str, at_ms: int) -> int:
+        """Operator-audited recovery: clear one latched halt after incident resolution."""
+        def apply(state: State) -> None:
+            if reason in state["halts"]:
+                state["halts"].remove(reason)
+            if not state["halts"]:
+                state["runtime"]["state"] = "DISARMED"
+        return self.update("RECOVER_" + reason, at_ms, apply)
+
     def verify(self) -> dict[str, Any]:
         if self.con is None:
             raise StorageUnavailable("JOURNAL_CLOSED")

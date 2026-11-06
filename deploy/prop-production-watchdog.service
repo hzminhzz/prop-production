@@ -1,0 +1,39 @@
+# prop-production independent watchdog. Read-only assessment of the deployed
+# runtime; it can never authorize trading and holds no broker credentials.
+[Unit]
+Description=prop-production independent watchdog
+After=prop-production-broker.service prop-production-guardian.service prop-production-planner.service prop-production-observer.service
+
+[Service]
+Type=simple
+User=prop-watchdog
+Group=prop
+UMask=0077
+Environment=PROP_STATE_ROOT=/var/lib/prop-production
+ExecStart=/opt/prop-production/venv/bin/python -m prop_production.watchdog
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+# Hardening: the watchdog observes evidence files and needs no network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/prop-production
+
+[Install]
+WantedBy=multi-user.target

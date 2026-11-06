@@ -1,0 +1,44 @@
+# prop-production read-only Propr account observation service.
+# Authenticated read-only REST polling; no order mutation path is reachable.
+[Unit]
+Description=prop-production read-only Propr account observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prop-observer
+Group=prop
+UMask=0077
+# Credentials are injected by systemd from a root-only environment file.
+EnvironmentFile=/etc/prop-production/observer.env
+Environment=PROP_OBSERVER_STATE=/var/lib/prop-production/observer
+Environment=PYTHONPATH=/opt/prop-production/connector
+ExecStart=/opt/prop-production/venv/bin/python -m prop_production.observer
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+# Hardening: network egress is required for the provider REST API; the
+# filesystem is otherwise minimal and credentials are never readable from disk.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/prop-production
+
+[Install]
+WantedBy=multi-user.target
