@@ -26,12 +26,15 @@ A separate `prop-production-bybit-observer.service` consumes the pinned connecto
 ## Reproduce and verify locally
 
 GitHub Actions is optional and **not required** for this private VPS program.
-Python 3.13/3.14 and uv 0.12.15 are used. From a clean reviewed commit,
-verify the full application + two companion repositories:
+Use Python 3.13/3.14 and record the actual uv version. The reviewed default
+branch is `feat/account-guardian-program`; verify it live. Companion pins and
+schemas come from [compatibility.json](src/prop_production/compatibility.json).
+From a clean reviewed commit, verify the application and both companions:
 
 ```bash
-export PROP_RESEARCH_ROOT=/home/quant/.devspace/worktrees/copytrade-pm-dade3502
-export PROP_CONNECTOR_ROOT=/home/quant/.devspace/worktrees/trading-connector-829a9992
+PYTHONPATH=src python3 -m prop_production.compatibility
+export PROP_RESEARCH_ROOT=/absolute/path/to/clean/pinned-copytrade-pm
+export PROP_CONNECTOR_ROOT=/absolute/path/to/clean/pinned-trading-connector
 bash scripts/verify-local.sh all
 ```
 
@@ -57,6 +60,14 @@ each implementation ticket retains its own acceptance evidence.
 
 ## Deployed release
 
-The active release is whatever `/opt/prop-production/current/COMMIT` names —
-authoritative and always current. Rollback: the newest other entry in
-`/opt/prop-production/releases/`. Procedure and evidence: `docs/DEPLOYMENT-RUNBOOK.md`.
+Read `/opt/prop-production/current/COMMIT`, verify the complete immutable bundle,
+and match actual service PIDs and fresh role evidence to it. The pointer alone is
+not proof of loaded code. Choose a named, verified, schema-compatible rollback
+bundle. Follow [deployment and recovery](docs/DEPLOYMENT-RUNBOOK.md); root release
+authority is required. Journals and the trust floor remain outside code releases.
+
+GitHub holds reviewed source; private SQLite holds research metadata; original
+receipts hold source evidence; Guardian journals hold protected finance; verified
+deployment metadata plus OS evidence establish running state. OptMem supplies
+durable navigation and never overrides these authorities. These GitHub repositories
+are public; private operating data must remain outside Git.

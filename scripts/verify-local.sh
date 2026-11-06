@@ -31,8 +31,14 @@ else
     printf 'WARNING: GATE_CLEAN=0; results are developmental, not a clean-revision acceptance\n' >&2
 fi
 
-RESEARCH_SHA="fcf79b8e4d8012b46cdf8d2ad190af06a6e8dd5e"
-CONNECTOR_SHA="b28aa8522c51830a4b389a61b20ceb539b7a89ca"
+pin_field() {
+    PYTHONPATH="$APP_ROOT/src" python3 -m prop_production.compatibility --field "$1"
+}
+RESEARCH_SHA="$(pin_field research)"
+CONNECTOR_SHA="$(pin_field connector)"
+COMPATIBILITY_SHA="$(pin_field sha)"
+PYTHONPATH="$APP_ROOT/src" python3 -m prop_production.compatibility \
+    --check-project "$APP_ROOT/pyproject.toml" --field sha
 if [[ "$MODE" == "all" ]]; then
     : "${PROP_RESEARCH_ROOT:?BLOCKED: set PROP_RESEARCH_ROOT to the pinned copytrade-pm worktree}"
     : "${PROP_CONNECTOR_ROOT:?BLOCKED: set PROP_CONNECTOR_ROOT to the pinned trading-connector worktree}"
@@ -50,13 +56,15 @@ if [[ "$MODE" == "all" ]]; then
         fi
     done
     if [[ "${GATE_CLEAN:-1}" == "1" ]]; then
-        verify_clean "$PROP_RESEARCH_ROOT" "src pyproject.toml tests"
-        verify_clean "$PROP_CONNECTOR_ROOT" "connectors pyproject.toml tests"
+        verify_clean "$PROP_RESEARCH_ROOT" "."
+        verify_clean "$PROP_CONNECTOR_ROOT" "."
     fi
-    export PROP_RESEARCH_ROOT
+    export PROP_RESEARCH_ROOT PROP_CONNECTOR_ROOT
 fi
 
-printf 'LOCAL_VERIFY_START app=%s mode=%s\n' "$(git -C "$APP_ROOT" rev-parse HEAD)" "$MODE"
+APP_SHA="$(git -C "$APP_ROOT" rev-parse HEAD)"
+printf 'LOCAL_VERIFY_START app=%s mode=%s\n' "$APP_SHA" "$MODE"
+uv --version
 cd "$APP_ROOT"
 for version in 3.13 3.14; do
     printf '\n[app / Python %s]\n' "$version"
@@ -74,22 +82,40 @@ if [[ "$MODE" == "all" ]]; then
     printf '\n[connector / %s]\n' "$CONNECTOR_SHA"
     (
         cd "$PROP_CONNECTOR_ROOT"
-        .venv/bin/python -m pytest -q connectors/propr/tests connectors/bybit/tests
+        PYTHONPATH="$PROP_RESEARCH_ROOT/src" .venv/bin/python -m pytest -q -rs connectors
+        .venv/bin/python -m ruff check connectors propr_sdk.py
+        uv build --offline --quiet
     )
     printf '\n[app + native connector / %s]\n' "$CONNECTOR_SHA"
     PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --extra connector --group dev pytest -q tests/test_native_gateway.py
     printf '\n[Bybit Demo native adapter / %s]\n' "$CONNECTOR_SHA"
-    PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --with ccxt==4.5.74 --extra connector --group dev pytest -q tests/test_bybit_gateway.py tests/test_bybit_observer.py
+    PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --extra connector --group dev pytest -q tests/test_bybit_gateway.py tests/test_bybit_observer.py
     printf '\n[research / %s]\n' "$RESEARCH_SHA"
     (
         cd "$PROP_RESEARCH_ROOT"
-        uv run --frozen --extra actuary --group dev pytest -q
-        uv run --frozen --group dev copytrade-pm capabilities validate
+        uv sync --frozen --all-extras --group dev
+        uv run --no-sync pytest -q
+        uv run --no-sync ruff check src tests scripts
+        uv run --no-sync ruff format --check src tests
+        uv build --offline --quiet
+        uv run --no-sync copytrade-pm capabilities validate
     )
 fi
 
-printf 'LOCAL_VERIFY_PASS app=%s mode=%s research=%s connector=%s\n' \
+# A receipt is valid only for the same clean revisions that began the gate.
+[[ "$(git -C "$APP_ROOT" rev-parse HEAD)" == "$APP_SHA" ]] || exit 2
+if [[ "${GATE_CLEAN:-1}" == "1" ]]; then
+    verify_clean "$APP_ROOT" "."
+    if [[ "$MODE" == "all" ]]; then
+        verify_clean "$PROP_RESEARCH_ROOT" "."
+        verify_clean "$PROP_CONNECTOR_ROOT" "."
+        [[ "$(git -C "$PROP_RESEARCH_ROOT" rev-parse HEAD)" == "$RESEARCH_SHA" ]] || exit 2
+        [[ "$(git -C "$PROP_CONNECTOR_ROOT" rev-parse HEAD)" == "$CONNECTOR_SHA" ]] || exit 2
+    fi
+fi
+printf 'LOCAL_VERIFY_PASS app=%s mode=%s research=%s connector=%s compatibility=%s\n' \
     "$(git -C "$APP_ROOT" rev-parse HEAD)" "$MODE" \
     "$([[ "$MODE" == "all" ]] && printf '%s' "$RESEARCH_SHA" || printf '%s' 'NOT_TESTED')" \
-    "$([[ "$MODE" == "all" ]] && printf '%s' "$CONNECTOR_SHA" || printf '%s' 'NOT_TESTED')"
+    "$([[ "$MODE" == "all" ]] && printf '%s' "$CONNECTOR_SHA" || printf '%s' 'NOT_TESTED')" \
+    "$COMPATIBILITY_SHA"
 printf 'Scope: ENGINEERING_TESTS_ONLY; G0-G4 and live trading remain BLOCKED\n'

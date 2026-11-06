@@ -1,119 +1,86 @@
 #!/usr/bin/env bash
-# prop-production protected deployment installer. Run with sudo from the repo root.
-# Idempotent: safe to re-run. Credentials flow file-to-file and never enter argv or logs.
-#
-# Identity model: the existing IPC mechanism binds broker roles to the broker
-# process uid (ipc.py peer-credential check), so broker and Guardian share one
-# service identity. Planner, observer and watchdog keep separate identities.
+# Stage an exact approved SHADOW bundle, then activate it with complete code rollback.
+# Run as root; credentials flow file-to-file and never enter argv or logs.
 set -euo pipefail
+umask 022
 
-REPO=${1:-/home/quant/dev/prop-production}
+REPO=${1:?Usage: install.sh CLEAN_APPROVED_APP_CHECKOUT}
+CONNECTOR_SRC=${PROP_CONNECTOR_ROOT:?Set PROP_CONNECTOR_ROOT to the pinned clean checkout}
 STATE=/var/lib/prop-production
 OPT=/opt/prop-production
-CONNECTOR_SRC=${CONNECTOR_SRC:-/home/quant/.devspace/worktrees/trading-connector-829a9992}
-
+ROOT_PYTHON=${ROOT_PYTHON:-/usr/bin/python3}
+UV=${UV:-/home/quant/.local/bin/uv}
+[ "$(id -u)" = 0 ] || { echo "REFUSING: root release authority required"; exit 1; }
 cd "$REPO"
+"$ROOT_PYTHON" -c 'import os, pathlib, sys; p=pathlib.Path(sys.executable).resolve(); assert sys.version_info >= (3,13); assert p.stat().st_uid == 0 and not p.stat().st_mode & 0o022'
 
-# Fail before touching the active release if the pinned adapter or credential
-# scope does not match the explicitly approved Demo-only integration.
-EXPECTED_CONNECTOR_SHA=b28aa8522c51830a4b389a61b20ceb539b7a89ca
-[ "$(git -C "$CONNECTOR_SRC" rev-parse HEAD)" = "$EXPECTED_CONNECTOR_SHA" ] || {
-    echo "REFUSING: connector revision mismatch"; exit 1;
-}
+# Reject stale, dirty or untracked source before any OS/service changes.
+DEFAULT_BRANCH=feat/account-guardian-program
+git fetch origin "$DEFAULT_BRANCH"
+RELEASE_SHA=$(git rev-parse "origin/$DEFAULT_BRANCH")
+[ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ] || { echo "REFUSING: app HEAD is not approved default"; exit 1; }
+[ -z "$(git status --porcelain=v1 --untracked-files=all)" ] || { echo "REFUSING: dirty app source"; exit 1; }
+pin_field() { PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.compatibility --field "$1"; }
+EXPECTED_CONNECTOR_SHA=$(pin_field connector)
+PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.compatibility --check-project "$REPO/pyproject.toml" --field sha
+[ "$(git -C "$CONNECTOR_SRC" rev-parse HEAD)" = "$EXPECTED_CONNECTOR_SHA" ] || { echo "REFUSING: connector revision mismatch"; exit 1; }
+[ -z "$(git -C "$CONNECTOR_SRC" status --porcelain=v1 --untracked-files=all)" ] || { echo "REFUSING: dirty connector source"; exit 1; }
+
 BYBIT_SOURCE=/home/quant/.config/trading-connector/bybit-demo.env
 BYBIT_SOURCE_OK=/etc/prop-production/bybit.env
-if [ -f "$BYBIT_SOURCE_OK" ]; then
-    BYBIT_PREFLIGHT="$BYBIT_SOURCE_OK"
-else
-    BYBIT_PREFLIGHT="$BYBIT_SOURCE"
-fi
+BYBIT_PREFLIGHT="$BYBIT_SOURCE"
+[ ! -f "$BYBIT_SOURCE_OK" ] || BYBIT_PREFLIGHT="$BYBIT_SOURCE_OK"
 [ -f "$BYBIT_PREFLIGHT" ] || { echo "REFUSING: missing Bybit Demo credentials"; exit 1; }
-grep -qx 'BYBIT_ENVIRONMENT=demo' "$BYBIT_PREFLIGHT" || {
-    echo "REFUSING: Bybit env is not Demo"; exit 1;
-}
-grep -qx 'BYBIT_MODE=read_only' "$BYBIT_PREFLIGHT" || {
-    echo "REFUSING: Bybit connector mode is not read_only"; exit 1;
-}
+grep -qx 'BYBIT_ENVIRONMENT=demo' "$BYBIT_PREFLIGHT"
+grep -qx 'BYBIT_MODE=read_only' "$BYBIT_PREFLIGHT"
 for name in BYBIT_DEMO_API_KEY BYBIT_DEMO_API_SECRET BYBIT_DEMO_EXPECTED_UID; do
-    grep -q "^$name=." "$BYBIT_PREFLIGHT" || {
-        echo "REFUSING: required Bybit Demo identity field is missing"; exit 1;
-    }
+    grep -q "^$name=." "$BYBIT_PREFLIGHT" || { echo "REFUSING: missing Demo identity field"; exit 1; }
 done
+# Legacy WAL trust floors require a separate reviewed migration, never a raw copy
+# or a checkpoint inside a transaction. Ordinary upgrades do not change the floor.
+if [ -f "$STATE/trust/floor.sqlite" ]; then
+    "$ROOT_PYTHON" -c 'import pathlib,sqlite3,sys; c=sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri()+"?mode=ro",uri=True); assert c.execute("PRAGMA integrity_check").fetchone()[0]=="ok"; assert c.execute("PRAGMA journal_mode").fetchone()[0]=="delete", "REVIEWED_OFFLINE_TRUST_MIGRATION_REQUIRED"; c.close()' "$STATE/trust/floor.sqlite"
+fi
 
-# 1. Service identities (system users, no login shell). Group before users.
+mkdir -p "$OPT/releases"
+exec 9>"$OPT/.deployment.lock"
+flock -n 9 || { echo "REFUSING: another deployment owns the lock"; exit 1; }
+RELEASE_DIR="$OPT/releases/$RELEASE_SHA"
+release_complete() {
+    PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment verify "$1" --commit "$RELEASE_SHA"
+}
+if [ -e "$RELEASE_DIR" ]; then
+    release_complete "$RELEASE_DIR" || {
+        echo "REFUSING: preserve incomplete/changed release for reviewed recovery: $RELEASE_DIR"; exit 1;
+    }
+else
+    mkdir -p "$RELEASE_DIR/source" "$RELEASE_DIR/connector" "$RELEASE_DIR/units" "$RELEASE_DIR/dist"
+    # Build from Git objects, never from mutable working-tree files.
+    git archive --format=tar "$RELEASE_SHA" --output "$RELEASE_DIR/SOURCE.tar"
+    tar -xf "$RELEASE_DIR/SOURCE.tar" -C "$RELEASE_DIR/source"
+    git -C "$CONNECTOR_SRC" archive "$EXPECTED_CONNECTOR_SHA" | tar -xf - -C "$RELEASE_DIR/connector"
+    printf '%s\n' "$RELEASE_SHA" > "$RELEASE_DIR/COMMIT"
+    git rev-parse "$RELEASE_SHA^{tree}" > "$RELEASE_DIR/TREE"
+    sha256sum "$RELEASE_DIR/SOURCE.tar" > "$RELEASE_DIR/SOURCE.sha256"
+    cp "$RELEASE_DIR/source/src/prop_production/compatibility.json" "$RELEASE_DIR/compatibility.json"
+    install -m 0644 "$RELEASE_DIR/source/deploy/"prop-production-*.service "$RELEASE_DIR/units/"
+    "$UV" build --project "$RELEASE_DIR/source" --wheel --out-dir "$RELEASE_DIR/dist" --quiet
+    UV_PROJECT_ENVIRONMENT="$RELEASE_DIR/venv" "$UV" sync --project "$RELEASE_DIR/source" \
+        --python "$ROOT_PYTHON" --frozen --no-dev --no-editable --extra connector
+    "$RELEASE_DIR/venv/bin/python" -c 'import ccxt; from prop_production.compatibility import BYBIT_CCXT; assert ccxt.__version__ == BYBIT_CCXT'
+    chown -R root:root "$RELEASE_DIR"
+    chmod -R go-w "$RELEASE_DIR"
+    PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment seal "$RELEASE_DIR"
+    release_complete "$RELEASE_DIR"
+fi
+OPT_VENV="$RELEASE_DIR/venv"
+
+# Service identities preserve the existing IPC uid contract.
 getent group prop >/dev/null || groupadd --system prop
 for role in runtime planner observer watchdog bybit; do
     id "prop-$role" >/dev/null 2>&1 || useradd --system --no-create-home \
         --shell /usr/sbin/nologin --gid prop "prop-$role"
 done
-
-# 2. Release layout: the release identity is the APPROVED MERGE COMMIT on the
-# default branch. The checkout must match its tree exactly; the wheel is built,
-# hashed and verified before installation. Rollback = repoint the symlink.
-DEFAULT_BRANCH=feat/account-guardian-program
-git fetch origin "$DEFAULT_BRANCH" 2>/dev/null || true
-RELEASE_SHA=$(git rev-parse "origin/$DEFAULT_BRANCH")
-git diff --quiet HEAD "origin/$DEFAULT_BRANCH" || {
-    echo "REFUSING: local tree differs from approved $DEFAULT_BRANCH ($RELEASE_SHA)"; exit 1; }
-[ -d "$OPT" ] || mkdir -p "$OPT"
-RELEASE_DIR="$OPT/releases/$RELEASE_SHA"
-# A release directory must not be accepted solely because it exists: verify its
-# manifest and contents before reuse; a partial installation is rebuilt.
-release_complete() {
-    [ -x "$1/venv/bin/python" ] || return 1
-    [ -f "$1/COMMIT" ] || return 1
-    [ -f "$1/SOURCE.sha256" ] || return 1
-    [ -f "$1/dist/SHA256SUMS" ] || return 1
-    ls "$1"/dist/*.whl >/dev/null 2>&1 || return 1
-    (cd "$1/dist" && sha256sum -c SHA256SUMS) >/dev/null 2>&1 || return 1
-    "$1/venv/bin/python" -c 'import ccxt; assert ccxt.__version__ == "4.5.74"' >/dev/null 2>&1
-}
-if [ -d "$RELEASE_DIR" ] && ! release_complete "$RELEASE_DIR"; then
-    # Never remove the release currently backing running Python processes.
-    # Instead stop and require an operator-controlled staged repair.
-    ACTIVE_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
-    if [ "$ACTIVE_RELEASE" = "$RELEASE_DIR" ]; then
-        echo "REFUSING: active release failed integrity checks; preserve it for recovery"
-        exit 1
-    fi
-    echo "INCOMPLETE INACTIVE RELEASE at $RELEASE_DIR — rebuilding"
-    rm -rf "$RELEASE_DIR"
-fi
-if [ ! -d "$RELEASE_DIR" ]; then
-    mkdir -p "$RELEASE_DIR"
-    git diff --quiet HEAD || { echo "REFUSING: dirty review tree"; exit 1; }
-    WHEEL_DIR="$RELEASE_DIR/dist"
-    mkdir -p "$WHEEL_DIR"
-    UV=${UV:-/home/quant/.local/bin/uv}
-    command -v uv >/dev/null 2>&1 && UV=uv
-    (uv build --wheel --out-dir "$WHEEL_DIR" 2>/dev/null \
-        || "$UV" build --wheel --out-dir "$WHEEL_DIR" 2>/dev/null) \
-        || { echo "REFUSING: wheel build failed"; exit 1; }
-    WHEEL=$(ls "$WHEEL_DIR"/*.whl | head -1)
-    WHEEL_SHA=$(sha256sum "$WHEEL" | cut -d' ' -f1)
-    echo "$WHEEL_SHA  $(basename "$WHEEL")" > "$WHEEL_DIR/SHA256SUMS"
-    # Verify the recorded digest matches before installing anything.
-    (cd "$WHEEL_DIR" && sha256sum -c SHA256SUMS) >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
-    python3 -m venv "$RELEASE_DIR/venv"
-    "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx "ccxt==4.5.74"
-    git rev-parse "$RELEASE_SHA" > "$RELEASE_DIR/COMMIT"
-    git cat-file -p "$RELEASE_SHA" | grep '^tree' > "$RELEASE_DIR/TREE"
-    (cd "$REPO" && git archive "$RELEASE_SHA" | sha256sum) > "$RELEASE_DIR/SOURCE.sha256"
-    CONNECTOR_SHA=$(git -C "$CONNECTOR_SRC" rev-parse HEAD)
-    echo "connector=$CONNECTOR_SHA" > "$RELEASE_DIR/PINS"
-    echo "bybit_ccxt=4.5.74" >> "$RELEASE_DIR/PINS"
-fi
-PREVIOUS_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
-ln -sfn "$RELEASE_DIR" "$OPT/current.new" && mv -T "$OPT/current.new" "$OPT/current"
-OPT_VENV="$OPT/current/venv"
-
-# 3. Pinned provider libraries. Bybit uses the existing validated CCXT client,
-# not a second V5 implementation. Reject an unexpected vendor revision.
-mkdir -p "$OPT/connector/connectors"
-cp -r "$CONNECTOR_SRC/connectors/propr" "$OPT/connector/connectors/propr"
-cp -r "$CONNECTOR_SRC/connectors/bybit" "$OPT/connector/connectors/bybit"
-sha256sum "$CONNECTOR_SRC/connectors/propr/"*.py > "$OPT/connector/PIN.sha256"
-sha256sum "$CONNECTOR_SRC/connectors/bybit/"*.py > "$OPT/connector/BYBIT.PIN.sha256"
 
 # 4. Fixture runtime initialization: requires a non-existent state root.
 if [ ! -e "$STATE" ]; then
@@ -143,51 +110,18 @@ chown -R prop-observer:prop "$STATE/observer"; chmod 0750 "$STATE/observer"
 [ -d "$STATE/watchdog" ] || mkdir -p "$STATE/watchdog"
 chown -R prop-watchdog:prop "$STATE/watchdog"; chmod 0750 "$STATE/watchdog"
 
-# Trust anchor: the release floor is the anti-rollback authority. DELETE journal
-# mode lets runtime workers open it read-only with zero write access; only the
-# deploy-time trust authority (root) may ever advance it.
-chown root:prop "$STATE/trust"; chmod 0750 "$STATE/trust"
-# Settings and floor: group-readable, never group-writable. The DELETE-journal
-# floor needs zero write access at runtime; only root (deploy authority) writes.
-chown root:prop "$STATE/trust/settings.json" "$STATE/trust/floor.sqlite" 2>/dev/null || true
-chmod 0640 "$STATE/trust/settings.json" 2>/dev/null || true
-chmod 0440 "$STATE/trust/floor.sqlite" 2>/dev/null || true
-# Migrate a pre-DELETE-mode floor (WAL sidecars needed shm write). Fail closed:
-# backup, validate, checkpoint, verify, convert, verify again — abort on any
-# failure and keep the previous database; sidecars are removed only after a
-# proven successful migration.
+
+# Preserve a consistent online trust backup. Neither upgrade nor rollback restores
+# an older trust floor or rewinds a financial journal.
 if [ -f "$STATE/trust/floor.sqlite" ]; then
-    BACKUP="$STATE/trust/floor.sqlite.pre-migration.$(date +%s)"
-    cp "$STATE/trust/floor.sqlite" "$BACKUP"
-    chmod 0600 "$BACKUP"
-    "$OPT_VENV/bin/python" - "$STATE/trust/floor.sqlite" <<'PYEOF' || {
-import sqlite3, sys
-path = sys.argv[1]
-con = sqlite3.connect(path, timeout=5.0, isolation_level=None)
-try:
-    if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-        raise SystemExit("TRUST_DB_CORRUPT_BEFORE_MIGRATION")
-    mode = con.execute("PRAGMA journal_mode").fetchone()[0]
-    if mode == "wal":
-        con.execute("BEGIN IMMEDIATE")
-        busy, _log, _ckpt = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        if busy:
-            raise SystemExit("TRUST_DB_BUSY_CHECKPOINT_FAILED")
-        con.execute("COMMIT")
-        con.execute("PRAGMA journal_mode=DELETE")
-        if con.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
-            raise SystemExit("TRUST_DB_MODE_SWITCH_FAILED")
-    if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-        raise SystemExit("TRUST_DB_CORRUPT_AFTER_MIGRATION")
-    print(f"trust migration ok (mode={con.execute('PRAGMA journal_mode').fetchone()[0]})")
-finally:
-    con.close()
-PYEOF
-    echo "MIGRATION FAILED: keeping previous release and database; sidecars untouched"
-    exit 1
-}
-    rm -f "$STATE/trust/floor.sqlite-wal" "$STATE/trust/floor.sqlite-shm"
+    BACKUP="$STATE/trust/floor.sqlite.pre-upgrade.$(date +%s%N)"
+    PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment backup \
+        "$STATE/trust/floor.sqlite" --target "$BACKUP"
 fi
+chown root:prop "$STATE/trust"; chmod 0750 "$STATE/trust"
+chown root:prop "$STATE/trust/settings.json" "$STATE/trust/floor.sqlite"
+chmod 0640 "$STATE/trust/settings.json"
+chmod 0440 "$STATE/trust/floor.sqlite"
 
 # 6. Observer credentials: root-only file, value flows file-to-file only.
 [ -f /etc/prop-production/observer.env ] || {
@@ -217,20 +151,14 @@ for name in BYBIT_DEMO_API_KEY BYBIT_DEMO_API_SECRET BYBIT_DEMO_EXPECTED_UID; do
     }
 done
 
-# 7. Units, then start.
-install -m 0644 deploy/prop-production-broker.service /etc/systemd/system/
-install -m 0644 deploy/prop-production-guardian.service /etc/systemd/system/
-install -m 0644 deploy/prop-production-planner.service /etc/systemd/system/
-install -m 0644 deploy/prop-production-observer.service /etc/systemd/system/
-install -m 0644 deploy/prop-production-watchdog.service /etc/systemd/system/
-install -m 0644 deploy/prop-production-bybit-observer.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now prop-production-broker.service prop-production-guardian.service \
-    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service \
-    prop-production-bybit-observer.service
-# enable --now does not restart running services; a new release must take effect.
-systemctl restart prop-production-broker.service prop-production-guardian.service \
-    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service \
-    prop-production-bybit-observer.service
 
-echo "DEPLOYED: systemctl status prop-production-*"
+# Activation snapshots old units and the old pointer, stops exactly these six
+# services, switches one immutable code set, and verifies fresh role heartbeats.
+# Failure restores the previous code+units. Interrupted activation has a durable
+# recovery record; no financial database is ever restored automatically.
+release_complete "$RELEASE_DIR"
+PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment activate "$RELEASE_DIR" --lock-fd 9
+systemctl enable prop-production-broker.service prop-production-guardian.service \
+    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service \
+    prop-production-bybit-observer.service
+printf 'DEPLOYED_SHADOW commit=%s\n' "$RELEASE_SHA"

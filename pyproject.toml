@@ -11,7 +11,10 @@ requires-python = ">=3.13"
 dependencies = ["cryptography>=50.0.2,<51"]
 
 [project.optional-dependencies]
-connector = ["trading-connector-library @ git+https://github.com/hzminhzz/trading-connector.git@b28aa8522c51830a4b389a61b20ceb539b7a89ca"]
+connector = [
+    "trading-connector-library @ git+https://github.com/hzminhzz/trading-connector.git@2db29b50af301741821781dedf64e4d8194fc125",
+    "ccxt==4.5.74",
+]
 
 [dependency-groups]
 dev = ["pytest==8.4.2", "ruff==0.14.3", "mypy==1.18.2"]

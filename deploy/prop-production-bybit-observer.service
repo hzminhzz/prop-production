@@ -11,7 +11,8 @@ Group=prop
 UMask=0077
 EnvironmentFile=/etc/prop-production/bybit.env
 Environment=PROP_BYBIT_STATE=/var/lib/prop-production/bybit
-Environment=PYTHONPATH=/opt/prop-production/connector
+Environment=PYTHONPATH=/opt/prop-production/current/connector
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.bybit_observer
 Restart=always
 RestartSec=7
