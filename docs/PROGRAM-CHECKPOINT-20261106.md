@@ -1,5 +1,7 @@
 # Program checkpoint — 2026-11-06 (SHADOW / NO_TRADE)
 
+**Later 2026-11-06 owner decision supersedes the old leader-NAV veto below:** [NAV-optional signed fixed-k sizing](SIZING-POLICY.md) is the default for new work. The earlier missing *source* NAV claims in issues #4, #7, #19 and unresolved blocker #4 below describe the older equity-relative fidelity contract, and **must not be reused as mandatory gates for fixed-k**. Missing validated selected-scope source positions, first-known receipts, follower/broker equity, protected workers, market volume, broker reconciliation, risk and G0–G4 still block relevant promotion. This report remains a dated historical checkpoint.
+
 This is an engineering checkpoint, **not** a release approval or completion certificate. Parent specification: GitHub issue #1; implementation: #2–#22; application PR #23; connector PR #18; research PR #127. All 21 implementation issues were observed **OPEN** at inspection. Do not close them from this checkpoint without reviewing the current issue comments and the full acceptance criteria individually.
 
 ## Exact reviewed revisions
