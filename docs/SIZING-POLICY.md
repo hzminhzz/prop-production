@@ -4,9 +4,9 @@
 
 ## Default: fixed-k risk-budgeted mirroring
 
-The follower mirrors the **explicitly selected account's perpetual position vector**, not the source wallet's entire net-worth or balance sheet. The release's signed member contains:
+The follower mirrors the **signed notional of the explicitly selected account's perpetual position vector**, not the source wallet's entire net-worth or balance sheet. When source/follower marks differ, follower quantity is not exactly k times source quantity. The release's signed member contains:
 
-- `sizing_policy = FIXED_K_NATIVE_QUANTITY`
+- `sizing_policy = FIXED_K_NATIVE_QUANTITY` (historical field name; its enforced unit is signed **position notional**)
 - `k`: explicit positive signed Decimal ratio, bounded by release contract (`0 < k <= 10`); calibrated from a versioned research plan, not guessed from leader equity
 - `source_identity`, `account_scope`, `allowed_markets`, `identity_known_at_ms`, `allocation`: unchanged account-bound release commitments
 - A first-known, signed, SHA-bound `source_book_v1` with complete positions **within that selected scope**, event/receipt timestamps, valid native position quantities and marks, and `nav = null`.
@@ -14,8 +14,8 @@ The follower mirrors the **explicitly selected account's perpetual position vect
 For each observed source leg:
 
 ```text
-target_follower_qty = signed_k * source_qty
-requested_notional = target_follower_qty * source_mark
+requested_notional = signed_k * source_qty * source_mark
+target_follower_qty = requested_notional / verified_follower_mark
 ```
 
 A target is **an intent**, not an order. Guardian re-verifies source signature, signed k and all target hashes and applies actual follower account equity, headroom, stressed cost, per-pod loss budget, market volume/quantity/price tiers, margin, price freshness, global limits, netting, broker accounting and HALT. Partial-fills and skipped follower legs must reconcile against actual positions, not presumed previous trades. `allocation` is retained as a signed member allocation/metadata field, **not** an alternative k denominator or an authorization to exceed Guardian constraints.
