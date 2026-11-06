@@ -65,9 +65,10 @@ def observation_record(result: Any, *, now_ms: int) -> dict[str, Any]:
                           else getattr(field, "provenance", "UNKNOWN"))
             record[key] = str(value)
             record[key + "_provenance"] = str(provenance)
-    # Healthy: the account is bound with complete financials. The bounded
-    # uncertainty reasons are expected in SHADOW and recorded separately.
-    record["healthy"] = bool(record["account_bound"] and record["financial_complete"])
+    # Healthy: the observation captured bound evidence with financial fields
+    # present. The provider's own financial incompleteness (cash unverified) is
+    # financial_complete's dimension — recorded, never conflated into healthy.
+    record["healthy"] = bool(record["account_bound"] and financial is not None)
     record["uncertainty_reasons"] = tuple(get("reasons", ()) or ())
     return record
 
