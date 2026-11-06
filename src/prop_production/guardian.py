@@ -147,7 +147,7 @@ class Guardian:
                        if d["receipt"]["decision_id"] == decision_id), None)
         if record is None:
             raise ValueError("DECISION_UNKNOWN")
-        if record["intent_ids"]:
+        if record.get("reservation_committed"):
             return list(record["intent_ids"])
         receipt = record["receipt"]
         reasons = self._scope(now_ms)
@@ -190,7 +190,33 @@ class Guardian:
                 "proof_sha": digest(receipt), "reservation_id": decision_id,
             })
         ids = [i["intent_id"] for i in intents]
+        # Exact opposing pod targets can cross internally only in the synthetic fixture.
+        # There is no external execution, cash movement, fee, or broker position.
+        # A nonzero broker delta must never take this path: its pod attribution is
+        # determined by independently observed broker fills instead.
+        internal_cross: dict[str, dict[str, str]] = {}
+        if not ids:
+            for pod, book in risk["pod_targets"].items():
+                delta = {market: str(decimal(quantity) - decimal(
+                    state["pod_positions"].get(pod, {}).get(market, "0")))
+                    for market, quantity in book.items()}
+                for market, quantity in state["pod_positions"].get(pod, {}).items():
+                    if market not in delta:
+                        delta[market] = str(-decimal(quantity))
+                if any(decimal(quantity) for quantity in delta.values()):
+                    internal_cross[pod] = delta
+            if any(sum((decimal(book.get(market, "0")) for book in internal_cross.values()), ZERO)
+                   for market in {m for book in internal_cross.values() for m in book}):
+                raise ValueError("INTERNAL_CROSS_NOT_NET_ZERO")
         def commit(s: State) -> None:
+            if internal_cross:
+                for pod, deltas in internal_cross.items():
+                    book = s["pod_positions"].setdefault(pod, {})
+                    for market, quantity in deltas.items():
+                        book[market] = str(decimal(book.get(market, "0")) + decimal(quantity))
+                s.setdefault("internal_allocations", []).append({
+                    "decision_id": decision_id, "known_at_ms": now_ms,
+                    "pod_deltas": internal_cross, "scope": "SYNTHETIC_ZERO_BROKER_NET"})
             if ids:
                 s["reservations"][decision_id] = {"loss": risk["worst_loss"],
                     "margin": risk["stressed_margin"], "cost": risk["cost_reserve"], "intent_ids": ids}
@@ -201,6 +227,7 @@ class Guardian:
                 s["source_cursors"][b["source_identity"]] = max(
                     s["source_cursors"].get(b["source_identity"], -1), b["sequence"])
             s["decisions"][receipt["proposal_id"]]["intent_ids"] = ids
+            s["decisions"][receipt["proposal_id"]]["reservation_committed"] = True
             s["runtime"].update(permit={"decision_id": decision_id,
                 "boot_epoch": receipt["journal_epoch"], "broker_epoch": receipt["broker_epoch"],
                 "expires_at_ms": receipt["known_at_ms"] + 5000}, state="SHADOW_READY")

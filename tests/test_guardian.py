@@ -5,7 +5,7 @@ import pytest
 from test_planner import book, quote
 
 
-def setup_system(tmp_path):
+def setup_system(tmp_path, opposed=False):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     from prop_production.evidence import digest, sign
@@ -22,6 +22,12 @@ def setup_system(tmp_path):
     body = fixture_release()
     body["risk_policy_sha"] = digest({"policy": policy, "markets": markets})
     body["rulebook_sha"] = rules.sha
+    if opposed:
+        body["members"].append(dict(body["members"][0], pod_id="pod-b",
+            source_identity="fixture-leader-b", account_scope=["fixture-leader-b"]))
+        body["definition_sha"] = digest(body["members"])
+        body["source_sha"] = digest({k: body[k] for k in
+            ("research_commit", "decision_sha", "inventory_sha", "definition_sha", "selection_known_at_ms")})
     release = ReleaseVerifier(key.public_key(), "approver", "fixture-account",
                               body["risk_policy_sha"], rules.sha).verify(
                                   sign(body, key, "approver"), now_ms=1000)
@@ -32,6 +38,9 @@ def setup_system(tmp_path):
     guardian = Guardian(journal, release, floor, key.public_key(), rules, policy, markets, broker)
     planner = Planner(tmp_path / "planner.sqlite", release, key.public_key())
     planner.ingest(sign(book(), key, "source-observer"), local_known_ms=1000)
+    if opposed:
+        second = dict(book(qty="-15"), source_identity="fixture-leader-b", scope=["fixture-leader-b"])
+        planner.ingest(sign(second, key, "source-observer"), local_known_ms=1000)
     guardian.reconcile(301000)
     proposal = planner.propose(301000, journal.snapshot()["runtime"]["broker_epoch"], quote())
     planner.close()
