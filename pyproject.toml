@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Account-guarded copytrading runtime with no live execution route"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["cryptography==46.0.3"]
+dependencies = ["cryptography>=50.0.2,<51"]
 
 [project.optional-dependencies]
 connector = ["trading-connector-library @ git+https://github.com/hzminhzz/trading-connector.git@b28aa8522c51830a4b389a61b20ceb539b7a89ca"]
