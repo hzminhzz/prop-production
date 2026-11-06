@@ -23,6 +23,29 @@ def test_readonly_snapshot_has_exact_unknowns_and_rejects_mutation():
         gateway.cancel("any")
 
 
+def test_native_metadata_survives_wire_roundtrip_without_promoting_readiness():
+    from dataclasses import asdict
+
+    from prop_production.gateway import fixture_snapshot, snapshot_from_wire
+
+    original = fixture_snapshot(1000)
+    raw = asdict(original)
+    raw.update(cash=None, equity="1010.00000001", connected=False, financial_complete=False,
+               history_complete=False, cutoff=None, native_account_id="fixture-only",
+               provider_balance="1010.00000001", provider_buying_power="400.25",
+               provider_financial_provenance=(("cash", "UNKNOWN"), ("equity", "DERIVED_SDK_FORMULA")),
+               evidence_schema="propr_native_evidence_v1",
+               uncertainty_reasons=("RECONCILIATION_UNCERTAIN",),
+               native_inventory_read_complete=True, native_inventory_count=(1, 2, 3))
+    converted = snapshot_from_wire(raw)
+    assert converted.provider_balance == Decimal("1010.00000001")
+    assert converted.provider_buying_power == Decimal("400.25")
+    assert converted.provider_financial_provenance == (("cash", "UNKNOWN"), ("equity", "DERIVED_SDK_FORMULA"))
+    assert converted.native_inventory_count == (1, 2, 3)
+    assert converted.uncertainty_reasons == ("RECONCILIATION_UNCERTAIN",)
+    assert not converted.ready(1000, 5000)
+
+
 def test_stale_disconnect_and_cross_account_never_ready():
     from prop_production.gateway import ReadOnlyGateway, fixture_snapshot
 

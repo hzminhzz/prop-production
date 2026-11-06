@@ -60,6 +60,17 @@ class BrokerSnapshot:
     connected: bool = False
     financial_complete: bool = False
     market_marks: tuple[tuple[str, Decimal, int], ...] = ()
+    provider_balance: Decimal | None = None
+    provider_buying_power: Decimal | None = None
+    provider_financial_provenance: tuple[tuple[str, str], ...] = ()
+    provider_time: str | None = None
+    native_account_id: str | None = None
+    native_attempt_id: str | None = None
+    native_account_source: str | None = None
+    evidence_schema: str | None = None
+    uncertainty_reasons: tuple[str, ...] = ()
+    native_inventory_read_complete: bool = False
+    native_inventory_count: tuple[int, int, int] | None = None
 
     def ready(self, now_ms: int, max_age_ms: int) -> bool:
         amounts = (self.cash, self.equity, self.unrealized,
@@ -159,7 +170,16 @@ def snapshot_from_wire(raw: dict[str, Any]) -> BrokerSnapshot:
                           amount("unrealized"), amount("initial_margin"),
                           amount("maintenance_margin"), positions, orders, fills, raw["cutoff"],
                           raw["history_complete"], raw["connected"], raw["financial_complete"],
-                          tuple((m, decimal(price), known) for m, price, known in raw.get("market_marks", [])))
+                          tuple((m, decimal(price), known) for m, price, known in raw.get("market_marks", [])),
+                          amount("provider_balance"), amount("provider_buying_power"),
+                          tuple(tuple(field) for field in raw.get("provider_financial_provenance", ())),
+                          raw.get("provider_time"), raw.get("native_account_id"),
+                          raw.get("native_attempt_id"), raw.get("native_account_source"),
+                          raw.get("evidence_schema"),
+                          tuple(raw.get("uncertainty_reasons", ())),
+                          raw.get("native_inventory_read_complete", False),
+                          tuple(raw["native_inventory_count"])
+                          if raw.get("native_inventory_count") is not None else None)
 
 
 def fixture_snapshot(now_ms: int = 1000) -> BrokerSnapshot:
@@ -172,37 +192,98 @@ def fixture_snapshot(now_ms: int = 1000) -> BrokerSnapshot:
 
 async def inspect_propr_readonly(rest: Any, account_id: str, endpoint: str,
                                 received_at_ms: int) -> BrokerSnapshot:
-    """Uses the pinned connector's actual published read-only parsers.
+    """Consume versioned provider evidence; never reconstruct Guardian cash.
 
-    Offset pagination and ordinary REST timestamps do not prove a coherent cutoff.
-    Even complete fields therefore remain non-ready; no invented replay sequence.
+    Diagnostic inventories are not coherent broker history. Synthetic fixtures
+    continue to use their own fully-proven fake history and accounting path.
     """
-    account = importlib.import_module("connectors.propr.account")
-    inventory_module = importlib.import_module("connectors.propr.inventory")
-    binding = await account.discover_account(rest, account_id)
-    raw = await rest.request("GET", rest_account_path(account_id))
-    financial = account.parse_account(account_id, binding.attempt_id, raw)
-    inventory = await inventory_module.InventoryReader(rest, account_id).snapshot()
-    positions: list[Position] = []
-    complete = financial.complete
-    for p in inventory.positions:
-        if p.entry_price is None or p.mark_price is None:
-            complete = False
-            continue
-        qty = p.quantity if p.side == "long" else -p.quantity
-        positions.append(Position(p.asset, qty, p.entry_price, p.mark_price))
-    orders = tuple(BrokerOrder(o.intent_id or "", o.id, o.asset,
-                               o.quantity if o.side == "buy" else -o.quantity,
-                               o.filled if o.side == "buy" else -o.filled, str(o.status), bool(o.reduce_only))
-                   for o in inventory.orders)
-    cash = (financial.equity - financial.unrealized_pnl
-            if financial.equity is not None and financial.unrealized_pnl is not None else None)
-    return BrokerSnapshot(digest({"provider": "propr", "endpoint": endpoint, "account": account_id}),
-                          endpoint, received_at_ms, received_at_ms, 1, cash, financial.equity,
-                          financial.unrealized_pnl, financial.initial_margin,
-                          financial.maintenance_margin, tuple(positions), orders,
-                          cutoff=None, history_complete=False, connected=True,
-                          financial_complete=complete)
+    native = importlib.import_module("connectors.propr.native_evidence")
+    evidence = await native.inspect_native_evidence(
+        rest, account_id=account_id, endpoint=endpoint,
+        known_at_ms=received_at_ms, stream_connected=False,
+    )
+    if evidence.schema != "propr_native_evidence_v1":
+        raise ValueError("NATIVE_EVIDENCE_VERSION_UNSUPPORTED")
+    if evidence.endpoint != endpoint or evidence.account_id != account_id:
+        raise ValueError("NATIVE_EVIDENCE_SCOPE_MISMATCH")
+
+    financial = evidence.financial
+    # No provider-verified cash is available. Never satisfy Guardian's synthetic
+    # cash+unrealized=equity equation with a fabricated residual.
+    positions: tuple[Position, ...] = ()
+    orders: tuple[BrokerOrder, ...] = ()
+    fills: tuple[Execution, ...] = ()
+    additional_reasons: list[str] = []
+    if evidence.inventory is not None:
+        entries: list[Position] = []
+        for item in evidence.inventory.positions:
+            if item.entry_price is None or item.mark_price is None:
+                additional_reasons.append("POSITION_PRICE_UNVERIFIED")
+                entries.clear()
+                break
+            entries.append(Position(
+                item.asset, item.quantity if item.side == "long" else -item.quantity,
+                item.entry_price, item.mark_price,
+            ))
+        positions = tuple(entries)
+        orders = tuple(BrokerOrder(
+            item.intent_id or "", item.id, item.asset,
+            item.quantity if item.side == "buy" else -item.quantity,
+            item.filled if item.side == "buy" else -item.filled,
+            item.status.value, item.reduce_only is True,
+        ) for item in evidence.inventory.orders)
+        order_intents = {item.id: item.intent_id for item in evidence.inventory.orders}
+        mapped_fills: list[Execution] = []
+        for trade in evidence.inventory.trades:
+            intent = order_intents.get(trade.order_id)
+            if (not intent or trade.fee is None or trade.side not in ("buy", "sell")
+                    or not evidence.provider_time):
+                additional_reasons.append("EXECUTION_EVIDENCE_UNVERIFIED")
+                mapped_fills.clear()
+                break
+            # Provider execution timestamps are native strings; no assertion that
+            # these give a coherent history or independently witnessed fill cutoff.
+            from datetime import datetime
+            try:
+                parsed = datetime.fromisoformat(trade.timestamp.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError("EXECUTION_TIME_UNVERIFIED")
+                execution_time = int(parsed.timestamp() * 1000)
+            except (ValueError, OverflowError):
+                additional_reasons.append("EXECUTION_TIME_UNVERIFIED")
+                mapped_fills.clear()
+                break
+            mapped_fills.append(Execution(
+                trade.id, intent, trade.asset,
+                trade.quantity if trade.side == "buy" else -trade.quantity,
+                trade.price, trade.fee, execution_time,
+            ))
+        fills = tuple(mapped_fills)
+    provenance = tuple((name, getattr(financial, name).provenance)
+                       for name in ("balance", "equity", "buying_power", "cash",
+                                    "unrealized_pnl", "initial_margin", "maintenance_margin"))
+    return BrokerSnapshot(
+        account_binding=digest({"provider": "propr", "endpoint": endpoint, "account": account_id}),
+        endpoint=endpoint, observed_at_ms=received_at_ms, received_at_ms=received_at_ms,
+        epoch=0, cash=financial.cash.value, equity=financial.equity.value,
+        unrealized=financial.unrealized_pnl.value,
+        initial_margin=financial.initial_margin.value,
+        maintenance_margin=financial.maintenance_margin.value,
+        positions=positions, orders=orders, fills=fills, cutoff=evidence.cutoff,
+        history_complete=evidence.history_complete, connected=evidence.stream_connected,
+        financial_complete=False,
+        provider_balance=financial.balance.value,
+        provider_buying_power=financial.buying_power.value,
+        provider_financial_provenance=provenance, provider_time=evidence.provider_time,
+        native_account_id=evidence.account_id if evidence.account_bound else None,
+        native_attempt_id=evidence.attempt_id, native_account_source=evidence.account_source,
+        evidence_schema=evidence.schema,
+        uncertainty_reasons=tuple(sorted(set(evidence.reasons) | set(additional_reasons))),
+        native_inventory_read_complete=evidence.inventory_read_complete,
+        native_inventory_count=(len(evidence.inventory.orders),
+                                len(evidence.inventory.positions),
+                                len(evidence.inventory.trades)) if evidence.inventory is not None else None,
+    )
 
 
 def rest_account_path(account_id: str) -> str:

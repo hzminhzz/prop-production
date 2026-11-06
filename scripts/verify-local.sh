@@ -32,7 +32,7 @@ else
 fi
 
 RESEARCH_SHA="fcf79b8e4d8012b46cdf8d2ad190af06a6e8dd5e"
-CONNECTOR_SHA="ec3f03a5d24a2db3b0c75fe61e3a3fbfa662b343"
+CONNECTOR_SHA="b28aa8522c51830a4b389a61b20ceb539b7a89ca"
 if [[ "$MODE" == "all" ]]; then
     : "${PROP_RESEARCH_ROOT:?BLOCKED: set PROP_RESEARCH_ROOT to the pinned copytrade-pm worktree}"
     : "${PROP_CONNECTOR_ROOT:?BLOCKED: set PROP_CONNECTOR_ROOT to the pinned trading-connector worktree}"
@@ -76,6 +76,8 @@ if [[ "$MODE" == "all" ]]; then
         cd "$PROP_CONNECTOR_ROOT"
         .venv/bin/python -m pytest -q connectors/propr/tests
     )
+    printf '\n[app + native connector / %s]\n' "$CONNECTOR_SHA"
+    PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --extra connector --group dev pytest -q tests/test_native_gateway.py
     printf '\n[research / %s]\n' "$RESEARCH_SHA"
     (
         cd "$PROP_RESEARCH_ROOT"

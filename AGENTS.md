@@ -10,6 +10,12 @@ Preserve other sessions' changes. Use isolated worktrees when upstream is dirty.
 
 Research metadata belongs to copytrade-pm SQLite. Provider protocol code belongs
 to trading-connector. Guardian account finance belongs to this application.
+Consume Propr read-only provider data exclusively through the versioned native
+evidence contract in connectors/propr/native_evidence.py via BrokerGateway. Never
+manufacture Guardian cash as equity minus unrealized PnL or treat matching REST
+snapshots as a coherent provider history cutoff. Preserve provider financial
+provenance, native identity, timestamps and RECONCILIATION_UNCERTAIN. No
+connector-owned journal may replace a Guardian-committed production intent.
 Planner cannot supply trusted broker equity, grant permits or access credentials.
 
 Default SHADOW / NO_TRADE. No real broker mutations, credentials, wallet identities,
