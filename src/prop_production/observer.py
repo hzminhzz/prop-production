@@ -64,8 +64,11 @@ async def observe_once() -> dict[str, Any]:
     from connectors.propr.native_evidence import inspect_native_evidence
 
     endpoint = os.environ.get("PROPR_API_URL", "").rstrip("/") or "https://api.propr.xyz/v1"
+    key = os.environ.get("PROPR_LIVE_API_KEY") or os.environ.get("PROPR_API_KEY")
+    if not key:
+        raise PermissionError("OBSERVER_KEY_MISSING")
     reader = ReadOnlyAccount(ProprConfig(Environment.PRODUCTION, account_id=None,
-                                         api_key=None, api_url=endpoint))
+                                         api_key=key, api_url=endpoint))
     binding = await discover_account(reader.rest)
     native = await inspect_native_evidence(
         reader.rest, account_id=binding.account_id, endpoint=endpoint,
