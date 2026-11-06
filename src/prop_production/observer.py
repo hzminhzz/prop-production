@@ -58,9 +58,13 @@ def observation_record(result: Any, *, now_ms: int) -> dict[str, Any]:
         for key in ("balance", "equity", "buying_power", "cash", "unrealized_pnl",
                     "isolated_position_margin", "initial_margin", "maintenance_margin"):
             field = fget(key)
-            if field is not None:
-                record[key] = str(getattr(field, "value", field))
-                record[key + "_provenance"] = str(getattr(field, "provenance", "UNKNOWN"))
+            if field is None:
+                continue
+            value = field.get("value") if isinstance(field, dict) else getattr(field, "value", field)
+            provenance = (field.get("provenance") if isinstance(field, dict)
+                          else getattr(field, "provenance", "UNKNOWN"))
+            record[key] = str(value)
+            record[key + "_provenance"] = str(provenance)
     # Healthy: the account is bound with complete financials. The bounded
     # uncertainty reasons are expected in SHADOW and recorded separately.
     record["healthy"] = bool(record["account_bound"] and record["financial_complete"])
