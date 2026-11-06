@@ -59,7 +59,7 @@ if [ ! -d "$RELEASE_DIR" ]; then
     WHEEL_SHA=$(sha256sum "$WHEEL" | cut -d' ' -f1)
     echo "$WHEEL_SHA  $(basename "$WHEEL")" > "$WHEEL_DIR/SHA256SUMS"
     # Verify the recorded digest matches before installing anything.
-    sha256sum -c "$WHEEL_DIR/SHA256SUMS" >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
+    (cd "$WHEEL_DIR" && sha256sum -c SHA256SUMS) >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
     python3 -m venv "$RELEASE_DIR/venv"
     "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx
     git rev-parse "$RELEASE_SHA" > "$RELEASE_DIR/COMMIT"
