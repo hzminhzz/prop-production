@@ -29,7 +29,10 @@ The CLI is authoritative; prose SHAs here go stale the moment a release ships.
   `observer/`, `watchdog/`, `health/{guardian,observer,watchdog}/` (role-owned
   heartbeats, 0750 dirs, 0640 files).
 - Credentials: `/etc/prop-production/observer.env` (0600 root:root, injected via
-  systemd EnvironmentFile). Never in Git, never in logs.
+  systemd EnvironmentFile). Bybit uses a separate `/etc/prop-production/bybit.env`
+  (0600 root:root) copied only from the pre-existing dedicated Demo file. Never in Git or logs.
+- Bybit private state: `/var/lib/prop-production/bybit/`; heartbeat:
+  `/var/lib/prop-production/health/bybit/heartbeat.json` (role-owned, read-only to watchdog).
 
 ## Services
 
@@ -40,6 +43,7 @@ The CLI is authoritative; prose SHAs here go stale the moment a release ships.
 | `prop-production-planner` | `prop-planner` | Planner worker |
 | `prop-production-observer` | `prop-observer` | read-only Propr `propr_native_evidence_v1` polling |
 | `prop-production-watchdog` | `prop-watchdog` | independent `watchdog_assessment_v2` evidence |
+| `prop-production-bybit-observer` | `prop-bybit` | separate Bybit Demo read-only account/position/order observation |
 
 Broker+Guardian share one uid by the IPC peer-credential contract — a deliberate
 temporary limitation; it does NOT establish acceptable isolation for future
@@ -79,6 +83,10 @@ sudo systemctl restart prop-production-*
   `RECONCILIATION_UNCERTAIN`; `history_complete: false`; `opening_ready: false`.
 - Trading: **never authorized**. `trading_authorized: false` in every surface.
   The connector mutation guard is intact; no real order route exists.
+
+## Bybit Demo (additional read-only venue)
+
+A sixth service, `prop-production-bybit-observer.service`, authenticates the dedicated Bybit Demo key and expected UID against `api-demo.bybit.com`, reads account USD equity/available buying power, supported live positions and open orders, and writes a separate private tape. No trades are sent. Watchdog `bybit_status=OBSERVED_READ_ONLY` means only a fresh authenticated bounded REST read; it does not prove a coherent cutoff, actual available cash, or execution readiness. Run the credential-free tests and protected single-observation smoke described in `docs/BYBIT-DEMO-INTEGRATION.md`.
 
 ## Safety invariants
 

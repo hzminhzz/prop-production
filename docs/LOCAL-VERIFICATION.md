@@ -18,6 +18,8 @@ During development only, `GATE_CLEAN=0 bash scripts/verify-local.sh app` is perm
 
 Store terminal output and the SHA-256 of the completed log in a private, access-controlled directory **outside Git** when documenting a release or issue disposition; include the command, resolved application/connector/research SHAs, Python/uv versions, timestamp, pass/skip counts, reviewer and any gaps. Repeat after each relevant code change. This is local evidence, not an independently signed G2 certificate.
 
+The connector gate also exercises pinned Bybit adapter tests. A separate cross-repository Bybit Demo adapter check uses CCXT 4.5.74 and credential-free fixtures; it does not send provider orders. Authenticated read-only smoke is a distinct, operator-scoped check with the dedicated Demo key, and is never a substitute for the commit-bound suite. See docs/BYBIT-DEMO-INTEGRATION.md.
+
 ## Operational rules
 
 - Local checks replace the need for GitHub Actions. A GitHub billing/job-startup failure is **not** an engineering blocker and should not be cited as one.

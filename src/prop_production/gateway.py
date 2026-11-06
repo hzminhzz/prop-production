@@ -286,6 +286,115 @@ async def inspect_propr_readonly(rest: Any, account_id: str, endpoint: str,
     )
 
 
+
+async def inspect_bybit_demo_readonly(client: Any, received_at_ms: int) -> BrokerSnapshot:
+    """Map the pinned connector's authenticated Bybit Demo reads into SHADOW evidence.
+
+    The existing connector owns all Bybit V5 and CCXT protocol calls. A completed
+    REST observation cannot prove a coherent replay boundary, trade history or
+    ledger cash, and never permits Guardian openings.
+    """
+    config = getattr(client, "config", None)
+    if config is None:
+        raise PermissionError("BYBIT_DEMO_SCOPE_UNVERIFIED")
+    environment = getattr(getattr(config, "environment", None), "value", None)
+    mode = getattr(getattr(config, "mode", None), "value", None)
+    identity = getattr(client, "demo_identity_evidence", {})
+    if (environment != "demo" or mode != "read_only"
+            or getattr(client, "demo_identity_verified", False) is not True
+            or not isinstance(identity, dict)
+            or identity.get("environment") != "demo"
+            or identity.get("private_rest") != "api-demo.bybit.com"
+            or identity.get("authenticated_uid_matches_expected") is not True
+            or identity.get("dedicated_demo_key_matches") is not True
+            or identity.get("unified_account_verified") is not True
+            or not getattr(config, "expected_demo_uid", None)):
+        raise PermissionError("BYBIT_DEMO_SCOPE_UNVERIFIED")
+    if type(received_at_ms) is not int or received_at_ms <= 0:
+        raise ValueError("BYBIT_OBSERVATION_TIME_INVALID")
+
+    summary = await client.fetch_demo_account_summary()
+    positions_native = await client.fetch_demo_positions()
+    orders_native = await client.fetch_demo_open_orders()
+    equity = decimal(summary.equity_usd)
+    buying_power = decimal(summary.available_usd)
+    if not equity.is_finite() or not buying_power.is_finite():
+        raise ValueError("BYBIT_FINANCIAL_EVIDENCE_INVALID")
+
+    positions: list[Position] = []
+    seen_markets: set[str] = set()
+    for item in positions_native:
+        size = decimal(item.size)
+        if (item.side not in ("buy", "sell") or size <= 0 or
+                not isinstance(item.symbol, str) or not item.symbol or
+                item.symbol in seen_markets or
+                item.entry_price is None or item.mark_price is None):
+            raise ValueError("BYBIT_POSITION_EVIDENCE_INVALID")
+        entry, mark = decimal(item.entry_price), decimal(item.mark_price)
+        if entry <= 0 or mark <= 0:
+            raise ValueError("BYBIT_POSITION_PRICE_INVALID")
+        positions.append(Position(item.symbol, size if item.side == "buy" else -size,
+                                  entry, mark))
+        seen_markets.add(item.symbol)
+
+    orders: list[BrokerOrder] = []
+    seen_orders: set[str] = set()
+    for item in orders_native:
+        size, filled = decimal(item.quantity), decimal(item.filled_quantity)
+        if (item.side not in ("buy", "sell")
+                or item.status not in ("open", "partially_filled")
+                or not isinstance(item.order_id, str) or not item.order_id
+                or item.order_id in seen_orders or not item.symbol
+                or size <= 0 or filled < 0 or filled > size):
+            raise ValueError("BYBIT_ORDER_EVIDENCE_INVALID")
+        sign = Decimal("1") if item.side == "buy" else Decimal("-1")
+        orders.append(BrokerOrder(
+            item.client_order_id or "", item.order_id, item.symbol,
+            size * sign, filled * sign, item.status,
+            False,  # reduce-only is not proven by this connector's order DTO
+        ))
+        seen_orders.add(item.order_id)
+
+    # Avoid storing UID or key in evidence. The preflight has authenticated
+    # exact UID/key equality, and this fingerprint scopes the read-only account.
+    scope = digest({"venue": "bybit", "environment": "demo",
+                    "uid": config.expected_demo_uid})
+    return BrokerSnapshot(
+        account_binding=scope, endpoint="https://api-demo.bybit.com",
+        observed_at_ms=received_at_ms, received_at_ms=received_at_ms,
+        epoch=0, cash=None, equity=equity, unrealized=None,
+        initial_margin=None, maintenance_margin=None,
+        positions=tuple(positions), orders=tuple(orders),
+        fills=(), cutoff=None, history_complete=False,
+        connected=False, financial_complete=False,
+        provider_balance=None, provider_buying_power=buying_power,
+        provider_financial_provenance=(
+            ("equity", "PROVIDER_TOTAL_EQUITY_USD"),
+            ("buying_power", "PROVIDER_TOTAL_AVAILABLE_BALANCE_USD"),
+            ("cash", "UNKNOWN"),
+            ("balance", "UNKNOWN"),
+            ("unrealized_pnl", "UNKNOWN"),
+            ("initial_margin", "UNKNOWN"),
+            ("maintenance_margin", "UNKNOWN"),
+        ),
+        provider_time=None, native_account_id=None,
+        native_account_source="bybit_demo",
+        evidence_schema="bybit_demo_snapshot_v1",
+        uncertainty_reasons=(
+            "BYBIT_NO_VERIFIED_HISTORY_CUTOFF",
+            "BYBIT_FINANCIAL_LEDGER_CASH_UNVERIFIED",
+            "BYBIT_MARGIN_AND_UNREALIZED_PNL_UNVERIFIED",
+            "BYBIT_EXECUTION_AND_FUNDING_UNVERIFIED",
+            "BYBIT_PRIVATE_STREAM_NOT_ESTABLISHED",
+            "REMOTE_MUTATION_UNAVAILABLE",
+        ),
+        # Position/order reads are complete for the supported V5 scope;
+        # the all-history trade/fill inventory was not fetched.
+        native_inventory_read_complete=False,
+        native_inventory_count=None,
+    )
+
+
 def rest_account_path(account_id: str) -> str:
     from urllib.parse import quote
     if not account_id or "/" in account_id:
