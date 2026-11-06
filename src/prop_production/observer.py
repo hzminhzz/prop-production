@@ -29,29 +29,42 @@ def _stop(*_: Any) -> None:
 
 
 def observation_record(result: Any, *, now_ms: int) -> dict[str, Any]:
-    """Normalize one ReadOnlyAccount.inspect() result into an evidence record."""
+    """Normalize one native-evidence result into an evidence record.
+
+    The connector's NativeEvidence carries a NativeFinancial of FinancialField
+    objects (value + provenance). Missing evidence stays UNKNOWN; healthy means
+    the account is bound with complete financials — bounded uncertainty reasons
+    (cash unverified, cutoff unproven) are expected and recorded separately.
+    """
     get = result.get if isinstance(result, dict) else (lambda k, d=None: getattr(result, k, d))
     record: dict[str, Any] = {
         "schema": "propr_observation_v1",
         "observed_at_ms": now_ms,
-        "healthy": bool(get("healthy", False)),
         "account_bound": bool(get("account_bound", False)),
         "account_source": str(get("account_source", "UNKNOWN")),
-        "financial_fields_verified": bool(get("financial_fields_verified", False)),
-        "history_complete": False,
+        "financial_complete": bool(get("financial_complete", False)),
+        "inventory_read_complete": bool(get("inventory_read_complete", False)),
+        "stream_connected": bool(get("stream_connected", False)),
+        "history_complete": bool(get("history_complete", False)),
+        "cutoff": str(get("cutoff", "UNKNOWN")),
+        "opening_ready": bool(get("opening_ready", False)),
         "reconciliation": "RECONCILIATION_UNCERTAIN",
         # Never derived: cash = equity - unrealized PnL is not verified ledger cash.
         "ledger_cash": "UNKNOWN",
     }
-    snapshot = get("snapshot")
-    if snapshot is not None:
-        fields = snapshot if isinstance(snapshot, dict) else None
-        for key in ("equity", "balance", "buying_power", "unrealized_pnl", "margin_used",
-                    "initial_margin", "maintenance_margin", "high_water_mark"):
-            if isinstance(fields, dict):
-                record[key] = str(fields.get(key, "UNKNOWN"))
-            else:
-                record[key] = str(getattr(snapshot, key, "UNKNOWN"))
+    financial = get("financial")
+    if financial is not None:
+        fget = financial.get if isinstance(financial, dict) else (lambda k, d=None: getattr(financial, k, d))
+        for key in ("balance", "equity", "buying_power", "cash", "unrealized_pnl",
+                    "isolated_position_margin", "initial_margin", "maintenance_margin"):
+            field = fget(key)
+            if field is not None:
+                record[key] = str(getattr(field, "value", field))
+                record[key + "_provenance"] = str(getattr(field, "provenance", "UNKNOWN"))
+    # Healthy: the account is bound with complete financials. The bounded
+    # uncertainty reasons are expected in SHADOW and recorded separately.
+    record["healthy"] = bool(record["account_bound"] and record["financial_complete"])
+    record["uncertainty_reasons"] = tuple(get("reasons", ()) or ())
     return record
 
 

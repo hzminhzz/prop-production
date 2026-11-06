@@ -7,9 +7,9 @@ from prop_production.watchdog import assess
 
 
 def test_observation_record_flattens_dict_result():
-    record = observation_record({"healthy": True, "account_bound": True,
+    record = observation_record({"account_bound": True, "financial_complete": True,
                                  "account_source": "challenge",
-                                 "snapshot": {"equity": "4999.225661"}}, now_ms=1000)
+                                 "financial": {"equity": {"value": "4999.225661"}}}, now_ms=1000)
     assert record["healthy"] is True
     assert record["account_bound"] is True
     assert record["equity"] == "4999.225661"
