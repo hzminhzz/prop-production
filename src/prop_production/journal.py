@@ -185,27 +185,34 @@ class Journal:
 
     def recover(self, reason: str, at_ms: int, *, operator: str, incident_id: str,
                 evidence_sha: str) -> int:
-        """Operator-audited recovery: clear one latched halt after incident resolution.
+        """Evidence-gated recovery: HALTED → RECOVERY_REQUESTED → RECOVERY_VERIFIED.
 
-        State machine: HALTED → RECOVERY_REQUESTED → RECOVERY_VERIFIED → DISARMED.
-        Requires the exact existing HALT reason, operator identity, incident ID,
-        evidence digest and a fresh epoch; stale permits are revoked and no
-        automatic re-arm occurs.
+        Requires the exact existing HALT, operator identity, incident ID and a
+        well-formed evidence digest. Unrelated HALTs keep the runtime HALTED;
+        clearing the last one transitions to DISARMED with a fresh epoch and
+        revoked permits. Never auto-arms.
         """
         if reason not in self.snapshot()["halts"]:
             raise ValueError(f"HALT_NOT_PRESENT: {reason}")
-        if not operator or not incident_id or not evidence_sha:
-            raise ValueError("RECOVERY_EVIDENCE_INCOMPLETE")
+        if not operator.strip() or not incident_id.strip():
+            raise ValueError("RECOVERY_IDENTITY_REQUIRED")
+        if (not isinstance(evidence_sha, str) or len(evidence_sha) != 64
+                or any(c not in "0123456789abcdef" for c in evidence_sha.lower())):
+            raise ValueError("RECOVERY_EVIDENCE_DIGEST_INVALID")
 
         def apply(state: State) -> None:
             state["halts"].remove(reason)
             runtime = state["runtime"]
-            runtime["state"] = "DISARMED"
+            # Unrelated HALTs keep the runtime halted; only a clean sheet disarms.
+            runtime["state"] = "DISARMED" if not state["halts"] else "HALTED"
             runtime["boot_epoch"] = runtime.get("boot_epoch", 0) + 1
             runtime["permit"] = None
-            runtime["last_recovery"] = {"reason": reason, "operator": operator,
-                                        "incident_id": incident_id,
-                                        "evidence_sha256": evidence_sha, "at_ms": at_ms}
+            runtime["last_recovery"] = {
+                "recovery_state": "RECOVERY_VERIFIED", "reason": reason,
+                "operator": operator, "incident_id": incident_id,
+                "evidence_sha256": evidence_sha.lower(), "at_ms": at_ms,
+                "remaining_halts": list(state["halts"]),
+            }
         return self.update("RECOVER_" + reason, at_ms, apply)
 
     def verify(self) -> dict[str, Any]:

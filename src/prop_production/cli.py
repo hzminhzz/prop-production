@@ -58,10 +58,33 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
         if args.journal is None or args.action == "report":
             raise ValueError("JOURNAL_AND_REASON_REQUIRED")
+        if not args.operator or not args.incident or not args.evidence_sha:
+            raise ValueError("OPERATOR_INCIDENT_AND_EVIDENCE_REQUIRED")
         account = Journal.read(args.journal)["account_binding"]
+        # Incident-specific verification: BROKER_UNREACHABLE requires a fresh
+        # attested guardian heartbeat showing a coherent reconcile (the broker
+        # is reachable again); its digest is the recovery evidence.
+        if args.action == "BROKER_UNREACHABLE":
+            heartbeat_path = (args.journal.parent.parent / "health" / "guardian"
+                              / "heartbeat.json")
+            try:
+                heartbeat = json.loads(heartbeat_path.read_text())
+                if not isinstance(heartbeat, dict):
+                    raise ValueError("HEARTBEAT_SCHEMA")
+            except (OSError, ValueError) as error:
+                raise ValueError("RECOVERY_EVIDENCE_UNAVAILABLE") from error
+            progress = heartbeat.get("last_progress_ms")
+            if (heartbeat.get("certainty") != "COHERENT"
+                    or not isinstance(progress, int)
+                    or not 0 <= now_ms - progress <= 120_000):
+                raise ValueError("RECOVERY_BROKER_STILL_UNREACHABLE")
+            import hashlib
+            evidence_sha = hashlib.sha256(json.dumps(heartbeat, sort_keys=True).encode()).hexdigest()
+        else:
+            evidence_sha = args.evidence_sha
         with Journal(args.journal, account) as journal:
             journal.recover(args.action, now_ms, operator=args.operator,
-                            incident_id=args.incident, evidence_sha=args.evidence_sha)
+                            incident_id=args.incident, evidence_sha=evidence_sha)
             remaining = Journal.read(args.journal)["halts"]
             return {
                 "schema": "operator_recover_v1",

@@ -71,9 +71,11 @@ def test_watchdog_propagates_latched_halts(tmp_path):
 def test_driver_heartbeat_writes_evidence(tmp_path):
     import subprocess
 
-    worker = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    from prop_production.driver import BoundedReader
+
+    worker = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     try:
-        _heartbeat(tmp_path, worker)
+        _heartbeat(tmp_path, worker, BoundedReader(worker.stdout.fileno()))
     finally:
         worker.stdin.close()
         worker.stdout.close()
@@ -105,12 +107,37 @@ def test_recover_requires_operator_and_incident(tmp_path):
         journal.halt("BROKER_UNREACHABLE", 1000)
         for kwargs in ({"operator": "", "incident_id": "INC-1", "evidence_sha": "0" * 64},
                        {"operator": "op", "incident_id": "", "evidence_sha": "0" * 64},
-                       {"operator": "op", "incident_id": "INC-1", "evidence_sha": ""}):
+                       {"operator": "op", "incident_id": "INC-1", "evidence_sha": ""},
+                       {"operator": "op", "incident_id": "INC-1", "evidence_sha": "forged"},
+                       {"operator": "op", "incident_id": "INC-1", "evidence_sha": "g" * 64}):
             try:
                 journal.recover("BROKER_UNREACHABLE", 1000, **kwargs)
-                assert False, f"incomplete recovery evidence accepted: {kwargs}"
+                assert False, f"invalid recovery evidence accepted: {kwargs}"
             except ValueError as error:
-                assert "RECOVERY_EVIDENCE_INCOMPLETE" in str(error)
+                assert ("RECOVERY_IDENTITY_REQUIRED" in str(error)
+                        or "RECOVERY_EVIDENCE_DIGEST_INVALID" in str(error))
+    finally:
+        journal.close()
+
+
+def test_recover_preserves_unrelated_halts(tmp_path):
+    from prop_production.journal import Journal
+    journal = Journal(tmp_path / "account.sqlite", "fixture-account", initialize=True)
+    try:
+        journal.halt("BROKER_UNREACHABLE", 1000)
+        journal.halt("UNKNOWN_OUTCOME", 1100)
+        journal.recover("BROKER_UNREACHABLE", 2000, operator="op",
+                        incident_id="INC-3", evidence_sha="b" * 64)
+        state = journal.snapshot()
+        # Unrelated HALT keeps the runtime HALTED; only a clean sheet disarms.
+        assert state["halts"] == ["UNKNOWN_OUTCOME"]
+        assert state["runtime"]["state"] == "HALTED"
+        assert state["runtime"]["permit"] is None
+        journal.recover("UNKNOWN_OUTCOME", 2100, operator="op",
+                        incident_id="INC-4", evidence_sha="c" * 64)
+        state = journal.snapshot()
+        assert state["halts"] == []
+        assert state["runtime"]["state"] == "DISARMED"
     finally:
         journal.close()
 
@@ -130,3 +157,52 @@ def test_recover_revokes_permits_and_advances_epoch(tmp_path):
         assert state["runtime"]["last_recovery"]["incident_id"] == "INC-2"
     finally:
         journal.close()
+
+
+def test_watchdog_detects_frozen_journal(tmp_path):
+    """Same sequence + boot epoch across two windows: hung worker, not quiet."""
+    from prop_production.watchdog import assess, write_evidence
+    health = tmp_path / "health"
+    (health / "guardian").mkdir(parents=True)
+    (health / "observer").mkdir(parents=True)
+    heartbeat = {"heartbeat_ms": 9_000, "last_progress_ms": 9_000,
+                 "journal_sequence": 7, "certainty": "COHERENT",
+                 "boot_epoch": 3, "halts": []}
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps(heartbeat))
+    (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
+    first = assess(tmp_path, now_ms=10_000)
+    write_evidence(tmp_path / "watchdog", first)
+    second = assess(tmp_path, now_ms=15_000)  # same sequence, same boot epoch
+    assert "SEQUENCE_NOT_ADVANCING" in second["reasons"]
+
+
+def test_watchdog_allows_restart_and_quiet(tmp_path):
+    """A restart (new boot epoch) or a gap outside the window is not a hang."""
+    from prop_production.watchdog import assess, write_evidence
+    health = tmp_path / "health"
+    (health / "guardian").mkdir(parents=True)
+    (health / "observer").mkdir(parents=True)
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({
+        "heartbeat_ms": 9_000, "last_progress_ms": 9_000, "journal_sequence": 7,
+        "certainty": "COHERENT", "boot_epoch": 3, "halts": []}))
+    (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
+    first = assess(tmp_path, now_ms=10_000)
+    write_evidence(tmp_path / "watchdog", first)
+    # Restart: boot epoch advances, sequence unchanged — legitimate.
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({
+        "heartbeat_ms": 14_000, "last_progress_ms": 14_000, "journal_sequence": 7,
+        "certainty": "COHERENT", "boot_epoch": 4, "halts": []}))
+    after_restart = assess(tmp_path, now_ms=15_000)
+    assert "SEQUENCE_NOT_ADVANCING" not in after_restart["reasons"]
+
+
+def test_watchdog_detects_stale_financial_progress(tmp_path):
+    """A fresh heartbeat with stale journal progress is an incident."""
+    health = tmp_path / "health"
+    (health / "guardian").mkdir(parents=True)
+    (health / "observer").mkdir(parents=True)
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({
+        "heartbeat_ms": 9_000, "last_progress_ms": 9_000 - 500_000,
+        "journal_sequence": 7, "certainty": "COHERENT", "boot_epoch": 3, "halts": []}))
+    (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
+    assert "FINANCIAL_PROGRESS_STALE" in assess(tmp_path, now_ms=10_000)["reasons"]
