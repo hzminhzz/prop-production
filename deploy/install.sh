@@ -21,18 +21,35 @@ for role in runtime planner observer watchdog; do
         --shell /usr/sbin/nologin --gid prop "prop-$role"
 done
 
-# 2. Release layout: build from the REVIEWED COMMIT, hash the artifact, install
-# to releases/<sha>/ and flip the current symlink atomically. Rollback = repoint.
-REVIEWED_SHA=$(git rev-parse HEAD)
+# 2. Release layout: the release identity is the APPROVED MERGE COMMIT on the
+# default branch. The checkout must match its tree exactly; the wheel is built,
+# hashed and verified before installation. Rollback = repoint the symlink.
+DEFAULT_BRANCH=feat/account-guardian-program
+git fetch origin "$DEFAULT_BRANCH" 2>/dev/null || true
+RELEASE_SHA=$(git rev-parse "origin/$DEFAULT_BRANCH")
+git diff --quiet HEAD "origin/$DEFAULT_BRANCH" || {
+    echo "REFUSING: local tree differs from approved $DEFAULT_BRANCH ($RELEASE_SHA)"; exit 1; }
 [ -d "$OPT" ] || mkdir -p "$OPT"
-RELEASE_DIR="$OPT/releases/$REVIEWED_SHA"
+RELEASE_DIR="$OPT/releases/$RELEASE_SHA"
 if [ ! -d "$RELEASE_DIR" ]; then
     mkdir -p "$RELEASE_DIR"
     git diff --quiet HEAD || { echo "REFUSING: dirty review tree"; exit 1; }
+    WHEEL_DIR="$RELEASE_DIR/dist"
+    mkdir -p "$WHEEL_DIR"
+    (uv build --wheel --out-dir "$WHEEL_DIR" 2>/dev/null || python3 -m build --wheel --outdir "$WHEEL_DIR") \
+        || { echo "REFUSING: wheel build failed"; exit 1; }
+    WHEEL=$(ls "$WHEEL_DIR"/*.whl | head -1)
+    WHEEL_SHA=$(sha256sum "$WHEEL" | cut -d' ' -f1)
+    echo "$WHEEL_SHA  $(basename "$WHEEL")" > "$WHEEL_DIR/SHA256SUMS"
+    # Verify the recorded digest matches before installing anything.
+    sha256sum -c "$WHEEL_DIR/SHA256SUMS" >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
     python3 -m venv "$RELEASE_DIR/venv"
-    "$RELEASE_DIR/venv/bin/pip" install --quiet "$REPO" python-dotenv httpx
-    git rev-parse HEAD > "$RELEASE_DIR/COMMIT"
-    (cd "$REPO" && git archive HEAD | sha256sum) > "$RELEASE_DIR/SOURCE.sha256"
+    "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx
+    git rev-parse "$RELEASE_SHA" > "$RELEASE_DIR/COMMIT"
+    git cat-file -p "$RELEASE_SHA" | grep '^tree' > "$RELEASE_DIR/TREE"
+    (cd "$REPO" && git archive "$RELEASE_SHA" | sha256sum) > "$RELEASE_DIR/SOURCE.sha256"
+    CONNECTOR_SHA=$(git -C "$CONNECTOR_SRC" rev-parse HEAD)
+    echo "connector=$CONNECTOR_SHA" > "$RELEASE_DIR/PINS"
 fi
 PREVIOUS_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
 ln -sfn "$RELEASE_DIR" "$OPT/current.new" && mv -T "$OPT/current.new" "$OPT/current"
