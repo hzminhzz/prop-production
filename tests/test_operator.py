@@ -35,6 +35,7 @@ def test_paper_evidence_chain_distinguishes_observation_from_follower_pnl(tmp_pa
     log.append(evidence, 2000)
     report = log.report(3000)
     assert report["verdict"] == "BLOCKED_PAPER_ADMISSION"
+    assert report["read_only_collection"] == "EVIDENCE_COLLECTED"
     assert report["observations"] == 2
     assert report["source_state"] == "QUIET"
     assert report["independently_matched_follower_pnl"] == "UNKNOWN"
@@ -42,3 +43,16 @@ def test_paper_evidence_chain_distinguishes_observation_from_follower_pnl(tmp_pa
     assert report["paper_days_qualified"] == 0
     log.close()
     assert ObservationJournal.read(path, 3000)["observations"] == 2
+
+
+def test_empty_paper_evidence_reports_collection_separately_from_admission(tmp_path):
+    from prop_production.paper import ObservationJournal
+
+    path = tmp_path / "empty.sqlite"
+    log = ObservationJournal(path, initialize=True)
+    report = log.report(3000)
+    assert report["read_only_collection"] == "NO_OBSERVATIONS"
+    assert report["verdict"] == "BLOCKED_PAPER_ADMISSION"
+    assert report["broker_mutations"] == 0
+    assert report["trading_authorized"] is False
+    log.close()
