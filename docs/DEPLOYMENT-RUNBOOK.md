@@ -1,8 +1,13 @@
 # Deployment and operations runbook — prop-production
 
-Last updated: 2026-11-06. Deployed release: **`05d9c78`** (merge lineage:
-`73d8ce2` = PR #36 + installer corrections `24cb1ea`/`fbb24f8` + release-manifest
-validation). Rollback target: **`508ec20`**.
+Last updated: 2026-11-06.
+
+**Active release**: read `/opt/prop-production/current/COMMIT` (at last writing:
+`bd850c4` — docs-inclusive revision, merge lineage `73d8ce2` = PR #36 +
+installer corrections + release-manifest validation).
+**Rollback target**: the previous verified release — list
+`/opt/prop-production/releases/` and use the newest one other than active.
+The CLI is authoritative; prose SHAs here go stale the moment a release ships.
 
 ## Terminology (do not conflate)
 

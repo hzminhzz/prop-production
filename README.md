@@ -49,7 +49,8 @@ and signing keys stay outside Git. Public fixtures use invented identities.
 The parent contract is [issue #1](https://github.com/hzminhzz/prop-production/issues/1);
 each implementation ticket retains its own acceptance evidence.
 
-## Deployed release (2026-11-06)
+## Deployed release
 
-Active: `releases/47d2d4b…` → superseded by **`releases/73d8ce2…`** (PR #36's merge).
-Rollback: `releases/508ec20…`. Status and evidence: `docs/DEPLOYMENT-RUNBOOK.md`.
+The active release is whatever `/opt/prop-production/current/COMMIT` names —
+authoritative and always current. Rollback: the newest other entry in
+`/opt/prop-production/releases/`. Procedure and evidence: `docs/DEPLOYMENT-RUNBOOK.md`.
