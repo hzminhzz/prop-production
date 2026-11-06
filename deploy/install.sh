@@ -106,5 +106,8 @@ install -m 0644 deploy/prop-production-watchdog.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now prop-production-broker.service prop-production-guardian.service \
     prop-production-planner.service prop-production-observer.service prop-production-watchdog.service
+# enable --now does not restart running services; a new release must take effect.
+systemctl restart prop-production-broker.service prop-production-guardian.service \
+    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service
 
 echo "DEPLOYED: systemctl status prop-production-*"
