@@ -42,7 +42,7 @@ if [ ! -d "$RELEASE_DIR" ]; then
     WHEEL_SHA=$(sha256sum "$WHEEL" | cut -d' ' -f1)
     echo "$WHEEL_SHA  $(basename "$WHEEL")" > "$WHEEL_DIR/SHA256SUMS"
     # Verify the recorded digest matches before installing anything.
-    sha256sum -c "$WHEEL_DIR/SHA256SUMS" >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
+    (cd "$WHEEL_DIR" && sha256sum -c SHA256SUMS) >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
     python3 -m venv "$RELEASE_DIR/venv"
     "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx
     git rev-parse "$RELEASE_SHA" > "$RELEASE_DIR/COMMIT"
@@ -50,6 +50,9 @@ if [ ! -d "$RELEASE_DIR" ]; then
     (cd "$REPO" && git archive "$RELEASE_SHA" | sha256sum) > "$RELEASE_DIR/SOURCE.sha256"
     CONNECTOR_SHA=$(git -C "$CONNECTOR_SRC" rev-parse HEAD)
     echo "connector=$CONNECTOR_SHA" > "$RELEASE_DIR/PINS"
+    # The connector pin must match the reviewed release exactly.
+    grep -q "^connector=b28aa85" "$RELEASE_DIR/PINS" || {
+        echo "REFUSING: connector pin mismatch ($CONNECTOR_SHA)"; exit 1; }
 fi
 PREVIOUS_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
 ln -sfn "$RELEASE_DIR" "$OPT/current.new" && mv -T "$OPT/current.new" "$OPT/current"
