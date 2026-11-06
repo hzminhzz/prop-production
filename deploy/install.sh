@@ -77,18 +77,42 @@ chown root:prop "$STATE/trust"; chmod 0750 "$STATE/trust"
 chown root:prop "$STATE/trust/settings.json" "$STATE/trust/floor.sqlite" 2>/dev/null || true
 chmod 0640 "$STATE/trust/settings.json" 2>/dev/null || true
 chmod 0440 "$STATE/trust/floor.sqlite" 2>/dev/null || true
-# Migrate a pre-DELETE-mode floor (WAL sidecars needed shm write): checkpoint,
-# convert, then drop the sidecars so runtime read-only opens need zero writes.
-"$OPT_VENV/bin/python" -c "
-import sqlite3
-con = sqlite3.connect('$STATE/trust/floor.sqlite', timeout=0.1, isolation_level=None)
-mode = con.execute('PRAGMA journal_mode').fetchone()[0]
-if mode == 'wal':
-    con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-    con.execute('PRAGMA journal_mode=DELETE')
-con.close()
-" || true
-rm -f "$STATE/trust/floor.sqlite-wal" "$STATE/trust/floor.sqlite-shm"
+# Migrate a pre-DELETE-mode floor (WAL sidecars needed shm write). Fail closed:
+# backup, validate, checkpoint, verify, convert, verify again — abort on any
+# failure and keep the previous database; sidecars are removed only after a
+# proven successful migration.
+if [ -f "$STATE/trust/floor.sqlite" ]; then
+    BACKUP="$STATE/trust/floor.sqlite.pre-migration.$(date +%s)"
+    cp "$STATE/trust/floor.sqlite" "$BACKUP"
+    chmod 0600 "$BACKUP"
+    "$OPT_VENV/bin/python" - "$STATE/trust/floor.sqlite" <<'PYEOF' || {
+import sqlite3, sys
+path = sys.argv[1]
+con = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+try:
+    if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise SystemExit("TRUST_DB_CORRUPT_BEFORE_MIGRATION")
+    mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+    if mode == "wal":
+        con.execute("BEGIN IMMEDIATE")
+        busy, _log, _ckpt = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if busy:
+            raise SystemExit("TRUST_DB_BUSY_CHECKPOINT_FAILED")
+        con.execute("COMMIT")
+        con.execute("PRAGMA journal_mode=DELETE")
+        if con.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
+            raise SystemExit("TRUST_DB_MODE_SWITCH_FAILED")
+    if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise SystemExit("TRUST_DB_CORRUPT_AFTER_MIGRATION")
+    print(f"trust migration ok (mode={con.execute('PRAGMA journal_mode').fetchone()[0]})")
+finally:
+    con.close()
+PYEOF
+    echo "MIGRATION FAILED: keeping previous release and database; sidecars untouched"
+    exit 1
+}
+    rm -f "$STATE/trust/floor.sqlite-wal" "$STATE/trust/floor.sqlite-shm"
+fi
 
 # 6. Observer credentials: root-only file, value flows file-to-file only.
 [ -f /etc/prop-production/observer.env ] || {
