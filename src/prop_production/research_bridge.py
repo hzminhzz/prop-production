@@ -1,4 +1,5 @@
 """Pinned, credential-clean subprocess access to research-owned read-only capabilities."""
+
 from __future__ import annotations
 
 import os
@@ -14,23 +15,47 @@ RESEARCH_COMMIT = "fcf79b8e4d8012b46cdf8d2ad190af06a6e8dd5e"
 def verify_checkout(root: Path) -> None:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("RESEARCH_CHECKOUT")
-    revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
-                              capture_output=True, text=True, timeout=3).stdout.strip()
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    ).stdout.strip()
     # A pinned HEAD alone is not sufficient: untracked importable modules and
     # staged edits also change the subprocess' effective executable code.
-    dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1",
-                            "--untracked-files=all", "--", "src", "pyproject.toml"],
-                           check=True, capture_output=True, text=True, timeout=3).stdout
+    dirty = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            "src",
+            "pyproject.toml",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    ).stdout
     if revision != RESEARCH_COMMIT or dirty.strip():
         raise ValueError("RESEARCH_REVISION_NOT_PINNED")
 
 
 def _invoke(root: Path, python: Path, arguments: list[str]) -> dict[str, Any]:
     verify_checkout(root)
-    result = subprocess.run([str(python), *arguments], cwd=root, capture_output=True, text=True,
-                            timeout=45, close_fds=True,
-                            env={"PATH": os.defpath, "PYTHONPATH": str(root / "src"),
-                                 "PYTHONDONTWRITEBYTECODE": "1"})
+    result = subprocess.run(
+        [str(python), *arguments],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=45,
+        close_fds=True,
+        env={"PATH": os.defpath, "PYTHONPATH": str(root / "src"), "PYTHONDONTWRITEBYTECODE": "1"},
+    )
     if result.returncode not in {0, 2} or len(result.stdout) > 1000000:
         raise ValueError("RESEARCH_READ_FAILED")
     return dict(load_json(result.stdout))
@@ -44,12 +69,23 @@ def economics(root: Path, python: Path, tapes: dict[str, Path] | None = None) ->
         arguments += ["--" + policy, str(path)]
     # Economics output may contain finite numeric statistics; it is not a financial authority input.
     import json
+
     verify_checkout(root)
-    result = subprocess.run([str(python), *arguments], capture_output=True, text=True, timeout=120,
-                            close_fds=True, env={"PATH": os.defpath, "PYTHONPATH": str(root / "src")})
+    result = subprocess.run(
+        [str(python), *arguments],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        close_fds=True,
+        env={"PATH": os.defpath, "PYTHONPATH": str(root / "src")},
+    )
     if result.returncode not in {0, 2}:
         raise ValueError("NATIVE_ECONOMICS_UNAVAILABLE")
-    return dict(json.loads(result.stdout, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("NONFINITE"))))
+    return dict(
+        json.loads(
+            result.stdout, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("NONFINITE"))
+        )
+    )
 
 
 def observe(root: Path, python: Path, observer_root: Path, now_iso: str) -> dict[str, Any]:
@@ -73,7 +109,7 @@ try:
         'collateral_receipts': sum(x['cursor'] for x in snapshot['collateral'].values()),
         'native_observer_health': health['health'], 'upstream_alive': alive,
         'source_nav_attested': False, 'trade_volume_complete': False,
-        'blockers': reasons + ['APPROVED_PRODUCTION_RELEASE_MISSING', 'NO_ATOMIC_SOURCE_NAV']}
+        'blockers': reasons + ['APPROVED_PRODUCTION_RELEASE_MISSING', 'SOURCE_SCOPE_AND_FOLLOWER_EXECUTION_UNVERIFIED']}
 except (OSError, ValueError, KeyError, TypeError):
     result = {'schema': 'read_only_source_observation_v1', 'native_tape_sha': '0'*64,
         'source_receipts': 0, 'market_receipts': 0, 'collateral_receipts': 0,

@@ -13,6 +13,8 @@ No live broker mutation route is installed or authorized.
 The Planner has no broker credentials. Only a separately isolated Guardian could
 hold financial mutation authority; this release provides zero-capital interfaces.
 
+**Sizing policy:** risk-budgeted fixed-k mirroring is the approved default for new design work; leader whole-account NAV is *not* an admission prerequisite for `FIXED_K_NATIVE_QUANTITY`. The signed policy requires an explicit k and complete selected account-position scope, while Guardian still controls follower equity, risk, limits, and execution. Existing `ALLOCATION_OVER_LIVE_NAV` releases retain strict NAV requirements. See [the sizing policy](docs/SIZING-POLICY.md).
+
 ## Native Propr evidence integration
 
 The optional provider connector exposes `propr_native_evidence_v1`. `BrokerGateway` consumes the versioned read-only evidence, including exact Decimal provider balance, equity formula provenance, buying power, native account/attempt identity, inventory and explicit uncertainty reasons. Propr `availableBalance` is buying power, **not** trusted Guardian cash. No `equity - unrealized` cash proxy is created. Offset REST pages and WebSocket events do not establish a coherent provider fill cutoff, so Propr returns `RECONCILIATION_UNCERTAIN`, `history_complete=False` and **NO_TRADE** even when the diagnostic inventory reads successfully. The Guardian alone owns SQLite financial state, durable intents and risk authorization. Optional ML4T 0.1.2 remains a separate consumer; no ML4T runtime is imported here. See [native integration notes](docs/NATIVE-CONNECTOR-INTEGRATION.md).

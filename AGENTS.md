@@ -18,6 +18,13 @@ provenance, native identity, timestamps and RECONCILIATION_UNCERTAIN. No
 connector-owned journal may replace a Guardian-committed production intent.
 Planner cannot supply trusted broker equity, grant permits or access credentials.
 
+## Binding owner decision: source NAV is not a universal gate (2026-11-06)
+
+- **Default copy policy:** risk-budgeted, fixed-k mirroring of an explicitly selected leader account/perpetual position scope. `FIXED_K_NATIVE_QUANTITY` is the signed release member policy: follower target **notional** is `k * leader native position quantity * source mark`, then quantity is determined at the independent follower quote and checked by Guardian. Source `nav=null` is valid in this mode and MUST NOT cause a `SOURCE_NAV` rejection or a request to reconstruct parent/subaccount/whole-wallet equity.
+- **Legacy fidelity policy:** `ALLOCATION_OVER_LIVE_NAV` remains available *only when explicitly selected* to reproduce leader equity-relative exposures; that path still requires verifiable leader NAV. Do not apply its NAV requirement to fixed-k policies.
+- **Mandatory regardless of policy:** authentic signer/release, canonical source/account scope, full positions inside the selected scope (not unrelated subaccounts), causal first-known clocks, signed fixed k, follower account equity/headroom, provider account reconciliation, fresh follower quotes, risk-policy caps, independent pod loss stop, daily/trailing drawdown, volume/lot/margin, HALT and order authorization. A $200 pod loss threshold does not guarantee execution at exactly $200 under gap/slippage.
+- Do not promote source NAV from Vike wallet summary or sum per-DEX NAV for unified/portfolio-margin accounts. Missing NAV can be a diagnostic field but **not** a blocker for `FIXED_K_NATIVE_QUANTITY`. No source-NAV request should interrupt routine research, paper planning, or engineering on this mode. See `docs/SIZING-POLICY.md`.
+
 Default SHADOW / NO_TRADE. No real broker mutations, credentials, wallet identities,
 private account responses, datasets or signing secrets in Git.
 Production permission requires account-bound independent evidence and explicit
