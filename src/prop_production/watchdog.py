@@ -60,14 +60,35 @@ def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
     if observer and observer.get("healthy") is False:
         reasons.append("OBSERVER_UNHEALTHY")
 
+    # Market/source: no connected market source exists in this deployment —
+    # reported explicitly, never folded into HEALTHY (§6: missing evidence
+    # for a required dimension is a blocked state, not a healthy one).
+    market_status = "UNKNOWN"  # no market source is currently connected
+
     disk = shutil.disk_usage(state_root)
     free = disk.free
     if free < MIN_DISK_FREE_BYTES:
         reasons.append("DISK_EXHAUSTION_RISK")
 
-    return {"schema": "watchdog_assessment_v1", "assessed_at_ms": now_ms,
-            "status": "BLOCKED" if reasons else "HEALTHY", "reasons": sorted(set(reasons)),
+    # Overall status: HEALTHY requires every required dimension evidenced.
+    # Missing market/source evidence keeps the runtime OPERATIONAL_BUT_BLOCKED.
+    if any(r.startswith("HALT:") for r in reasons):
+        status = "HALTED"
+    elif reasons:
+        status = "OPERATIONAL_BUT_BLOCKED"
+    elif market_status == "UNKNOWN":
+        status = "OPERATIONAL_BUT_BLOCKED"
+        reasons.append("MARKET_SOURCE_UNKNOWN")
+    else:
+        status = "HEALTHY"
+
+    return {"schema": "watchdog_assessment_v2", "assessed_at_ms": now_ms,
+            "status": status, "reasons": sorted(set(reasons)),
+            "market_status": market_status,
             "guardian_heartbeat_ms": guardian_ms, "observer_heartbeat_ms": observer_ms,
+            "guardian_last_progress_ms": guardian.get("last_progress_ms") if guardian else None,
+            "guardian_journal_sequence": guardian.get("journal_sequence") if guardian else None,
+            "guardian_certainty": guardian.get("certainty") if guardian else None,
             "disk_free_bytes": free, "trading_authorized": False}
 
 

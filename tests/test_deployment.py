@@ -52,7 +52,9 @@ def test_watchdog_healthy_when_fresh(tmp_path):
         "certainty": "COHERENT", "halts": []}))
     (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
     assessment = assess(tmp_path, now_ms=10_000)
-    assert assessment["status"] == "HEALTHY"
+    # Market source is not connected: the honest ceiling is OPERATIONAL_BUT_BLOCKED.
+    assert assessment["status"] == "OPERATIONAL_BUT_BLOCKED"
+    assert "MARKET_SOURCE_UNKNOWN" in assessment["reasons"]
     assert assessment["guardian_heartbeat_ms"] == 9_000
 
 
