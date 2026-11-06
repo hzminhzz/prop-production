@@ -16,7 +16,10 @@ def verify_checkout(root: Path) -> None:
         raise ValueError("RESEARCH_CHECKOUT")
     revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
                               capture_output=True, text=True, timeout=3).stdout.strip()
-    dirty = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "HEAD", "--", "src", "pyproject.toml"],
+    # A pinned HEAD alone is not sufficient: untracked importable modules and
+    # staged edits also change the subprocess' effective executable code.
+    dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1",
+                            "--untracked-files=all", "--", "src", "pyproject.toml"],
                            check=True, capture_output=True, text=True, timeout=3).stdout
     if revision != RESEARCH_COMMIT or dirty.strip():
         raise ValueError("RESEARCH_REVISION_NOT_PINNED")

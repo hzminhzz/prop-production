@@ -5,7 +5,7 @@ import pytest
 from test_planner import book, quote
 
 
-def setup_system(tmp_path, opposed=False):
+def setup_system(tmp_path, opposed=False, second_qty="-15"):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     from prop_production.evidence import digest, sign
@@ -39,7 +39,7 @@ def setup_system(tmp_path, opposed=False):
     planner = Planner(tmp_path / "planner.sqlite", release, key.public_key())
     planner.ingest(sign(book(), key, "source-observer"), local_known_ms=1000)
     if opposed:
-        second = dict(book(qty="-15"), source_identity="fixture-leader-b", scope=["fixture-leader-b"])
+        second = dict(book(qty=second_qty), source_identity="fixture-leader-b", scope=["fixture-leader-b"])
         planner.ingest(sign(second, key, "source-observer"), local_known_ms=1000)
     guardian.reconcile(301000)
     proposal = planner.propose(301000, journal.snapshot()["runtime"]["broker_epoch"], quote())

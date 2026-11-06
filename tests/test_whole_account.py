@@ -34,6 +34,55 @@ def test_cross_pod_nets_have_zero_broker_orders_and_durable_attribution(tmp_path
     floor.close()
 
 
+def test_opposing_pods_partial_fill_conserves_broker_fee_and_inventory(tmp_path):
+    guardian, broker, journal, proposal, floor = setup_system(
+        tmp_path, opposed=True, second_qty="-10")
+    try:
+        receipt = guardian.decide(proposal, quote(), 301000)
+        assert receipt.data["status"] == "PREVIEW"
+        ids = guardian.reserve(receipt.data["decision_id"], 301000)
+        assert len(ids) == 1
+        broker.fill_on_submit = False
+        guardian.dispatch(ids[0], 301000)
+        broker.fill(ids[0], "0.5")
+        guardian.reconcile(301001)
+        state = journal.snapshot()
+        assert state["intents"][ids[0]]["status"] == "PARTIAL"
+        total_pod_quantity = sum((Decimal(p["BTC"]) for p in state["pod_positions"].values()),
+                                 Decimal("0"))
+        assert total_pod_quantity == Decimal(state["positions"]["BTC"])
+        total_pod_fees = sum(map(Decimal, state["pod_fees_paid"].values()), Decimal("0"))
+        broker_fees = sum((Decimal(item["fee"]) for item in broker.ledger()
+                           if item["kind"] == "FILL"), Decimal("0"))
+        assert total_pod_fees == broker_fees
+        assert "POD_FILL_ALLOCATION_INVALID" not in state["halts"]
+    finally:
+        journal.close()
+        broker.close()
+        floor.close()
+
+
+def test_unattributed_funding_halts_instead_of_charging_every_pod(tmp_path):
+    guardian, broker, journal, proposal, floor = setup_system(tmp_path, opposed=True)
+    try:
+        receipt = guardian.decide(proposal, quote(), 301000)
+        assert guardian.reserve(receipt.data["decision_id"], 301000) == []
+        before = journal.snapshot()["pod_loss_used"] if "pod_loss_used" in journal.snapshot() else {}
+        broker.funding("-1", 301001)
+        result = guardian.reconcile(301001)
+        state = journal.snapshot()
+        assert result["certainty"] == "UNKNOWN"
+        assert "BROKER_CASH_ATTRIBUTION_UNKNOWN" in state["halts"]
+        assert state["finance"]["cash"] == "9999"
+        assert state["pod_loss_used"] == before or all(
+            Decimal(v) == Decimal(before.get(k, "0")) for k, v in state["pod_loss_used"].items())
+        assert broker.audit() == []
+    finally:
+        journal.close()
+        broker.close()
+        floor.close()
+
+
 def test_two_previews_cannot_spend_the_same_financial_epoch(tmp_path):
     import pytest
 

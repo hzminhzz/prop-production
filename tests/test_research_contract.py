@@ -6,6 +6,25 @@ from pathlib import Path
 import pytest
 
 
+def test_research_checkout_rejects_untracked_importable_modules(tmp_path, monkeypatch):
+    from prop_production import research_bridge
+
+    root = tmp_path / "pinned-research"
+    root.mkdir()
+    (root / "src").mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty",
+                    "-qm", "initial"], check=True)
+    revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+    monkeypatch.setattr(research_bridge, "RESEARCH_COMMIT", revision)
+    research_bridge.verify_checkout(root)
+    (root / "src" / "untracked_runtime.py").write_text("UNREVIEWED = True\n")
+    with pytest.raises(ValueError, match="RESEARCH_REVISION_NOT_PINNED"):
+        research_bridge.verify_checkout(root)
+
+
 def test_actual_research_sqlite_export_is_accepted_by_production_verifier():
     root = os.getenv("PROP_RESEARCH_ROOT")
     if not root:

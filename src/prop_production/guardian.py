@@ -323,15 +323,16 @@ class Guardian:
             if position.market in marks and marks[position.market] != position.mark_price:
                 errors.append("BROKER_MARK_CONFLICT")
             marks[position.market] = position.mark_price
-        cash_debit = max(ZERO, decimal(state["finance"].get("cash", str(snapshot.cash))) - snapshot.cash) if snapshot.cash is not None else ZERO
+        new_fees = ZERO
         # Charge every adverse move; gains never refill a pod budget during the day.
         for pod, book in state["pod_positions"].items():
             adverse = sum((max(ZERO, -decimal(q) * (marks[m] - decimal(previous_marks[m])))
                            for m, q in book.items() if m in marks and m in previous_marks), ZERO)
             if any(decimal(q) and m not in marks for m, q in book.items()):
                 errors.append("POD_MARK_UNKNOWN")
-            # Charging unexplained cash debits to every pod is intentionally conservative.
-            used[pod] = str(decimal(used.get(pod, "0")) + adverse + cash_debit)
+            # Broker cash belongs to the account; charging the full debit to
+            # every pod would double-count common fees and funding.
+            used[pod] = str(decimal(used.get(pod, "0")) + adverse)
         for fill in sorted(snapshot.fills, key=lambda f: (f.known_at_ms, f.execution_id)):
             body = {"execution_id": fill.execution_id, "intent_id": fill.intent_id, "market": fill.market,
                     "quantity": str(fill.quantity), "price": str(fill.price), "fee": str(fill.fee),
@@ -351,14 +352,28 @@ class Guardian:
                     or fill.fee < 0 or fill.known_at_ms > snapshot.observed_at_ms):
                 errors.append("FILL_INCONSISTENT")
                 continue
+            changes = {pod: decimal(change) for pod, change in intent.get("pod_changes", {}).items()}
+            gross_changes = sum((abs(change) for change in changes.values()), ZERO)
+            if (not changes or not gross_changes
+                    or sum(changes.values(), ZERO) != decimal(intent["quantity"])):
+                errors.append("POD_FILL_ALLOCATION_INVALID")
+                continue
+            if decimal(state["positions"].get(fill.market, "0")) * fill.quantity < 0:
+                # Realized PnL needs independently confirmed pod entry basis.
+                errors.append("POD_REALIZED_ATTRIBUTION_UNVERIFIED")
+            new_fees += fill.fee
             intent["filled"] = str(total)
             state["fills"][fill.execution_id] = body
             state["positions"][fill.market] = str(decimal(state["positions"].get(fill.market, "0")) + fill.quantity)
-            for pod, change in intent.get("pod_changes", {}).items():
+            for pod, change in changes.items():
                 book = state["pod_positions"].setdefault(pod, {})
-                allocated = decimal(change) * fill.quantity / decimal(intent["quantity"])
+                allocated = change * fill.quantity / decimal(intent["quantity"])
                 book[fill.market] = str(decimal(book.get(fill.market, "0")) + allocated)
-                fee = fill.fee * abs(decimal(change) / decimal(intent["quantity"]))
+                # Gross allocation shares conserve the real broker fee even when
+                # two pods oppose one another and the net order is much smaller.
+                fee = fill.fee * abs(change) / gross_changes
+                pod_fees = state.setdefault("pod_fees_paid", {})
+                pod_fees[pod] = str(decimal(pod_fees.get(pod, "0")) + fee)
                 execution_loss = max(ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price))
                 used[pod] = str(decimal(used.get(pod, "0")) + fee + execution_loss)
         known_orders: dict[str, BrokerOrder] = {}
@@ -392,6 +407,14 @@ class Guardian:
         expected = {m: decimal(q) for m, q in state["positions"].items() if decimal(q)}
         if observed != expected or len(observed) != len(snapshot.positions):
             errors.append("ORPHAN_POSITION")
+        old_cash = state["finance"].get("cash")
+        if old_cash is not None and snapshot.cash is not None:
+            # New fills explain fees only when there is no realized close. Other
+            # debits/credits (funding, corrections, transfers) require explicit
+            # typed provider evidence before assigning any pod economic effect.
+            if snapshot.cash - decimal(old_cash) != -new_fees and (
+                    "POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors):
+                errors.append("BROKER_CASH_ATTRIBUTION_UNKNOWN")
         finance, finance_errors = account_step(state["finance"], snapshot, self.rules, now_ms)
         previous_day = state["finance"].get("day")
         state["finance"] = finance
