@@ -19,6 +19,10 @@ hold financial mutation authority; this release provides zero-capital interfaces
 
 The optional provider connector exposes `propr_native_evidence_v1`. `BrokerGateway` consumes the versioned read-only evidence, including exact Decimal provider balance, equity formula provenance, buying power, native account/attempt identity, inventory and explicit uncertainty reasons. Propr `availableBalance` is buying power, **not** trusted Guardian cash. No `equity - unrealized` cash proxy is created. Offset REST pages and WebSocket events do not establish a coherent provider fill cutoff, so Propr returns `RECONCILIATION_UNCERTAIN`, `history_complete=False` and **NO_TRADE** even when the diagnostic inventory reads successfully. The Guardian alone owns SQLite financial state, durable intents and risk authorization. Optional ML4T 0.1.2 remains a separate consumer; no ML4T runtime is imported here. See [native integration notes](docs/NATIVE-CONNECTOR-INTEGRATION.md).
 
+## Bybit Demo read-only integration
+
+A separate `prop-production-bybit-observer.service` consumes the pinned connector's authenticated Bybit Demo account, position and order readers. It uses the dedicated Demo key/UID, not generic Bybit credentials. Its private observations retain exact USD equity, available buying power, position/order diagnostics, identity verification and explicit UNKNOWN cash/history. A separate watchdog field reports Bybit observer health; this does not authorize trading or establish a market/source feed. The existing Propr observer and synthetic Guardian remain independent. See [Bybit Demo integration](docs/BYBIT-DEMO-INTEGRATION.md).
+
 ## Reproduce and verify locally
 
 GitHub Actions is optional and **not required** for this private VPS program.

@@ -55,6 +55,7 @@ def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
     reasons: list[str] = []
     guardian = _read_json(state_root / "health" / "guardian" / "heartbeat.json")
     observer = _read_json(state_root / "health" / "observer" / "heartbeat.json")
+    bybit = _read_json(state_root / "health" / "bybit" / "heartbeat.json")
 
     guardian_ms = guardian.get("heartbeat_ms") if guardian else None
     if not isinstance(guardian_ms, int) or not 0 <= now_ms - guardian_ms <= STALE_GUARDIAN_MS:
@@ -89,11 +90,23 @@ def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
         reasons.append("SEQUENCE_NOT_ADVANCING")
     if observer and observer.get("healthy") is False:
         reasons.append("OBSERVER_UNHEALTHY")
+    bybit_ms = bybit.get("heartbeat_ms") if bybit else None
+    if not isinstance(bybit_ms, int) or not 0 <= now_ms - bybit_ms <= STALE_OBSERVER_MS:
+        bybit_status = "UNKNOWN_OR_STALE"
+        reasons.append("BYBIT_DEMO_OBSERVER_STALE_OR_UNKNOWN")
+    elif (bybit is not None and bybit.get("healthy") is True
+          and bybit.get("identity_verified") is True
+          and bybit.get("opening_ready") is False and bybit.get("mutations") == 0):
+        bybit_status = "OBSERVED_READ_ONLY"
+    else:
+        bybit_status = "BLOCKED"
+        reasons.append("BYBIT_DEMO_EVIDENCE_UNHEALTHY")
 
     # Market/source: no connected market source exists in this deployment —
     # reported explicitly, never folded into HEALTHY (§6: missing evidence
     # for a required dimension is a blocked state, not a healthy one).
     market_status = "UNKNOWN"  # no market source is currently connected
+    reasons.append("MARKET_SOURCE_UNKNOWN")
 
     disk = shutil.disk_usage(state_root)
     free = disk.free
@@ -106,15 +119,13 @@ def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
         status = "HALTED"
     elif reasons:
         status = "OPERATIONAL_BUT_BLOCKED"
-    elif market_status == "UNKNOWN":
-        status = "OPERATIONAL_BUT_BLOCKED"
-        reasons.append("MARKET_SOURCE_UNKNOWN")
     else:
         status = "HEALTHY"
 
     return {"schema": "watchdog_assessment_v2", "assessed_at_ms": now_ms,
             "status": status, "reasons": sorted(set(reasons)),
-            "market_status": market_status,
+            "market_status": market_status, "bybit_status": bybit_status,
+            "bybit_observer_heartbeat_ms": bybit_ms,
             "guardian_heartbeat_ms": guardian_ms, "observer_heartbeat_ms": observer_ms,
             "guardian_last_progress_ms": guardian.get("last_progress_ms") if guardian else None,
             "guardian_journal_sequence": guardian.get("journal_sequence") if guardian else None,

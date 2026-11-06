@@ -14,9 +14,35 @@ CONNECTOR_SRC=${CONNECTOR_SRC:-/home/quant/.devspace/worktrees/trading-connector
 
 cd "$REPO"
 
+# Fail before touching the active release if the pinned adapter or credential
+# scope does not match the explicitly approved Demo-only integration.
+EXPECTED_CONNECTOR_SHA=b28aa8522c51830a4b389a61b20ceb539b7a89ca
+[ "$(git -C "$CONNECTOR_SRC" rev-parse HEAD)" = "$EXPECTED_CONNECTOR_SHA" ] || {
+    echo "REFUSING: connector revision mismatch"; exit 1;
+}
+BYBIT_SOURCE=/home/quant/.config/trading-connector/bybit-demo.env
+BYBIT_SOURCE_OK=/etc/prop-production/bybit.env
+if [ -f "$BYBIT_SOURCE_OK" ]; then
+    BYBIT_PREFLIGHT="$BYBIT_SOURCE_OK"
+else
+    BYBIT_PREFLIGHT="$BYBIT_SOURCE"
+fi
+[ -f "$BYBIT_PREFLIGHT" ] || { echo "REFUSING: missing Bybit Demo credentials"; exit 1; }
+grep -qx 'BYBIT_ENVIRONMENT=demo' "$BYBIT_PREFLIGHT" || {
+    echo "REFUSING: Bybit env is not Demo"; exit 1;
+}
+grep -qx 'BYBIT_MODE=read_only' "$BYBIT_PREFLIGHT" || {
+    echo "REFUSING: Bybit connector mode is not read_only"; exit 1;
+}
+for name in BYBIT_DEMO_API_KEY BYBIT_DEMO_API_SECRET BYBIT_DEMO_EXPECTED_UID; do
+    grep -q "^$name=." "$BYBIT_PREFLIGHT" || {
+        echo "REFUSING: required Bybit Demo identity field is missing"; exit 1;
+    }
+done
+
 # 1. Service identities (system users, no login shell). Group before users.
 getent group prop >/dev/null || groupadd --system prop
-for role in runtime planner observer watchdog; do
+for role in runtime planner observer watchdog bybit; do
     id "prop-$role" >/dev/null 2>&1 || useradd --system --no-create-home \
         --shell /usr/sbin/nologin --gid prop "prop-$role"
 done
@@ -39,10 +65,18 @@ release_complete() {
     [ -f "$1/SOURCE.sha256" ] || return 1
     [ -f "$1/dist/SHA256SUMS" ] || return 1
     ls "$1"/dist/*.whl >/dev/null 2>&1 || return 1
-    (cd "$1/dist" && sha256sum -c SHA256SUMS) >/dev/null 2>&1
+    (cd "$1/dist" && sha256sum -c SHA256SUMS) >/dev/null 2>&1 || return 1
+    "$1/venv/bin/python" -c 'import ccxt; assert ccxt.__version__ == "4.5.74"' >/dev/null 2>&1
 }
 if [ -d "$RELEASE_DIR" ] && ! release_complete "$RELEASE_DIR"; then
-    echo "INCOMPLETE RELEASE at $RELEASE_DIR — rebuilding"
+    # Never remove the release currently backing running Python processes.
+    # Instead stop and require an operator-controlled staged repair.
+    ACTIVE_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
+    if [ "$ACTIVE_RELEASE" = "$RELEASE_DIR" ]; then
+        echo "REFUSING: active release failed integrity checks; preserve it for recovery"
+        exit 1
+    fi
+    echo "INCOMPLETE INACTIVE RELEASE at $RELEASE_DIR — rebuilding"
     rm -rf "$RELEASE_DIR"
 fi
 if [ ! -d "$RELEASE_DIR" ]; then
@@ -61,21 +95,25 @@ if [ ! -d "$RELEASE_DIR" ]; then
     # Verify the recorded digest matches before installing anything.
     (cd "$WHEEL_DIR" && sha256sum -c SHA256SUMS) >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
     python3 -m venv "$RELEASE_DIR/venv"
-    "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx
+    "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx "ccxt==4.5.74"
     git rev-parse "$RELEASE_SHA" > "$RELEASE_DIR/COMMIT"
     git cat-file -p "$RELEASE_SHA" | grep '^tree' > "$RELEASE_DIR/TREE"
     (cd "$REPO" && git archive "$RELEASE_SHA" | sha256sum) > "$RELEASE_DIR/SOURCE.sha256"
     CONNECTOR_SHA=$(git -C "$CONNECTOR_SRC" rev-parse HEAD)
     echo "connector=$CONNECTOR_SHA" > "$RELEASE_DIR/PINS"
+    echo "bybit_ccxt=4.5.74" >> "$RELEASE_DIR/PINS"
 fi
 PREVIOUS_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
 ln -sfn "$RELEASE_DIR" "$OPT/current.new" && mv -T "$OPT/current.new" "$OPT/current"
 OPT_VENV="$OPT/current/venv"
 
-# 3. Pinned connector code for the observer (SHA recorded next to the copy).
+# 3. Pinned provider libraries. Bybit uses the existing validated CCXT client,
+# not a second V5 implementation. Reject an unexpected vendor revision.
 mkdir -p "$OPT/connector/connectors"
 cp -r "$CONNECTOR_SRC/connectors/propr" "$OPT/connector/connectors/propr"
+cp -r "$CONNECTOR_SRC/connectors/bybit" "$OPT/connector/connectors/bybit"
 sha256sum "$CONNECTOR_SRC/connectors/propr/"*.py > "$OPT/connector/PIN.sha256"
+sha256sum "$CONNECTOR_SRC/connectors/bybit/"*.py > "$OPT/connector/BYBIT.PIN.sha256"
 
 # 4. Fixture runtime initialization: requires a non-existent state root.
 if [ ! -e "$STATE" ]; then
@@ -90,10 +128,13 @@ fi
 # Heartbeats live in role-owned health/ subdirs (0750 dir, 0640 file): only the
 # owner role writes its own evidence; the watchdog and root read via group.
 [ -d "$STATE/health/guardian" ] || mkdir -p "$STATE/health/guardian" "$STATE/health/observer" "$STATE/health/watchdog"
+mkdir -p "$STATE/health/bybit" "$STATE/bybit"
 chown root:prop "$STATE/health"; chmod 0755 "$STATE/health"
 chown prop-runtime:prop "$STATE/health/guardian"; chmod 0750 "$STATE/health/guardian"
 chown prop-observer:prop "$STATE/health/observer"; chmod 0750 "$STATE/health/observer"
 chown prop-watchdog:prop "$STATE/health/watchdog"; chmod 0750 "$STATE/health/watchdog"
+chown prop-bybit:prop "$STATE/health/bybit"; chmod 0750 "$STATE/health/bybit"
+chown prop-bybit:prop "$STATE/bybit"; chmod 0700 "$STATE/bybit"
 chown -R prop-runtime:prop "$STATE/broker" "$STATE/guardian" "$STATE/judge"
 for role in broker guardian judge; do chmod 0700 "$STATE/$role"; done
 chown -R prop-planner:prop "$STATE/planner"; chmod 0700 "$STATE/planner"
@@ -155,17 +196,41 @@ fi
     chown root:root /etc/prop-production/observer.env; chmod 0600 /etc/prop-production/observer.env
 }
 
+# Bybit requires an independently authenticated dedicated Demo key/UID.
+# Never copy BYBIT_PROP_* or generic mainnet keys; never fall back to Testnet.
+if [ ! -f /etc/prop-production/bybit.env ]; then
+    install -m 0600 -o root -g root \
+        /home/quant/.config/trading-connector/bybit-demo.env \
+        /etc/prop-production/bybit.env
+fi
+chown root:root /etc/prop-production/bybit.env
+chmod 0600 /etc/prop-production/bybit.env
+grep -qx 'BYBIT_ENVIRONMENT=demo' /etc/prop-production/bybit.env || {
+    echo "REFUSING: Bybit credentials are not for Demo"; exit 1;
+}
+grep -qx 'BYBIT_MODE=read_only' /etc/prop-production/bybit.env || {
+    echo "REFUSING: Bybit observer credential mode not read_only"; exit 1;
+}
+for name in BYBIT_DEMO_API_KEY BYBIT_DEMO_API_SECRET BYBIT_DEMO_EXPECTED_UID; do
+    grep -q "^$name=." /etc/prop-production/bybit.env || {
+        echo "REFUSING: Bybit Demo credential field missing"; exit 1;
+    }
+done
+
 # 7. Units, then start.
 install -m 0644 deploy/prop-production-broker.service /etc/systemd/system/
 install -m 0644 deploy/prop-production-guardian.service /etc/systemd/system/
 install -m 0644 deploy/prop-production-planner.service /etc/systemd/system/
 install -m 0644 deploy/prop-production-observer.service /etc/systemd/system/
 install -m 0644 deploy/prop-production-watchdog.service /etc/systemd/system/
+install -m 0644 deploy/prop-production-bybit-observer.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now prop-production-broker.service prop-production-guardian.service \
-    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service
+    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service \
+    prop-production-bybit-observer.service
 # enable --now does not restart running services; a new release must take effect.
 systemctl restart prop-production-broker.service prop-production-guardian.service \
-    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service
+    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service \
+    prop-production-bybit-observer.service
 
 echo "DEPLOYED: systemctl status prop-production-*"

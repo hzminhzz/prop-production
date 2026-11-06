@@ -16,6 +16,11 @@ manufacture Guardian cash as equity minus unrealized PnL or treat matching REST
 snapshots as a coherent provider history cutoff. Preserve provider financial
 provenance, native identity, timestamps and RECONCILIATION_UNCERTAIN. No
 connector-owned journal may replace a Guardian-committed production intent.
+Bybit is a second, independently authenticated Demo-only read-only observer:
+use the pinned BybitClient, explicit Demo UID/key/endpoint verification, and
+BYBIT_MODE=read_only. Never fall back to BYBIT_PROP_* or mainnet/testnet
+credentials. Bybit equity and available buying power are not ledger cash;
+REST order/position reads are not coherent history. See docs/BYBIT-DEMO-INTEGRATION.md.
 Planner cannot supply trusted broker equity, grant permits or access credentials.
 
 ## Binding owner decision: source NAV is not a universal gate (2026-11-06)
