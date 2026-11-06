@@ -60,7 +60,8 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             raise ValueError("JOURNAL_AND_REASON_REQUIRED")
         account = Journal.read(args.journal)["account_binding"]
         with Journal(args.journal, account) as journal:
-            journal.recover(args.action, now_ms)
+            journal.recover(args.action, now_ms, operator=args.operator,
+                            incident_id=args.incident, evidence_sha=args.evidence_sha)
             remaining = Journal.read(args.journal)["halts"]
             return {
                 "schema": "operator_recover_v1",
@@ -233,6 +234,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--now-ms", type=int)
     parser.add_argument("--intent-id")
+    parser.add_argument("--operator", help="operator identity for audited recovery")
+    parser.add_argument("--incident", help="incident ID for audited recovery")
+    parser.add_argument("--evidence-sha", help="SHA-256 of resolution evidence for recovery")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument(
         "--scenario", choices=["NORMAL", "ACCEPT_THEN_TIMEOUT", "OUT_OF_ENVELOPE"], default="NORMAL"

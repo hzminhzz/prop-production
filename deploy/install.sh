@@ -64,7 +64,7 @@ chown root:prop "$STATE/trust"; chmod 0750 "$STATE/trust"
 # floor needs zero write access at runtime; only root (deploy authority) writes.
 chown root:prop "$STATE/trust/settings.json" "$STATE/trust/floor.sqlite" 2>/dev/null || true
 chmod 0640 "$STATE/trust/settings.json" 2>/dev/null || true
-
+chmod 0440 "$STATE/trust/floor.sqlite" 2>/dev/null || true
 # Migrate a pre-DELETE-mode floor (WAL sidecars needed shm write): checkpoint,
 # convert, then drop the sidecars so runtime read-only opens need zero writes.
 "$OPT/venv/bin/python" -c "

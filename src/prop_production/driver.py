@@ -12,17 +12,36 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 PERIODIC: dict[str, dict[str, Any] | None] = {"guardian": {"command": "reconcile"},
                                               "planner": {"command": "propose", "broker_epoch": 0,
                                                           "quotes": {}},
                                               "broker": None}
+RESPONSE_TIMEOUT_S = 30  # hard bound per worker response
 INTERVAL_S = 4  # keep reconcile ages under assess_health's 5s/10s staleness thresholds
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _readline_bounded(stream: IO[str], timeout_s: float) -> str:
+    """Read one line with a hard time bound; a hung child cannot stall the loop."""
+    import select
+
+    deadline = time.time() + timeout_s
+    pieces: list[str] = []
+    while time.time() < deadline:
+        if not select.select([stream], [], [], 0.1)[0]:
+            continue
+        piece = stream.readline()
+        if piece == "":
+            raise EOFError("WORKER_STDOUT_CLOSED")
+        pieces.append(piece)
+        if piece.endswith("\n"):
+            return "".join(pieces)
+    raise TimeoutError(f"WORKER_RESPONSE_TIMEOUT after {timeout_s}s")
 
 
 def _heartbeat(root: Path, worker: subprocess.Popen[str]) -> None:
@@ -36,13 +55,20 @@ def _heartbeat(root: Path, worker: subprocess.Popen[str]) -> None:
     except ValueError:
         state = {}
     halts = state.get("halts") if isinstance(state, dict) else None
+    runtime = state.get("runtime", {}) if isinstance(state, dict) else {}
     # Role-owned heartbeat: only prop-runtime writes here (0750 dir, group reads).
     health = root / "health" / "guardian"
     health.mkdir(mode=0o750, parents=True, exist_ok=True)
     target = health / "heartbeat.json"
     temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"schema": "guardian_heartbeat_v1",
-                                     "heartbeat_ms": _now_ms(), "halts": halts or []}))
+    temporary.write_text(json.dumps({
+        "schema": "guardian_heartbeat_v2", "heartbeat_ms": _now_ms(),
+        "journal_sequence": state.get("sequence") if isinstance(state, dict) else None,
+        "last_progress_ms": runtime.get("last_progress_ms"),
+        "certainty": runtime.get("certainty"), "runtime_state": runtime.get("state"),
+        "boot_epoch": runtime.get("boot_epoch"), "broker_epoch": runtime.get("broker_epoch"),
+        "halts": halts or [],  # a missing halts key is an empty list, never an implicit pass
+    }))
     os.replace(temporary, target)
     os.chmod(target, 0o640)  # watchdog (group prop) must read this evidence
 
@@ -68,9 +94,12 @@ def drive(role: str, root: Path, *, interval_s: int = INTERVAL_S) -> None:
             command = {"now_ms": _now_ms(), **template}
             worker.stdin.write(json.dumps(command) + "\n")
             worker.stdin.flush()
-            response = worker.stdout.readline()
-            if not response.strip():
-                break  # worker died mid-command; Restart=always handles recovery
+            try:
+                response = _readline_bounded(worker.stdout, RESPONSE_TIMEOUT_S)
+            except (TimeoutError, EOFError) as error:
+                print(json.dumps({"schema": "driver_failure_v1", "role": role,
+                                  "error": type(error).__name__, "at_ms": _now_ms()}), flush=True)
+                break  # hung or dead worker; Restart=always handles recovery
             print(json.dumps({"schema": "driver_response_v1", "role": role,
                               "command": command["command"], "at_ms": _now_ms(),
                               "response": response.strip() or None}), flush=True)

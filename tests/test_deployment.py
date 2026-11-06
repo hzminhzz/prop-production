@@ -36,7 +36,9 @@ def test_watchdog_blocks_on_unhealthy_observer(tmp_path):
     health = tmp_path / "health"
     (health / "guardian").mkdir(parents=True)
     (health / "observer").mkdir(parents=True)
-    (health / "guardian" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "halts": []}))
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({
+        "heartbeat_ms": 9_000, "last_progress_ms": 9_000, "journal_sequence": 3,
+        "certainty": "COHERENT", "halts": []}))
     (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": False}))
     assert "OBSERVER_UNHEALTHY" in assess(tmp_path, now_ms=10_000)["reasons"]
 
@@ -45,7 +47,9 @@ def test_watchdog_healthy_when_fresh(tmp_path):
     health = tmp_path / "health"
     (health / "guardian").mkdir(parents=True)
     (health / "observer").mkdir(parents=True)
-    (health / "guardian" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "halts": []}))
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({
+        "heartbeat_ms": 9_000, "last_progress_ms": 9_000, "journal_sequence": 3,
+        "certainty": "COHERENT", "halts": []}))
     (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
     assessment = assess(tmp_path, now_ms=10_000)
     assert assessment["status"] == "HEALTHY"
@@ -74,6 +78,53 @@ def test_driver_heartbeat_writes_evidence(tmp_path):
         worker.terminate()
         worker.wait()
     record = json.loads((tmp_path / "health" / "guardian" / "heartbeat.json").read_text())
-    assert record["schema"] == "guardian_heartbeat_v1"
+    assert record["schema"] == "guardian_heartbeat_v2"
     assert record["halts"] == []
     assert type(record["heartbeat_ms"]) is int
+
+
+def test_recover_requires_existing_halt(tmp_path):
+    from prop_production.journal import Journal
+    journal = Journal(tmp_path / "account.sqlite", "fixture-account", initialize=True)
+    try:
+        journal.recover("BROKER_UNREACHABLE", 1000, operator="op",
+                        incident_id="INC-1", evidence_sha="0" * 64)
+        assert False, "recovery without a latched halt must fail"
+    except ValueError as error:
+        assert "HALT_NOT_PRESENT" in str(error)
+    finally:
+        journal.close()
+
+
+def test_recover_requires_operator_and_incident(tmp_path):
+    from prop_production.journal import Journal
+    journal = Journal(tmp_path / "account.sqlite", "fixture-account", initialize=True)
+    try:
+        journal.halt("BROKER_UNREACHABLE", 1000)
+        for kwargs in ({"operator": "", "incident_id": "INC-1", "evidence_sha": "0" * 64},
+                       {"operator": "op", "incident_id": "", "evidence_sha": "0" * 64},
+                       {"operator": "op", "incident_id": "INC-1", "evidence_sha": ""}):
+            try:
+                journal.recover("BROKER_UNREACHABLE", 1000, **kwargs)
+                assert False, f"incomplete recovery evidence accepted: {kwargs}"
+            except ValueError as error:
+                assert "RECOVERY_EVIDENCE_INCOMPLETE" in str(error)
+    finally:
+        journal.close()
+
+
+def test_recover_revokes_permits_and_advances_epoch(tmp_path):
+    from prop_production.journal import Journal
+    journal = Journal(tmp_path / "account.sqlite", "fixture-account", initialize=True)
+    try:
+        journal.halt("BROKER_UNREACHABLE", 1000)
+        epoch_before = journal.snapshot()["runtime"]["boot_epoch"]
+        journal.recover("BROKER_UNREACHABLE", 2000, operator="op",
+                        incident_id="INC-2", evidence_sha="a" * 64)
+        state = journal.snapshot()
+        assert state["halts"] == []
+        assert state["runtime"]["boot_epoch"] == epoch_before + 1  # fresh epoch, stale permits dead
+        assert state["runtime"]["permit"] is None
+        assert state["runtime"]["last_recovery"]["incident_id"] == "INC-2"
+    finally:
+        journal.close()

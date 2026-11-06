@@ -20,6 +20,7 @@ from .evidence import canonical
 WATCH_INTERVAL_S = 5  # watchdog heartbeat must stay under assess_health's 10s threshold
 STALE_GUARDIAN_MS = 120_000     # guardian progress older than this is an incident
 STALE_OBSERVER_MS = 120_000     # observer heartbeat older than this is an incident
+FINANCIAL_STALE_MS = 120_000    # journal progress older than this is an incident
 MIN_DISK_FREE_BYTES = 512 * 1024 * 1024
 
 
@@ -45,6 +46,17 @@ def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
         reasons.append("OBSERVER_STALE_OR_UNKNOWN")
     if guardian and guardian.get("halts"):
         reasons.extend(f"HALT:{halt}" for halt in guardian["halts"])
+    # Financial progress: a fresh heartbeat with no journal sequence or no
+    # reconciled certainty is an incident, not progress.
+    progress = guardian.get("last_progress_ms") if guardian else None
+    sequence = guardian.get("journal_sequence") if guardian else None
+    if reasons == [] and (not isinstance(progress, int) or now_ms - progress > FINANCIAL_STALE_MS):
+        reasons.append("FINANCIAL_PROGRESS_STALE")
+    if reasons == [] and (not isinstance(sequence, int) or sequence < 1):
+        reasons.append("FINANCIAL_PROGRESS_STALE")
+    certainty = guardian.get("certainty") if guardian else None
+    if reasons == [] and certainty != "COHERENT":
+        reasons.append("RECONCILIATION_UNCERTAIN")
     if observer and observer.get("healthy") is False:
         reasons.append("OBSERVER_UNHEALTHY")
 
