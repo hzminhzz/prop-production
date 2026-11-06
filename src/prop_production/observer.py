@@ -56,22 +56,21 @@ def observation_record(result: Any, *, now_ms: int) -> dict[str, Any]:
 
 
 async def observe_once() -> dict[str, Any]:
-    from dotenv import load_dotenv
+    """One native-evidence observation via the pinned connector's v1 contract."""
+    from dataclasses import asdict
 
-    load_dotenv()
-    # Read-only account inspection lives in the pinned connector package, which
-    # is deployed next to the application venv, not a build-time dependency.
-    from connectors.propr.account import ReadOnlyAccount
+    from connectors.propr.account import ReadOnlyAccount, discover_account
     from connectors.propr.config import Environment, ProprConfig
+    from connectors.propr.native_evidence import inspect_native_evidence
 
-    key = os.environ.get("PROPR_LIVE_API_KEY") or os.environ.get("PROPR_API_KEY")
-    if not key:
-        raise PermissionError("OBSERVER_KEY_MISSING")
-    reader = ReadOnlyAccount(ProprConfig(Environment.PRODUCTION, account_id=None, api_key=key))
-    result = await reader.inspect()
-    if not isinstance(result, dict):
-        raise TypeError("INSPECTION_SCHEMA")
-    return result
+    endpoint = os.environ.get("PROPR_API_URL", "").rstrip("/") or "https://api.propr.xyz/v1"
+    reader = ReadOnlyAccount(ProprConfig(Environment.PRODUCTION, account_id=None,
+                                         api_key=None, api_url=endpoint))
+    binding = await discover_account(reader.rest)
+    native = await inspect_native_evidence(
+        reader.rest, account_id=binding.account_id, endpoint=endpoint,
+        known_at_ms=int(time.time() * 1000), stream_connected=False)
+    return asdict(native)
 
 
 async def observe_loop(state_dir: Path, *, poll_seconds: int = POLL_SECONDS) -> None:
