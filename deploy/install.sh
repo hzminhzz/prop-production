@@ -45,7 +45,10 @@ if [ ! -d "$RELEASE_DIR" ]; then
     git diff --quiet HEAD || { echo "REFUSING: dirty review tree"; exit 1; }
     WHEEL_DIR="$RELEASE_DIR/dist"
     mkdir -p "$WHEEL_DIR"
-    (uv build --wheel --out-dir "$WHEEL_DIR" 2>/dev/null || python3 -m build --wheel --outdir "$WHEEL_DIR") \
+    UV=${UV:-/home/quant/.local/bin/uv}
+    command -v uv >/dev/null 2>&1 && UV=uv
+    (uv build --wheel --out-dir "$WHEEL_DIR" 2>/dev/null \
+        || "$UV" build --wheel --out-dir "$WHEEL_DIR" 2>/dev/null) \
         || { echo "REFUSING: wheel build failed"; exit 1; }
     WHEEL=$(ls "$WHEEL_DIR"/*.whl | head -1)
     WHEEL_SHA=$(sha256sum "$WHEEL" | cut -d' ' -f1)
