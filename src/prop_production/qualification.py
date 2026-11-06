@@ -5,7 +5,7 @@ from typing import Any
 
 from .evidence import digest, require_sha, verify
 
-CONNECTOR_COMMIT = "ec3f03a5d24a2db3b0c75fe61e3a3fbfa662b343"
+CONNECTOR_COMMIT = "b28aa8522c51830a4b389a61b20ceb539b7a89ca"
 FOUR_WEEKS_MS = 28 * 86400000
 REQUIREMENTS: dict[str, dict[str, Any]] = {
     "G0": {"inputs_complete": True, "causal_source_scope": True, "rulebook_authenticated": True},
