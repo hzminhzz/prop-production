@@ -65,7 +65,14 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         # attested guardian heartbeat showing a coherent reconcile (the broker
         # is reachable again); its digest is the recovery evidence.
         if args.action == "BROKER_UNREACHABLE":
-            heartbeat = _guardian_heartbeat(args.journal)
+            heartbeat_path = (args.journal.parent.parent / "health" / "guardian"
+                              / "heartbeat.json")
+            try:
+                heartbeat = json.loads(heartbeat_path.read_text())
+                if not isinstance(heartbeat, dict):
+                    raise ValueError("HEARTBEAT_SCHEMA")
+            except (OSError, ValueError) as error:
+                raise ValueError("RECOVERY_EVIDENCE_UNAVAILABLE") from error
             progress = heartbeat.get("last_progress_ms")
             if (heartbeat.get("certainty") != "COHERENT"
                     or not isinstance(progress, int)
