@@ -41,3 +41,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 python_version = "3.13"
 strict = true
 files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["connectors.*", "dotenv"]
+ignore_missing_imports = true

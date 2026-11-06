@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,15 @@ def installed() -> dict[str, Any]:
             "engine_tree_sha": digest(files), "source_files": files}
 
 
+def _health_evidence(journal_path: Path) -> dict[str, Any]:
+    """Watchdog heartbeat evidence for the health assessment (absent = stale)."""
+    try:
+        value = json.loads((journal_path.parent.parent / "watchdog" / "heartbeat.json").read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def read_model(path: Path, command: str, now_ms: int, intent_id: str | None = None) -> dict[str, Any]:
     state = Journal.read(path)
     runtime = state["runtime"]
@@ -41,7 +51,8 @@ def read_model(path: Path, command: str, now_ms: int, intent_id: str | None = No
     if command == "status":
         result.update(state="HALTED" if state["halts"] else runtime["state"],
                       account_readiness=runtime["certainty"], mode="SHADOW", order_route="NONE",
-                      health=assess_health(state, now_ms=now_ms), installed=installed(),
+                      health=assess_health(state, now_ms=now_ms,
+                                           watchdog_ms=_health_evidence(path).get("heartbeat_ms")), installed=installed(),
                       scientifically_qualified=False)
     elif command == "portfolio":
         result["decisions"] = [{"decision_id": d["receipt"]["decision_id"],

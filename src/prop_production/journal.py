@@ -183,6 +183,31 @@ class Journal:
             state["runtime"].update(state="HALTED", permit=None)
         return self.update("HALT_" + reason, at_ms, apply)
 
+    def recover(self, reason: str, at_ms: int, *, operator: str, incident_id: str,
+                evidence_sha: str) -> int:
+        """Operator-audited recovery: clear one latched halt after incident resolution.
+
+        State machine: HALTED → RECOVERY_REQUESTED → RECOVERY_VERIFIED → DISARMED.
+        Requires the exact existing HALT reason, operator identity, incident ID,
+        evidence digest and a fresh epoch; stale permits are revoked and no
+        automatic re-arm occurs.
+        """
+        if reason not in self.snapshot()["halts"]:
+            raise ValueError(f"HALT_NOT_PRESENT: {reason}")
+        if not operator or not incident_id or not evidence_sha:
+            raise ValueError("RECOVERY_EVIDENCE_INCOMPLETE")
+
+        def apply(state: State) -> None:
+            state["halts"].remove(reason)
+            runtime = state["runtime"]
+            runtime["state"] = "DISARMED"
+            runtime["boot_epoch"] = runtime.get("boot_epoch", 0) + 1
+            runtime["permit"] = None
+            runtime["last_recovery"] = {"reason": reason, "operator": operator,
+                                        "incident_id": incident_id,
+                                        "evidence_sha256": evidence_sha, "at_ms": at_ms}
+        return self.update("RECOVER_" + reason, at_ms, apply)
+
     def verify(self) -> dict[str, Any]:
         if self.con is None:
             raise StorageUnavailable("JOURNAL_CLOSED")

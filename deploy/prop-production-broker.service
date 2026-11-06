@@ -1,0 +1,49 @@
+# prop-production synthetic broker (SHADOW). No authenticated remote execution exists.
+[Unit]
+Description=prop-production synthetic broker worker (SHADOW, no real orders)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=prop-runtime
+Group=prop
+UMask=0077
+ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.worker broker /var/lib/prop-production
+# A SIGKILLed predecessor leaves a stale socket; the unit is single-instance,
+# so removing it at start cannot race a live server.
+ExecStartPre=-/usr/bin/rm -f /var/lib/prop-production/broker/b.sock
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+# Hardening: no privileges, no network for the synthetic broker, minimal FS.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/prop-production
+
+# Audit hardening: resource ceilings, namespace/proc isolation.
+MemoryMax=512M
+TasksMax=64
+RestrictNamespaces=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

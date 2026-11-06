@@ -42,6 +42,9 @@ class ReleaseFloor:
         if initialize:
             self.con.execute("CREATE TABLE IF NOT EXISTS releases "
                              "(account TEXT PRIMARY KEY, generation INTEGER, sha TEXT)")
+            # DELETE journal mode: runtime mode=ro opens need zero write access
+            # (WAL read-only attaches still create the -shm sidecar).
+            self.con.execute("PRAGMA journal_mode=DELETE")
             os.chmod(path, 0o600)
         if self.con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("TRUST_STORE_CORRUPT")

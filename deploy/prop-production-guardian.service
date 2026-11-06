@@ -1,0 +1,48 @@
+# prop-production Guardian SHADOW worker, driven by a persistent supervisor.
+# The journal is the durable state; systemd Restart provides crash recovery.
+[Unit]
+Description=prop-production Guardian worker (SHADOW, synthetic broker)
+Requires=prop-production-broker.service
+After=prop-production-broker.service
+
+[Service]
+Type=simple
+User=prop-runtime
+Group=prop
+UMask=0077
+ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.driver guardian /var/lib/prop-production
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+# Hardening: Guardian holds no broker credentials and has no network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/prop-production
+
+# Audit hardening: resource ceilings, namespace/proc isolation.
+MemoryMax=512M
+TasksMax=64
+RestrictNamespaces=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
