@@ -3,6 +3,8 @@
 Account-guarded copytrading application. Default: **SHADOW / DISARMED / NO_TRADE**.
 No live broker mutation route is installed or authorized.
 
+[Capability-scoped readiness](docs/CAPABILITY-SCOPED-READINESS-20261107.md) separates selected-source OBSERVE, read-only PAPER collection, independently qualified follower economics, DEMO and LIVE. Neither an unrelated missing research proof nor elapsed 72-hour soak is a universal read-only observer gate. Source collection never grants broker authority.
+
 ## Ownership
 
 - `copytrade-pm`: research, SQLite metadata authority and immutable portfolio exports.

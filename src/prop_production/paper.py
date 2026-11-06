@@ -70,6 +70,7 @@ class ObservationJournal:
         alive = latest.get("upstream_alive") is True and 0 <= now_ms - last <= 90000
         quiet = bool(prior and prior["native_tape_sha"] == latest["native_tape_sha"])
         return {"schema": "prospective_paper_report_v1", "verdict": "BLOCKED_PAPER_ADMISSION",
+                "read_only_collection": "EVIDENCE_COLLECTED" if count else "NO_OBSERVATIONS",
                 "observations": count, "first_local_known_ms": first if count else None,
                 "last_local_known_ms": last if count else None, "head_sha": previous,
                 "observed_elapsed_days": str(Decimal(last - first) / 86400000),

@@ -10,6 +10,10 @@ live GitHub, SQLite and OS evidence. The actual default branch is currently
 `feat/account-guardian-program`; recheck before publication.
 Preserve other sessions' changes. Use isolated worktrees when upstream is dirty.
 
+## Capability-scoped gates (2026-11-07)
+
+Read [capability-scoped readiness](docs/CAPABILITY-SCOPED-READINESS-20261107.md). Credential-free source OBSERVE and read-only PAPER receipt collection are independent of protected Guardian/financial attestations, historical positive alpha, unrelated regime proofs and optional 72-hour soak. `read_only_collection=EVIDENCE_COLLECTED` is **not** paper-follower admission: preserve `BLOCKED_PAPER_ADMISSION` absent executable follower economics. DEMO/LIVE still require account-bound reconciliation, actual equity, signed release, risk, broker permissions and explicit authorization.
+
 ## Authority
 
 Research metadata belongs to copytrade-pm SQLite. Provider protocol code belongs
