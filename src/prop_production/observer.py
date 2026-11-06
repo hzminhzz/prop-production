@@ -56,13 +56,13 @@ def observation_record(result: Any, *, now_ms: int) -> dict[str, Any]:
 
 
 async def observe_once() -> dict[str, Any]:
-    from dotenv import load_dotenv  # type: ignore[import-not-found]
+    from dotenv import load_dotenv
 
     load_dotenv()
     # Read-only account inspection lives in the pinned connector package, which
     # is deployed next to the application venv, not a build-time dependency.
-    from connectors.propr.account import ReadOnlyAccount  # type: ignore[import-untyped]
-    from connectors.propr.config import Environment, ProprConfig  # type: ignore[import-untyped]
+    from connectors.propr.account import ReadOnlyAccount
+    from connectors.propr.config import Environment, ProprConfig
 
     key = os.environ.get("PROPR_LIVE_API_KEY") or os.environ.get("PROPR_API_KEY")
     if not key:
