@@ -12,7 +12,7 @@ from ..evidence import canonical, digest, load_json, sign
 from ..ipc import LocalClient
 from ..journal import Journal
 from ..worker import initialize_fixture, public_fixture_key
-from .reference import ReferenceAccount, check_model, check_protocol
+from .reference import ReferenceAccount, check_guardian_projection, check_model, check_protocol
 
 
 class Worker:
@@ -120,13 +120,20 @@ def run_fixture(root: Path, *, seed: int = 17, scenario: str = "NORMAL") -> dict
             if submitted["intent_id"] not in final["intents"] or not submitted["commit_sequence"]:
                 checked = {"verdict": "FAIL", "counterexample": submitted}
         report = oracle.report(301004)
-        trace.extend([{"ledger": ledger, "audit": audit, "final": final, "reference": report}])
-        passed = accounting["verdict"] == "EXACT_REFERENCE_MATCH" and checked["verdict"] == "PROTOCOL_TRACE_VERIFIED"
+        projection = check_guardian_projection(final, observed, report)
+        model = check_model()
+        trace.extend([{"ledger": ledger, "audit": audit, "final": final,
+                       "reference": report, "guardian_projection": projection}])
+        passed = (accounting["verdict"] == "EXACT_REFERENCE_MATCH"
+                  and checked["verdict"] == "PROTOCOL_TRACE_VERIFIED"
+                  and projection["verdict"] == "GUARDIAN_REFERENCE_MATCH"
+                  and model["verdict"] == "BOUNDED_PROTOCOL_VERIFIED")
         result = {
             "schema": "judge_run_v1", "seed": seed, "scenario": scenario,
             "scope": "DECLARED_SYNTHETIC_ENVELOPE",
             "verdict": "BOUNDED_SAFETY_VERIFIED" if passed else "FAIL",
-            "accounting": accounting, "protocol": checked, "model": check_model(),
+            "accounting": accounting, "guardian_projection": projection,
+            "protocol": checked, "model": model,
             "market_outcome": "BREACH_OBSERVED" if report["breaches"] else "NO_BREACH_OBSERVED",
             "release_sha": initialized["release_sha"], "trace_sha": digest(trace),
             "sends": len([a for a in audit if a["kind"] == "SUBMIT"]),

@@ -43,6 +43,27 @@ def test_oracle_never_imports_guardian_financial_or_risk_functions():
                {"__future__", "fractions", "typing", "dataclasses", "collections"} for name in imports)
 
 
+def test_outside_judge_rejects_guardian_projection_mutants():
+    from prop_production.judge.reference import check_guardian_projection
+
+    broker = {"positions": [{"market": "BTC", "quantity": "1"}]}
+    reference = {"cash": "9990", "equity": "9990", "breaches": []}
+    guardian = {"finance": {"cash": "9990", "equity": "9990"},
+                "positions": {"BTC": "1"}, "pod_positions": {"pod-a": {"BTC": "1"}},
+                "runtime": {"certainty": "COHERENT", "flat_confirmed": False},
+                "reservations": {}, "halts": []}
+    assert check_guardian_projection(guardian, broker, reference)["verdict"] == "GUARDIAN_REFERENCE_MATCH"
+    assert check_guardian_projection(dict(guardian, finance={"cash": "9991", "equity": "9990"}),
+                                    broker, reference)["verdict"] == "FAIL"
+    assert check_guardian_projection(dict(guardian, pod_positions={"pod-a": {"BTC": "2"}}),
+                                    broker, reference)["verdict"] == "FAIL"
+    assert check_guardian_projection(dict(guardian, runtime={"certainty": "COHERENT",
+                                                             "flat_confirmed": True}),
+                                    broker, reference)["verdict"] == "FAIL"
+    assert check_guardian_projection(guardian, broker, dict(reference,
+                                    breaches=["TRAILING_FLOOR"]))["verdict"] == "FAIL"
+
+
 def test_bounded_protocol_model_explores_crash_and_unknown_states():
     from prop_production.judge.reference import check_model
     result = check_model(10)

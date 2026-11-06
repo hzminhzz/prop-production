@@ -122,6 +122,49 @@ class ReferenceAccount:
         return {"verdict": "EXACT_REFERENCE_MATCH", "currency_quantum": "0.00000001"}
 
 
+def check_guardian_projection(guardian: dict[str, Any], observed: dict[str, Any],
+                              reference: dict[str, Any]) -> dict[str, Any]:
+    """Check the actual Guardian's public journal view against independent truth.
+
+    This is deliberately separate from the broker-versus-oracle comparison:
+    matching two fake-broker implementations cannot establish Guardian correctness.
+    """
+    finance = guardian.get("finance", {})
+    for field in ("cash", "equity"):
+        try:
+            actual = money(Fraction(finance[field]))
+            expected = money(Fraction(reference[field]))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return {"verdict": "FAIL", "counterexample": {"field": field, "reason": "MISSING_FINANCE"}}
+        if actual != expected:
+            return {"verdict": "FAIL", "counterexample": {
+                "field": field, "actual": str(actual), "expected": str(expected)}}
+    try:
+        actual_positions = {market: Fraction(q) for market, q in guardian["positions"].items()
+                            if Fraction(q)}
+        broker_positions = {item["market"]: Fraction(item["quantity"])
+                            for item in observed["positions"] if Fraction(item["quantity"])}
+        pod_positions: dict[str, Fraction] = {}
+        for book in guardian.get("pod_positions", {}).values():
+            for market, q in book.items():
+                pod_positions[market] = pod_positions.get(market, ZERO) + Fraction(q)
+        pod_positions = {m: q for m, q in pod_positions.items() if q}
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return {"verdict": "FAIL", "counterexample": {"reason": "INVALID_POSITION_PROJECTION"}}
+    if actual_positions != broker_positions or actual_positions != pod_positions:
+        return {"verdict": "FAIL", "counterexample": {"reason": "POSITION_DRIFT",
+                "guardian": {m: str(q) for m, q in actual_positions.items()},
+                "broker": {m: str(q) for m, q in broker_positions.items()},
+                "pods": {m: str(q) for m, q in pod_positions.items()}}}
+    if reference["breaches"] and not guardian.get("halts"):
+        return {"verdict": "FAIL", "counterexample": {"reason": "MISSING_BREACH_HALT"}}
+    if guardian.get("runtime", {}).get("flat_confirmed") and (
+            broker_positions or guardian.get("reservations")
+            or guardian.get("runtime", {}).get("certainty") != "COHERENT"):
+        return {"verdict": "FAIL", "counterexample": {"reason": "FALSE_FLAT_CONFIRMED"}}
+    return {"verdict": "GUARDIAN_REFERENCE_MATCH"}
+
+
 def check_protocol(events: list[dict[str, Any]]) -> dict[str, Any]:
     identities: dict[str, str] = {}
     for index, event in enumerate(events):
