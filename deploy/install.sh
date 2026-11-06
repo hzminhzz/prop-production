@@ -36,15 +36,17 @@ if [ ! -d "$RELEASE_DIR" ]; then
     git diff --quiet HEAD || { echo "REFUSING: dirty review tree"; exit 1; }
     WHEEL_DIR="$RELEASE_DIR/dist"
     mkdir -p "$WHEEL_DIR"
-    (uv build --wheel --out-dir "$WHEEL_DIR" 2>/dev/null || python3 -m build --wheel --outdir "$WHEEL_DIR") \
+    uv build --wheel --out-dir "$WHEEL_DIR" >/dev/null 2>&1 \
         || { echo "REFUSING: wheel build failed"; exit 1; }
     WHEEL=$(ls "$WHEEL_DIR"/*.whl | head -1)
     WHEEL_SHA=$(sha256sum "$WHEEL" | cut -d' ' -f1)
     echo "$WHEEL_SHA  $(basename "$WHEEL")" > "$WHEEL_DIR/SHA256SUMS"
     # Verify the recorded digest matches before installing anything.
     (cd "$WHEEL_DIR" && sha256sum -c SHA256SUMS) >/dev/null || { echo "REFUSING: wheel digest mismatch"; exit 1; }
-    python3 -m venv "$RELEASE_DIR/venv"
-    "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx
+    python3 -m venv "$RELEASE_DIR/venv" || { echo "REFUSING: venv creation failed"; exit 1; }
+    "$RELEASE_DIR/venv/bin/pip" install --quiet "$WHEEL" python-dotenv httpx \
+        || { echo "REFUSING: dependency install failed"; exit 1; }
+    [ -x "$RELEASE_DIR/venv/bin/python" ] || { echo "REFUSING: release venv incomplete"; exit 1; }
     git rev-parse "$RELEASE_SHA" > "$RELEASE_DIR/COMMIT"
     git cat-file -p "$RELEASE_SHA" | grep '^tree' > "$RELEASE_DIR/TREE"
     (cd "$REPO" && git archive "$RELEASE_SHA" | sha256sum) > "$RELEASE_DIR/SOURCE.sha256"
