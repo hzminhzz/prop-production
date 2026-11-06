@@ -34,17 +34,19 @@ def test_watchdog_blocks_on_stale_guardian(tmp_path):
 
 def test_watchdog_blocks_on_unhealthy_observer(tmp_path):
     health = tmp_path / "health"
-    health.mkdir()
-    (health / "guardian.json").write_text(json.dumps({"heartbeat_ms": 9000, "halts": []}))
-    (health / "observer.json").write_text(json.dumps({"heartbeat_ms": 9000, "healthy": False}))
-    assert "OBSERVER_UNHEALTHY" in assess(tmp_path, now_ms=10_000_000)["reasons"]
+    (health / "guardian").mkdir(parents=True)
+    (health / "observer").mkdir(parents=True)
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "halts": []}))
+    (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": False}))
+    assert "OBSERVER_UNHEALTHY" in assess(tmp_path, now_ms=10_000)["reasons"]
 
 
 def test_watchdog_healthy_when_fresh(tmp_path):
     health = tmp_path / "health"
-    health.mkdir()
-    (health / "guardian.json").write_text(json.dumps({"heartbeat_ms": 9_000, "halts": []}))
-    (health / "observer.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
+    (health / "guardian").mkdir(parents=True)
+    (health / "observer").mkdir(parents=True)
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "halts": []}))
+    (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
     assessment = assess(tmp_path, now_ms=10_000)
     assert assessment["status"] == "HEALTHY"
     assert assessment["guardian_heartbeat_ms"] == 9_000
@@ -52,11 +54,12 @@ def test_watchdog_healthy_when_fresh(tmp_path):
 
 def test_watchdog_propagates_latched_halts(tmp_path):
     health = tmp_path / "health"
-    health.mkdir()
-    (health / "guardian.json").write_text(json.dumps({"heartbeat_ms": 9_000,
+    (health / "guardian").mkdir(parents=True)
+    (health / "observer").mkdir(parents=True)
+    (health / "guardian" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000,
                                                       "halts": ["BROKER_UNREACHABLE"]}))
-    (health / "observer.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
-    assert "HALT:BROKER_UNREACHABLE" in assess(tmp_path, now_ms=10_000_000)["reasons"]
+    (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
+    assert "HALT:BROKER_UNREACHABLE" in assess(tmp_path, now_ms=10_000)["reasons"]
 
 
 def test_driver_heartbeat_writes_evidence(tmp_path):
@@ -70,7 +73,7 @@ def test_driver_heartbeat_writes_evidence(tmp_path):
         worker.stdout.close()
         worker.terminate()
         worker.wait()
-    record = json.loads((tmp_path / "health" / "guardian.json").read_text())
+    record = json.loads((tmp_path / "health" / "guardian" / "heartbeat.json").read_text())
     assert record["schema"] == "guardian_heartbeat_v1"
     assert record["halts"] == []
     assert type(record["heartbeat_ms"]) is int

@@ -40,5 +40,13 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 ReadWritePaths=/var/lib/prop-production
 
+# Audit hardening: resource ceilings, namespace/proc isolation.
+MemoryMax=512M
+TasksMax=64
+RestrictNamespaces=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+
 [Install]
 WantedBy=multi-user.target

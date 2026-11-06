@@ -78,10 +78,10 @@ async def observe_loop(state_dir: Path, *, poll_seconds: int = POLL_SECONDS) -> 
     """Poll read-only account evidence until stopped. Appends only."""
     state_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
     evidence_path = state_dir / "observations.jsonl"
-    # Observer heartbeat goes to the shared health dir the watchdog reads.
-    health = state_dir.parent / "health"
-    health.mkdir(mode=0o770, parents=True, exist_ok=True)
-    heartbeat_path = health / "observer.json"
+    # Observer heartbeat: role-owned dir (prop-observer writes, group reads).
+    health = state_dir.parent / "health" / "observer"
+    health.mkdir(mode=0o750, parents=True, exist_ok=True)
+    heartbeat_path = health / "heartbeat.json"
     while running:
         now_ms = int(time.time() * 1000)
         try:

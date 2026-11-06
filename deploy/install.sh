@@ -41,10 +41,13 @@ fi
 
 # 5. Root-protected state tree; per-role ownership. Role dirs stay 0700:
 # the worker Landlock sandbox rejects writable paths with group/other bits.
-# Shared heartbeats live in health/ (0770 root:prop, files 0640).
-[ -d "$STATE/health" ] || mkdir -p "$STATE/health"
-chown root:prop "$STATE"; chmod 0750 "$STATE"
-chown root:prop "$STATE/health"; chmod 0770 "$STATE/health"
+# Heartbeats live in role-owned health/ subdirs (0750 dir, 0640 file): only the
+# owner role writes its own evidence; the watchdog and root read via group.
+[ -d "$STATE/health/guardian" ] || mkdir -p "$STATE/health/guardian" "$STATE/health/observer" "$STATE/health/watchdog"
+chown root:prop "$STATE/health"; chmod 0755 "$STATE/health"
+chown prop-runtime:prop "$STATE/health/guardian"; chmod 0750 "$STATE/health/guardian"
+chown prop-observer:prop "$STATE/health/observer"; chmod 0750 "$STATE/health/observer"
+chown prop-watchdog:prop "$STATE/health/watchdog"; chmod 0750 "$STATE/health/watchdog"
 chown -R prop-runtime:prop "$STATE/broker" "$STATE/guardian" "$STATE/judge"
 for role in broker guardian judge; do chmod 0700 "$STATE/$role"; done
 chown -R prop-planner:prop "$STATE/planner"; chmod 0700 "$STATE/planner"
@@ -53,13 +56,27 @@ chown -R prop-observer:prop "$STATE/observer"; chmod 0750 "$STATE/observer"
 [ -d "$STATE/watchdog" ] || mkdir -p "$STATE/watchdog"
 chown -R prop-watchdog:prop "$STATE/watchdog"; chmod 0750 "$STATE/watchdog"
 
-# Trust anchor: group-readable; the SQLite WAL reader needs write on the
-# -wal/-shm side files (dir stays 0750), never on settings or keys.
-chown -R root:prop "$STATE/trust"; chmod 0750 "$STATE/trust"
+# Trust anchor: the release floor is the anti-rollback authority. DELETE journal
+# mode lets runtime workers open it read-only with zero write access; only the
+# deploy-time trust authority (root) may ever advance it.
+chown root:prop "$STATE/trust"; chmod 0750 "$STATE/trust"
+# Settings and floor: group-readable, never group-writable. The DELETE-journal
+# floor needs zero write access at runtime; only root (deploy authority) writes.
+chown root:prop "$STATE/trust/settings.json" "$STATE/trust/floor.sqlite" 2>/dev/null || true
 chmod 0640 "$STATE/trust/settings.json" 2>/dev/null || true
-for suffix in "" -wal -shm; do
-    [ -f "$STATE/trust/floor.sqlite$suffix" ] && chmod 0660 "$STATE/trust/floor.sqlite$suffix"
-done
+
+# Migrate a pre-DELETE-mode floor (WAL sidecars needed shm write): checkpoint,
+# convert, then drop the sidecars so runtime read-only opens need zero writes.
+"$OPT/venv/bin/python" -c "
+import sqlite3
+con = sqlite3.connect('$STATE/trust/floor.sqlite', timeout=0.1, isolation_level=None)
+mode = con.execute('PRAGMA journal_mode').fetchone()[0]
+if mode == 'wal':
+    con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    con.execute('PRAGMA journal_mode=DELETE')
+con.close()
+" || true
+rm -f "$STATE/trust/floor.sqlite-wal" "$STATE/trust/floor.sqlite-shm"
 
 # 6. Observer credentials: root-only file, value flows file-to-file only.
 [ -f /etc/prop-production/observer.env ] || {

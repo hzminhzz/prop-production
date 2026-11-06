@@ -34,8 +34,8 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 def assess(state_root: Path, *, now_ms: int) -> dict[str, Any]:
     """One fail-closed assessment of the deployed runtime. Read-only."""
     reasons: list[str] = []
-    guardian = _read_json(state_root / "health" / "guardian.json")
-    observer = _read_json(state_root / "health" / "observer.json")
+    guardian = _read_json(state_root / "health" / "guardian" / "heartbeat.json")
+    observer = _read_json(state_root / "health" / "observer" / "heartbeat.json")
 
     guardian_ms = guardian.get("heartbeat_ms") if guardian else None
     if not isinstance(guardian_ms, int) or not 0 <= now_ms - guardian_ms <= STALE_GUARDIAN_MS:

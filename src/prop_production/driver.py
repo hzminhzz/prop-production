@@ -36,9 +36,10 @@ def _heartbeat(root: Path, worker: subprocess.Popen[str]) -> None:
     except ValueError:
         state = {}
     halts = state.get("halts") if isinstance(state, dict) else None
-    health = root / "health"
-    health.mkdir(mode=0o770, parents=True, exist_ok=True)
-    target = health / "guardian.json"
+    # Role-owned heartbeat: only prop-runtime writes here (0750 dir, group reads).
+    health = root / "health" / "guardian"
+    health.mkdir(mode=0o750, parents=True, exist_ok=True)
+    target = health / "heartbeat.json"
     temporary = target.with_suffix(".tmp")
     temporary.write_text(json.dumps({"schema": "guardian_heartbeat_v1",
                                      "heartbeat_ms": _now_ms(), "halts": halts or []}))
