@@ -69,7 +69,14 @@ release_complete() {
     "$1/venv/bin/python" -c 'import ccxt; assert ccxt.__version__ == "4.5.74"' >/dev/null 2>&1
 }
 if [ -d "$RELEASE_DIR" ] && ! release_complete "$RELEASE_DIR"; then
-    echo "INCOMPLETE RELEASE at $RELEASE_DIR — rebuilding"
+    # Never remove the release currently backing running Python processes.
+    # Instead stop and require an operator-controlled staged repair.
+    ACTIVE_RELEASE=$(readlink -f "$OPT/current" 2>/dev/null || true)
+    if [ "$ACTIVE_RELEASE" = "$RELEASE_DIR" ]; then
+        echo "REFUSING: active release failed integrity checks; preserve it for recovery"
+        exit 1
+    fi
+    echo "INCOMPLETE INACTIVE RELEASE at $RELEASE_DIR — rebuilding"
     rm -rf "$RELEASE_DIR"
 fi
 if [ ! -d "$RELEASE_DIR" ]; then
