@@ -1,6 +1,15 @@
+import ctypes
 import json
 import subprocess
 import sys
+
+
+def test_landlock_abi_layout_is_stable_across_python_versions():
+    from prop_production.isolation import PathRule
+
+    assert ctypes.sizeof(PathRule) == 12
+    assert PathRule.allowed_access.offset == 0
+    assert PathRule.parent_fd.offset == 8
 
 
 def test_linux_planner_sandbox_denies_guardian_secrets_and_network(tmp_path):

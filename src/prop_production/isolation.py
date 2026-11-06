@@ -20,6 +20,9 @@ class Ruleset(ctypes.Structure):
 
 
 class PathRule(ctypes.Structure):
+    # Kernel landlock_path_beneath_attr has a packed 12-byte ABI.
+    # ctypes 3.14+ requires explicit layout when _pack_ is supplied.
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
 
