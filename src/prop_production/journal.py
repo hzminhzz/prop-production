@@ -184,16 +184,23 @@ class Journal:
         return self.update("HALT_" + reason, at_ms, apply)
 
     def recover(self, reason: str, at_ms: int, *, operator: str, incident_id: str,
-                evidence_sha: str) -> int:
+                evidence_sha: str, reset_daily_baseline: bool = False) -> int:
         """Evidence-gated recovery: HALTED → RECOVERY_REQUESTED → RECOVERY_VERIFIED.
 
         Requires the exact existing HALT, operator identity, incident ID and a
         well-formed evidence digest. Unrelated HALTs keep the runtime HALTED;
         clearing the last one transitions to DISARMED with a fresh epoch and
         revoked permits. Never auto-arms.
+
+        reset_daily_baseline: for MIDNIGHT_BASELINE_UNKNOWN only — a skipped
+        UTC day can never satisfy the +1 rollover, so the stale baseline is
+        discarded (audited here) and the next boundary-aligned reconcile
+        bootstraps fresh from provider evidence.
         """
         if reason not in self.snapshot()["halts"]:
             raise ValueError(f"HALT_NOT_PRESENT: {reason}")
+        if reset_daily_baseline and reason != "MIDNIGHT_BASELINE_UNKNOWN":
+            raise ValueError("DAILY_BASELINE_RESET_ONLY_FOR_MIDNIGHT_INCIDENTS")
         if not operator.strip() or not incident_id.strip():
             raise ValueError("RECOVERY_IDENTITY_REQUIRED")
         if (not isinstance(evidence_sha, str) or len(evidence_sha) != 64
@@ -207,10 +214,13 @@ class Journal:
             runtime["state"] = "DISARMED" if not state["halts"] else "HALTED"
             runtime["boot_epoch"] = runtime.get("boot_epoch", 0) + 1
             runtime["permit"] = None
+            if reset_daily_baseline:
+                state["finance"] = {}  # stale baseline discarded; boundary re-bootstraps
             runtime["last_recovery"] = {
                 "recovery_state": "RECOVERY_VERIFIED", "reason": reason,
                 "operator": operator, "incident_id": incident_id,
                 "evidence_sha256": evidence_sha.lower(), "at_ms": at_ms,
+                "daily_baseline_reset": reset_daily_baseline,
                 "remaining_halts": list(state["halts"]),
             }
         return self.update("RECOVER_" + reason, at_ms, apply)
