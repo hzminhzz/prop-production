@@ -31,7 +31,9 @@ def initial_state(account_binding: str) -> State:
     }
 
 
-def _verify(con: sqlite3.Connection, *, finance_history: deque | None = None) -> tuple[State, int, str]:
+def _verify(
+    con: sqlite3.Connection, *, finance_history: deque[dict[str, Any]] | None = None,
+) -> tuple[State, int, str]:
     if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
         raise ValueError("CORRUPT_DATABASE")
     if con.execute("PRAGMA foreign_key_check").fetchall():
@@ -331,7 +333,7 @@ class Journal:
         try:
             con.execute("PRAGMA query_only=ON")
             con.execute("BEGIN")
-            history: deque = deque(maxlen=limit)
+            history: deque[dict[str, Any]] = deque(maxlen=limit)
             state, _, _ = _verify(con, finance_history=history)
             return state, list(history)
         except (sqlite3.Error, ValueError) as exc:

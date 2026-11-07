@@ -11,7 +11,7 @@ import re
 import subprocess
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import __version__
 from .evidence import digest
@@ -99,11 +99,14 @@ def _exposure(state: dict[str, Any]) -> dict[str, Any]:
                 "observed_at_ms": runtime.get("last_snapshot_ms")}
     for market, raw_quantity in positions.items():
         qty, mark = _decimal(raw_quantity), _decimal(marks.get(market))
-        if qty is None or (qty and (mark is None or mark <= 0)):
+        if qty is None:
             return {"status": "UNKNOWN", "gross": None, "net": None,
                     "observed_at_ms": runtime.get("last_snapshot_ms")}
-        if not qty:
+        if qty == 0:
             continue
+        if mark is None or mark <= 0:
+            return {"status": "UNKNOWN", "gross": None, "net": None,
+                    "observed_at_ms": runtime.get("last_snapshot_ms")}
         notional = qty * mark
         gross += abs(notional)
         net += notional
@@ -223,7 +226,7 @@ def project_state(state: dict[str, Any], command: str, now_ms: int,
                              for value in selected]
         result["total_intents"] = len(all_intents)
         result["truncated"] = intent_id is None and len(all_intents) > 120
-    return _scrub(result, state["account_binding"])
+    return cast(dict[str, Any], _scrub(result, state["account_binding"]))
 
 
 def read_model(path: Path, command: str, now_ms: int, intent_id: str | None = None) -> dict[str, Any]:
