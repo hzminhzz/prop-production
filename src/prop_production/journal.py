@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import os
 import sqlite3
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,9 @@ def initial_state(account_binding: str) -> State:
     }
 
 
-def _verify(con: sqlite3.Connection) -> tuple[State, int, str]:
+def _verify(
+    con: sqlite3.Connection, *, finance_history: deque[dict[str, Any]] | None = None,
+) -> tuple[State, int, str]:
     if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
         raise ValueError("CORRUPT_DATABASE")
     if con.execute("PRAGMA foreign_key_check").fetchall():
@@ -49,6 +52,25 @@ def _verify(con: sqlite3.Connection) -> tuple[State, int, str]:
         if expected != row_sha or parsed["sequence"] != seq:
             raise ValueError("JOURNAL_TAMPER")
         previous, state, sequence = row_sha, parsed, seq
+        if finance_history is not None and kind == "RECONCILE":
+            finance = parsed.get("finance")
+            if isinstance(finance, dict) and type(finance.get("observed_at_ms")) is int:
+                finance_history.append({
+                    "journal_sequence": seq,
+                    "reconciled_at_ms": at_ms,
+                    "observed_at_ms": finance["observed_at_ms"],
+                    "release_sha": parsed.get("active_release_sha"),
+                    "equity": finance.get("equity"),
+                    "unrealized": finance.get("unrealized"),
+                    "cash": finance.get("cash"),
+                    "risk_floor": finance.get("risk_floor"),
+                    "daily_floor": finance.get("daily_floor"),
+                    "internal_floor": finance.get("internal_floor"),
+                    "trailing_floor": finance.get("trailing_floor"),
+                    "headroom": finance.get("headroom"),
+                    "day": finance.get("day"),
+                    "realized_made": finance.get("realized_made"),
+                })
     snap = con.execute("SELECT seq,payload,sha FROM snapshot WHERE id=1").fetchone()
     if sequence and (snap is None or snap != (sequence, canonical(state).decode(), previous)):
         raise ValueError("SNAPSHOT_MISMATCH")
@@ -289,6 +311,31 @@ class Journal:
             con.execute("BEGIN")
             state, _, _ = _verify(con)
             return state
+        except (sqlite3.Error, ValueError) as exc:
+            raise StorageUnavailable("HALT_STORAGE") from exc
+        finally:
+            con.close()
+
+    @staticmethod
+    def read_with_finance_history(
+        path: Path, *, limit: int = 256,
+    ) -> tuple[State, list[dict[str, Any]]]:
+        """Owner-only full-chain verification; never call on a dashboard refresh.
+
+        Retain recent authentic RECONCILE observations, including contractual
+        floors and day boundaries. This does not reconstruct missing history.
+        """
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("INVALID_FINANCE_HISTORY_LIMIT")
+        if path.is_symlink() or not path.is_file():
+            raise StorageUnavailable("JOURNAL_UNAVAILABLE")
+        con = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True, isolation_level=None)
+        try:
+            con.execute("PRAGMA query_only=ON")
+            con.execute("BEGIN")
+            history: deque[dict[str, Any]] = deque(maxlen=limit)
+            state, _, _ = _verify(con, finance_history=history)
+            return state, list(history)
         except (sqlite3.Error, ValueError) as exc:
             raise StorageUnavailable("HALT_STORAGE") from exc
         finally:
