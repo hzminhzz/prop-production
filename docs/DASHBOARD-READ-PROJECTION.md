@@ -22,8 +22,9 @@ and exposes additive causal fields:
   associated with intent ID, market, quantity, price, fee and fill-known clock.
   A provider timeout is still UNKNOWN, not a rejected order.
 - Exact owner-computed gross/net broker-mark notional diagnostics only after
-  `runtime.certainty=COHERENT`, a usable broker snapshot clock and complete
-  position marks. Missing evidence returns UNKNOWN, not zero.
+  `runtime.certainty=COHERENT`, no active Guardian HALT, a usable broker
+  snapshot clock and complete position marks. A newer HALT may invalidate
+  retained previous marks. Missing evidence returns UNKNOWN, not zero.
 - Guardian exact contractual floors, equity/headroom and cumulative pod
   loss used. The signed *budget value* is not stored in the existing Guardian
   journal, so this exporter does not invent it from a synthetic risk policy.
@@ -51,7 +52,9 @@ history.json
 
 Each file carries `dashboard_guardian_capture_v1`, native
 `operator_<command>_v1`, account-binding SHA, journal sequence, release SHA,
-source observation clock and capture clock. Every file is capped at 128 KiB.
+source observation clock and common capture clock. The consumer requires
+identical account/release/sequence/**capture clock** across the set, rejecting
+partially replaced captures. Every file is capped at 128 KiB.
 The writer rejects symlink capture directories, unexpected owners, or
 group/world-write access; fixed-name files are installed by fsync +
 atomic replace at mode `0640`. No account binding string, wallet address,
@@ -88,3 +91,15 @@ This extension is intentionally additive to the existing read CLI. Its
 single-intent lookups even when the general tail window is truncated.
 The read-only exporter cannot place/cancel orders, alter HALT, change
 sizing, or mutate the Guardian journal.
+
+## Phase 2 source-review outcome / Phase 3 contract
+
+Independent review repaired the retained-mark HALT classification and strict
+mypy typing in the Journal history and owner projector. At owner source
+`29805417be8e4b773cdcd2073bed5148dd17d9f6`, the clean pinned
+`bash scripts/verify-local.sh all` completed; that existing manifest pins
+research `b1dc9fd9493b28d56385400708e7547f74b173fe` and connector
+`2db29b50af301741821781dedf64e4d8194fc125`, not a new dashboard
+consumer release. Phase 3 must separately review the consumer pin and verify
+actual protected permissions, producer schedule and operational performance
+before installation. No source merge implies live activation.
