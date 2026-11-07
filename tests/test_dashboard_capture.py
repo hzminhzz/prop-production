@@ -62,6 +62,10 @@ def test_owner_exposure_unknown_if_mark_or_broker_certainty_missing():
     assert _exposure(state)["gross"] is None
     state["runtime"]["certainty"] = "UNKNOWN"
     assert _exposure(state)["status"] == "UNKNOWN"
+    state["last_marks"]["ETH"] = "100"
+    state["runtime"]["certainty"] = "COHERENT"
+    state["halts"] = ["RECONCILIATION_UNCERTAIN"]
+    assert _exposure(state)["status"] == "UNKNOWN"
 
 
 def test_export_single_journal_snapshot_bounded_and_no_financial_write(tmp_path):

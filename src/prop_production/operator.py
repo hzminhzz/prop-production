@@ -80,7 +80,11 @@ def _decimal(value: object) -> Decimal | None:
 def _exposure(state: dict[str, Any]) -> dict[str, Any]:
     """Diagnostic mark exposure only when the broker-owned reconciliation is coherent."""
     runtime = state.get("runtime", {})
+    # A newer failed reconciliation can leave the last successful snapshot's
+    # certainty/marks in the journal. Never describe those marks as a currently
+    # coherent broker book while a Guardian safety latch is active.
     if (runtime.get("certainty") != "COHERENT"
+            or state.get("halts")
             or type(runtime.get("last_snapshot_ms")) is not int):
         return {"status": "UNKNOWN", "gross": None, "net": None,
                 "observed_at_ms": None}
