@@ -22,6 +22,7 @@ PERIODIC: dict[str, dict[str, Any] | None] = {"guardian": {"command": "reconcile
                                               "planner": {"command": "propose", "broker_epoch": 0,
                                                           "quotes": {}},
                                               "broker": None}
+DAY_MS = 86_400_000
 INTERVAL_S = 4        # default cadence; overridable via PROP_DRIVER_INTERVAL
 RESPONSE_TIMEOUT_S = 30
 STARTUP_TIMEOUT_S = 30
@@ -130,7 +131,17 @@ def drive(role: str, root: Path, *, interval_s: int) -> None:
         while worker.poll() is None:
             template = PERIODIC[role]
             assert template is not None
-            command = {"now_ms": _now_ms(), **template}
+            # Boundary alignment: the daily-loss baseline may only be
+            # bootstrapped or rolled over from a receipt timestamped exactly at
+            # the UTC day boundary (finance.py MIDNIGHT_BASELINE_UNKNOWN gate).
+            # When a boundary falls inside this sleep window, wait for it and
+            # reconcile AT it so the broker snapshot carries boundary evidence.
+            now_ms = _now_ms()
+            boundary_ms = (now_ms // DAY_MS + 1) * DAY_MS
+            if role == "guardian" and boundary_ms - now_ms <= interval_s * 1000:
+                time.sleep(max(0.0, (boundary_ms - time.time() * 1000) / 1000))
+                now_ms = boundary_ms
+            command = {"now_ms": now_ms, **template}
             worker.stdin.write((json.dumps(command) + "\n").encode())
             worker.stdin.flush()
             try:

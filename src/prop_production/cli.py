@@ -84,7 +84,8 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             evidence_sha = args.evidence_sha
         with Journal(args.journal, account) as journal:
             journal.recover(args.action, now_ms, operator=args.operator,
-                            incident_id=args.incident, evidence_sha=evidence_sha)
+                            incident_id=args.incident, evidence_sha=evidence_sha,
+                            reset_daily_baseline=(args.action == "MIDNIGHT_BASELINE_UNKNOWN"))
             remaining = Journal.read(args.journal)["halts"]
             return {
                 "schema": "operator_recover_v1",

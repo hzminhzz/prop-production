@@ -206,3 +206,37 @@ def test_watchdog_detects_stale_financial_progress(tmp_path):
         "journal_sequence": 7, "certainty": "COHERENT", "boot_epoch": 3, "halts": []}))
     (health / "observer" / "heartbeat.json").write_text(json.dumps({"heartbeat_ms": 9_000, "healthy": True}))
     assert "FINANCIAL_PROGRESS_STALE" in assess(tmp_path, now_ms=10_000)["reasons"]
+
+
+def test_recover_resets_stale_daily_baseline_for_midnight_incident(tmp_path):
+    """A skipped UTC day cannot satisfy the +1 rollover: recovery discards the
+    stale baseline (audited) so the next boundary-aligned reconcile bootstraps."""
+    from prop_production.journal import Journal
+    journal = Journal(tmp_path / "account.sqlite", "fixture-account", initialize=True)
+    try:
+        journal.halt("MIDNIGHT_BASELINE_UNKNOWN", 1000)
+        journal.recover("MIDNIGHT_BASELINE_UNKNOWN", 2000, operator="op",
+                        incident_id="INC-5", evidence_sha="d" * 64,
+                        reset_daily_baseline=True)
+        state = journal.snapshot()
+        assert state["halts"] == []
+        assert state["finance"] == {}  # stale baseline gone; boundary re-bootstraps
+        assert state["runtime"]["last_recovery"]["daily_baseline_reset"] is True
+    finally:
+        journal.close()
+
+
+def test_daily_baseline_reset_rejected_for_other_reasons(tmp_path):
+    from prop_production.journal import Journal
+    journal = Journal(tmp_path / "account.sqlite", "fixture-account", initialize=True)
+    try:
+        journal.halt("BROKER_UNREACHABLE", 1000)
+        try:
+            journal.recover("BROKER_UNREACHABLE", 2000, operator="op",
+                            incident_id="INC-6", evidence_sha="e" * 64,
+                            reset_daily_baseline=True)
+            assert False, "reset accepted for a non-midnight incident"
+        except ValueError as error:
+            assert "DAILY_BASELINE_RESET_ONLY_FOR_MIDNIGHT_INCIDENTS" in str(error)
+    finally:
+        journal.close()
