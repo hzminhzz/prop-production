@@ -114,6 +114,23 @@ def test_shadow_guardian_denial_is_journaled_and_cannot_be_reserved(tmp_path):
     floor.close()
 
 
+def test_old_source_action_cannot_reopen_after_gap_or_update(tmp_path):
+    guardian, projection, source, broker, journal, floor = guardian_and_projection(tmp_path)
+    projection.ingest(event(source, 1, 101, 0, kind="BASELINE"), now_ms=101)
+    projection.ingest(event(source, 2, 200, 20), now_ms=200)
+    action = projection.due(300200)[0]
+    quote = {NATIVE: {"bid": "10000", "ask": "10030", "known_at_ms": 300300}}
+    projection.ingest(event(source, 3, 300300, kind="GAP", valid=False), now_ms=300300)
+    with pytest.raises(ValueError, match="ACTION_SOURCE_NOT_CONTINUOUS"):
+        guardian.preview_v4(projection, action["action_id"], quote, 300300)
+    assert not journal.snapshot()["intents"]
+    assert not broker.audit()
+    projection.close()
+    journal.close()
+    broker.close()
+    floor.close()
+
+
 def test_shadow_guardian_rejects_different_signer_and_expired_timing(tmp_path):
     guardian, projection, source, broker, journal, floor = guardian_and_projection(tmp_path)
     projection.ingest(event(source, 1, 101, 0, kind="BASELINE"), now_ms=101)

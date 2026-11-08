@@ -157,7 +157,7 @@ class Guardian:
             or self.release.payload["source_mode"] != "PROSPECTIVE"
         ):
             raise ValueError("V4_PROJECTION_AUTHORITY")
-        action = projection.action(action_id)
+        action = projection.current_action(action_id, now_ms)
         if action["trading_authorized"] is not False or action["due_ms"] > now_ms:
             raise ValueError("V4_ACTION_NOT_ELIGIBLE")
         proposal_id = digest(

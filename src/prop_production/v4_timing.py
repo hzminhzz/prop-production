@@ -465,6 +465,26 @@ class V4ShadowProjection:
                 return action
         raise ValueError("V4_ACTION_UNKNOWN")
 
+    def current_action(self, action_id: str, now_ms: int) -> dict[str, Any]:
+        """Reject old eligibility receipts after a new source frame or gap."""
+        action = self.action(action_id)
+        row = self.con.execute(
+            "SELECT s.continuous,s.known_ms,s.book,m.eligible_qty "
+            "FROM streams s JOIN markets m ON s.identity=m.identity "
+            "WHERE s.identity=? AND m.market=?",
+            (action["source_identity"], action["market"]),
+        ).fetchone()
+        if row is None or row[0] != 1 or row[2] is None:
+            raise ValueError("V4_ACTION_SOURCE_NOT_CONTINUOUS")
+        if not 0 <= now_ms - row[1] <= STALE_MS:
+            raise ValueError("V4_ACTION_SOURCE_STALE")
+        if (
+            digest(json.loads(row[2])) != action["source_receipt_sha"]
+            or decimal(row[3]) != decimal(action["eligible_source_qty"])
+        ):
+            raise ValueError("V4_ACTION_SUPERSEDED")
+        return action
+
     def eligible_pods(self, now_ms: int) -> list[dict[str, Any]]:
         """Risk-neutral signed-source targets; only Guardian may admit follower risk.
 
