@@ -131,6 +131,60 @@ def test_old_source_action_cannot_reopen_after_gap_or_update(tmp_path):
     floor.close()
 
 
+def test_attested_v4_preview_requires_separate_quote_signer(tmp_path):
+    from prop_production.evidence import sign
+
+    guardian, projection, source, broker, journal, floor = guardian_and_projection(tmp_path)
+    projection.ingest(event(source, 1, 101, 0, kind="BASELINE"), now_ms=101)
+    projection.ingest(event(source, 2, 200, 20), now_ms=200)
+    action = projection.due(300200)[0]
+    quote_key = Ed25519PrivateKey.generate()
+    quote = {
+        "schema": "follower_quote_book_v1",
+        "account_binding": guardian.release.payload["account_binding"],
+        "release_sha": guardian.release.release_sha,
+        "known_at_ms": 300200,
+        "provider_endpoint": "https://example.test/independent",
+        "provider_scope": "synthetic-test-only",
+        "quotes": {
+            NATIVE: {
+                "bid": "9990",
+                "ask": "10010",
+                "known_at_ms": 300200,
+                "venue_native_id": NATIVE,
+            },
+        },
+        "source_kind": "INDEPENDENT_FOLLOWER_VENUE_BID_ASK",
+        "mutation_authorized": False,
+    }
+    envelope = sign(quote, quote_key, "follower-independent-quote")
+    with pytest.raises(ValueError, match="SIGNER_NOT_INDEPENDENT"):
+        guardian.preview_attested_v4(
+            projection,
+            action["action_id"],
+            envelope,
+            source.public_key(),
+            frozenset({NATIVE}),
+            300200,
+        )
+    decision = guardian.preview_attested_v4(
+        projection,
+        action["action_id"],
+        envelope,
+        quote_key.public_key(),
+        frozenset({NATIVE}),
+        300200,
+    )
+    assert decision.data["status"] == "BLOCKED"
+    assert decision.data["broker_mutations"] == 0
+    assert not journal.snapshot()["intents"]
+    assert not broker.audit()
+    projection.close()
+    journal.close()
+    broker.close()
+    floor.close()
+
+
 def test_shadow_guardian_rejects_different_signer_and_expired_timing(tmp_path):
     guardian, projection, source, broker, journal, floor = guardian_and_projection(tmp_path)
     projection.ingest(event(source, 1, 101, 0, kind="BASELINE"), now_ms=101)

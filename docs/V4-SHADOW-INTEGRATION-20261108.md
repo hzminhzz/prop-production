@@ -47,15 +47,18 @@ Implemented: signed V4 source export and persistent transition eligibility,
 Guardian SHADOW risk preview, regression tests, cross-Python producer→consumer
 integration test and compatibility pin update.
 
-**Not implemented as a deployed authenticated runtime:** protected root-owned
-signed prospective portfolio admission, separately reviewed external source
-signer/public-key installation, narrow authenticated quant→root evidence
-transfer, native Hyperliquid-to-Propr market identity normalization, and a
-protected production listener that durably consumes exported packets. The
-existing `prop-production-planner.service` is still the legacy synthetic
-Planner; this module does not replace it. The existing synthetic Guardian
-remains the only installed broker simulation. Do not claim deployed integration
-or live T+300 until these boundaries are separately wired and verified.
+**Implemented but not installed:** the immutable producer packet spool,
+root-mediated private source-copy CLI, authenticated source-only receiver,
+exact 157-market catalog allowlist validation, independent signed follower
+bid/ask validation and Guardian's attested SHADOW review. The owner must still
+provision a separately approved signed prospective portfolio release, root-pinned
+independent source/quote public keys, real native Propr bid/ask and a coherent
+account cutoff. Source-only intake remains `BLOCKED_NOT_WIRED` for Guardian
+financial admission; no protected service currently consumes these packets.
+The existing `prop-production-planner.service` remains synthetic and unchanged.
+See [protected V4 source operations](V4-PROTECTED-SOURCE-OPERATIONS-20261109.md).
+Do not claim deployed Guardian integration or live T+300 without actual
+release and runtime evidence.
 
 The protected Propr native account observations currently report
 `RECONCILIATION_UNCERTAIN`: do not derive cash from equity, pretend REST

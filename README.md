@@ -21,7 +21,8 @@ hold financial mutation authority; this release provides zero-capital interfaces
 
 The additive, externally authenticated source export, per-transition T+300
 eligibility projection and Guardian-owned SHADOW risk preview are documented in
-[the V4 integration runbook](docs/V4-SHADOW-INTEGRATION-20261108.md).
+[the V4 integration runbook](docs/V4-SHADOW-INTEGRATION-20261108.md) and
+[protected source operations](docs/V4-PROTECTED-SOURCE-OPERATIONS-20261109.md).
 They do not replace the installed synthetic Planner or authorize broker orders.
 The protected cross-user transfer and signed prospective release still require
 independent verification before a deployable integrated service exists.
