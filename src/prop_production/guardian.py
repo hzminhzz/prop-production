@@ -15,6 +15,7 @@ from .journal import Journal, State, StorageUnavailable
 from .planner import compile_pods
 from .release import ReleaseFloor, VerifiedRelease
 from .risk import size_book
+from .v4_timing import V4ShadowProjection
 
 TERMINAL = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "NOT_ACCEPTED", "REVOKED"}
 ZERO = Decimal("0")
@@ -140,6 +141,121 @@ class Guardian:
             }
         self.journal.update("DECISION", now_ms, record)
         return DecisionReceipt.from_dict(body)
+
+    def preview_v4(
+        self, projection: V4ShadowProjection, action_id: str, quotes: dict[str, Any], now_ms: int
+    ) -> DecisionReceipt:
+        """Protected SHADOW review of authenticated V4 source eligibility.
+
+        Must run with the Guardian-owned projection, never on Planner-submitted
+        target quantities. The receipt deliberately cannot be reserved or
+        dispatched: only the separately authorized production path may do so.
+        """
+        if (
+            projection.release.release_sha != self.release.release_sha
+            or projection.source_key.public_bytes_raw() != self.source_key.public_bytes_raw()
+            or self.release.payload["source_mode"] != "PROSPECTIVE"
+        ):
+            raise ValueError("V4_PROJECTION_AUTHORITY")
+        action = projection.action(action_id)
+        if action["trading_authorized"] is not False or action["due_ms"] > now_ms:
+            raise ValueError("V4_ACTION_NOT_ELIGIBLE")
+        proposal_id = digest(
+            {
+                "schema": "v4_shadow_proposal_v1",
+                "release_sha": self.release.release_sha,
+                "source_action_id": action_id,
+            }
+        )
+        state = self.journal.snapshot()
+        previous = state["decisions"].get(proposal_id)
+        if previous is not None:
+            return DecisionReceipt.from_dict(previous["receipt"])
+        reasons = self._scope(now_ms)
+        if state["halts"]:
+            reasons.extend(state["halts"])
+        if state["runtime"]["certainty"] != "COHERENT":
+            reasons.append("RECONCILIATION_UNCERTAIN")
+        if (
+            state["runtime"].get("last_snapshot_ms") is None
+            or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000
+        ):
+            reasons.append("BROKER_STALE")
+        if state["reservations"] or any(
+            intent["status"] not in TERMINAL for intent in state["intents"].values()
+        ):
+            reasons.append("PENDING_RESERVATION")
+        try:
+            from .planner import validate_quotes
+
+            validate_quotes(quotes, now_ms)
+            for market, quote in quotes.items():
+                mark = decimal(state.get("last_marks", {})[market])
+                if not decimal(quote["bid"]) <= mark <= decimal(quote["ask"]) or decimal(
+                    quote["ask"]
+                ) / decimal(quote["bid"]) > Decimal("1.01"):
+                    raise ValueError("INDEPENDENT_MARKET_EVIDENCE_MISMATCH")
+        except (KeyError, ValueError, TypeError, ZeroDivisionError):
+            reasons.append("INDEPENDENT_MARKET_EVIDENCE_MISMATCH")
+        pods = []
+        try:
+            pods = projection.eligible_pods(now_ms)
+        except (ValueError, KeyError, TypeError) as exc:
+            reasons.append(str(exc) if isinstance(exc, ValueError) else "V4_SOURCE_UNAVAILABLE")
+        risk: dict[str, Any] = {}
+        if not reasons:
+            pending = [
+                {
+                    "market": intent["market"],
+                    "remaining": str(decimal(intent["quantity"]) - decimal(intent["filled"])),
+                }
+                for intent in state["intents"].values()
+                if intent["status"] not in TERMINAL
+            ]
+            risk = size_book(
+                pods,
+                quotes,
+                self.markets,
+                self.policy,
+                dict(state["finance"], pod_loss_used=state.get("pod_loss_used", {})),
+                state["positions"],
+                state["pod_positions"],
+                pending,
+                now_ms=now_ms,
+            )
+            if risk["status"] != "ACCEPTED":
+                reasons.extend(risk.get("reasons", ["RISK_BLOCKED"]))
+        status = "SHADOW_PREVIEW" if not reasons else "BLOCKED"
+        receipt = {
+            "schema": "guardian_v4_shadow_decision_v1",
+            "proposal_id": proposal_id,
+            "release_sha": self.release.release_sha,
+            "source_action_id": action_id,
+            "status": status,
+            "reasons": sorted(set(reasons)),
+            "risk": risk,
+            "known_at_ms": now_ms,
+            "journal_epoch": state["runtime"]["boot_epoch"],
+            "broker_epoch": state["runtime"]["broker_epoch"],
+            "quote_sha": digest(quotes),
+            "requested_pods": pods,
+            "trading_authorized": False,
+            "broker_mutations": 0,
+        }
+        receipt["decision_id"] = digest(receipt)
+
+        def record(s: State) -> None:
+            s["decisions"][proposal_id] = {
+                "proposal_sha": digest(action),
+                "receipt": receipt,
+                "proposal": None,
+                "quotes": quotes,
+                "decision_sequence": self.journal.sequence + 1,
+                "intent_ids": [],
+            }
+
+        self.journal.update("V4_SHADOW_DECISION", now_ms, record)
+        return DecisionReceipt.from_dict(receipt)
 
     def reserve(self, decision_id: str, now_ms: int) -> list[str]:
         state = self.journal.snapshot()
