@@ -165,7 +165,7 @@ class ReleaseVerifier:
         if not isinstance(members, list) or not members:
             raise ValueError("MISSING_MEMBERS")
         ids: set[str] = set()
-        identities: set[str] = set()
+        identities: dict[str, tuple[str, ...]] = {}
         for m in members:
             fields = {
                 "pod_id",
@@ -185,11 +185,10 @@ class ReleaseVerifier:
                 not m["pod_id"]
                 or m["pod_id"] in ids
                 or not m["source_identity"]
-                or m["source_identity"] in identities
+                or not isinstance(m["source_identity"], str)
             ):
                 raise ValueError("AMBIGUOUS_MEMBER")
             ids.add(m["pod_id"])
-            identities.add(m["source_identity"])
             if (
                 type(m["identity_known_at_ms"]) is not int
                 or not 0 <= m["identity_known_at_ms"] <= p["selection_known_at_ms"]
@@ -202,6 +201,10 @@ class ReleaseVerifier:
                 or not m["allowed_markets"]
             ):
                 raise ValueError("INCOMPLETE_ACCOUNT_SCOPE")
+            source_scope = tuple(sorted(m["account_scope"]))
+            previous_scope = identities.setdefault(m["source_identity"], source_scope)
+            if previous_scope != source_scope:
+                raise ValueError("SHARED_SOURCE_SCOPE_CONFLICT")
             if decimal(m["allocation"]) <= 0:
                 raise ValueError("INVALID_SIZING_POLICY")
             if mode == "FIXED_K_NATIVE_QUANTITY":

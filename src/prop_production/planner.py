@@ -93,7 +93,9 @@ def compile_pods(
     if not isinstance(receipts, list) or not 1 <= len(receipts) <= 201:
         raise ValueError("SOURCE_RECEIPT_CAPACITY")
     payload = release.payload
-    members = {m["source_identity"]: m for m in payload["members"]}
+    members: dict[str, list[dict[str, Any]]] = {}
+    for member in payload["members"]:
+        members.setdefault(member["source_identity"], []).append(member)
     latest: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     seen: dict[tuple[str, int], str] = {}
     for receipt in receipts:
@@ -103,7 +105,8 @@ def compile_pods(
         identity = body["source_identity"]
         if identity not in members:
             raise ValueError("SOURCE_IDENTITY")
-        validate_book(body, members[identity], payload, receipt["local_known_ms"])
+        for member in members[identity]:
+            validate_book(body, member, payload, receipt["local_known_ms"])
         if receipt["local_known_ms"] > decision_ms:
             raise ValueError("FUTURE_RECEIPT")
         key = (identity, body["sequence"])
@@ -115,39 +118,40 @@ def compile_pods(
     if set(latest) != set(members):
         raise ValueError("SOURCE_BOOK_MISSING")
     pods = []
-    for identity, member in members.items():
+    for identity, source_members in members.items():
         body, receipt = latest[identity]
         if decision_ms - body["known_at_ms"] > 600000:
             raise ValueError("SOURCE_STALE")
-        with localcontext() as ctx:
-            ctx.prec = 50
-            if member["sizing_policy"] == "FIXED_K_NATIVE_QUANTITY":
-                requested = {
-                    leg["market"]: str(
-                        decimal(leg["quantity"]) * decimal(leg["mark"]) * decimal(member["k"])
-                    )
-                    for leg in body["positions"]
+        for member in source_members:
+            with localcontext() as ctx:
+                ctx.prec = 50
+                if member["sizing_policy"] == "FIXED_K_NATIVE_QUANTITY":
+                    requested = {
+                        leg["market"]: str(
+                            decimal(leg["quantity"]) * decimal(leg["mark"]) * decimal(member["k"])
+                        )
+                        for leg in body["positions"]
+                    }
+                else:
+                    requested = {
+                        leg["market"]: str(
+                            decimal(leg["quantity"])
+                            * decimal(leg["mark"])
+                            / decimal(body["nav"])
+                            * decimal(member["allocation"])
+                        )
+                        for leg in body["positions"]
+                    }
+            pods.append(
+                {
+                    "pod_id": member["pod_id"],
+                    "requested_notionals": requested,
+                    "source_receipt_sha": digest(receipt),
+                    "source_nav": body["nav"],
+                    "allocation": member["allocation"],
+                    "sizing_policy": member["sizing_policy"],
                 }
-            else:
-                requested = {
-                    leg["market"]: str(
-                        decimal(leg["quantity"])
-                        * decimal(leg["mark"])
-                        / decimal(body["nav"])
-                        * decimal(member["allocation"])
-                    )
-                    for leg in body["positions"]
-                }
-        pods.append(
-            {
-                "pod_id": member["pod_id"],
-                "requested_notionals": requested,
-                "source_receipt_sha": digest(receipt),
-                "source_nav": body["nav"],
-                "allocation": member["allocation"],
-                "sizing_policy": member["sizing_policy"],
-            }
-        )
+            )
     return sorted(pods, key=lambda p: p["pod_id"])
 
 
@@ -196,12 +200,15 @@ class Planner:
     def ingest(self, envelope: dict[str, Any], *, local_known_ms: int) -> None:
         try:
             body = verify(envelope, self.source_key, "source-observer")
-            members = {m["source_identity"]: m for m in self.release.payload["members"]}
-            if body["source_identity"] not in members:
+            members = [
+                m
+                for m in self.release.payload["members"]
+                if m["source_identity"] == body["source_identity"]
+            ]
+            if not members:
                 raise ValueError("SOURCE_IDENTITY")
-            validate_book(
-                body, members[body["source_identity"]], self.release.payload, local_known_ms
-            )
+            for member in members:
+                validate_book(body, member, self.release.payload, local_known_ms)
             latest = self.con.execute(
                 "SELECT seq,sha,known_ms FROM receipts WHERE identity=? ORDER BY seq DESC LIMIT 1",
                 (body["source_identity"],),
