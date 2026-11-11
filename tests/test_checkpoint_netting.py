@@ -86,6 +86,7 @@ def test_zero_net_records_liabilities_without_trade_fill_fee_or_cash_change(tmp_
         assert state["finance"] == before["finance"]
         assert not state["fills"]
         assert state["runtime"]["permit"] is None
+        assert state["runtime"]["flat_confirmed"] is False
         assert not state.get("pod_fees_paid")
         assert not state.get("pod_realized")
         assert not s.broker.audit()

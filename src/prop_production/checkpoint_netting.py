@@ -61,7 +61,7 @@ def claims(
     checkpoint_ms = record["result"]["checkpoint_ms"]
     attempt = record["attempts"][-1]
     result = {}
-    for market in affected_markets(state, attempt["risk"]):
+    for market in affected_markets(state, attempt["execution_plan"]):
         identity = resource(state["account_binding"], market, checkpoint_ms)
         if identity in state.get("checkpoint_market_claims", {}):
             raise ValueError("MARKET_CHECKPOINT_ALREADY_COMMITTED")
@@ -107,7 +107,7 @@ def validate_claims(previous: dict[str, Any], current: dict[str, Any], kind: str
             ]
             if any(
                 affected_markets(
-                    previous, current["checkpoint_decisions"][key]["attempts"][-1]["risk"]
+                    previous, current["checkpoint_decisions"][key]["attempts"][-1]["execution_plan"]
                 )
                 for key in committed
             ):

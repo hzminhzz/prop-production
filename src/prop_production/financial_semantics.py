@@ -58,7 +58,7 @@ def validate_transition(
     validate_mandate_history(previous, current, kind)
     from .checkpoint_admission import validate_history
 
-    validate_history(previous, current, kind)
+    validate_history(previous, current, kind, previous_head=previous_head)
     if current.get("_semantic_contract") != CONTRACT:
         raise ValueError("GUARDIAN_SEMANTIC_CONTRACT_NOT_V2")
     if previous and previous.get("_semantic_contract") != CONTRACT:
@@ -74,6 +74,8 @@ def validate_transition(
             raise ValueError("GUARDIAN_LEGACY_UPGRADE_WITHOUT_FORWARD_CHECKPOINT")
     if previous and current["account_binding"] != previous["account_binding"]:
         raise ValueError("GUARDIAN_SEMANTIC_ACCOUNT_CHANGED")
+    from .guardian_protection import valid_protective_permit
+
     halts = current.get("halts")
     runtime = current.get("runtime")
     if (
@@ -86,7 +88,7 @@ def validate_transition(
         or type(runtime.get("broker_epoch")) is not int
         or runtime["boot_epoch"] < 0
         or runtime["broker_epoch"] < 0
-        or (halts and runtime.get("permit") is not None)
+        or (halts and runtime.get("permit") is not None and not valid_protective_permit(current))
     ):
         raise ValueError("GUARDIAN_SEMANTIC_HALT_OR_PERMIT_INVALID")
     if not (

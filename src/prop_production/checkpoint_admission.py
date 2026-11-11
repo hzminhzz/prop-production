@@ -146,6 +146,8 @@ def _prerequisites(
     cfg: dict[str, Any],
     now_ms: int,
     needed: set[str],
+    *,
+    capability_feature: str = "net_order",
 ) -> tuple[list[str], dict[str, Any]]:
     reasons = []
     evidence: dict[str, Any] = {}
@@ -181,7 +183,7 @@ def _prerequisites(
         for market in needed:
             if market not in capabilities or not execution_capability(
                 capabilities[market],
-                "net_order",
+                capability_feature,
                 account=state["account_binding"],
                 endpoint=snapshot.endpoint,
                 instrument=market,
@@ -211,6 +213,11 @@ def _prerequisites(
             "cutoff": snapshot.cutoff,
             "market_marks": [[m, str(p), t] for m, p, t in snapshot.market_marks],
             "execution_capabilities": capabilities,
+            "position_basis": {
+                p.market: {"quantity": str(p.quantity), "entry_price": str(p.entry_price)}
+                for p in snapshot.positions
+                if p.quantity
+            },
         }
     except (ValueError, KeyError, TimeoutError, ConnectionError, OSError) as exc:
         reasons.append(str(exc))
@@ -311,6 +318,7 @@ def review(
         "deadline_ms": deadline,
         "intent_ids": [],
         "risk": None,
+        "execution_plan": None,
         "reasons": [],
         "source_dispositions": dispositions,
         "source_signal_ids": sorted({opportunities[k]["state"]["signal_id"] for k in selected}),
@@ -363,6 +371,7 @@ def review(
         for owner, book in state["pod_positions"].items()
         if owner not in active_owners
     }
+    account_proof: dict[str, Any] = {}
     if not terminal_reasons:
         try:
             mapping = {
@@ -442,13 +451,23 @@ def review(
                 if risk["status"] != "ACCEPTED":
                     terminal_reasons.extend(risk["reasons"])
                 else:
+                    from .checkpoint_execution import project
                     from .checkpoint_netting import conflicts
 
-                    if conflicts(state, risk, checkpoint_ms):
+                    result["execution_plan"] = project(
+                        state,
+                        risk,
+                        account_proof,
+                        guardian.markets,
+                        quotes,
+                        frozen,
+                        now_ms=now_ms,
+                        synthetic=guardian.gateway.synthetic,
+                    )
+                    if conflicts(state, result["execution_plan"], checkpoint_ms):
                         terminal_reasons.append("MARKET_CHECKPOINT_ALREADY_COMMITTED")
         except (ValueError, KeyError) as exc:
             terminal_reasons.append(str(exc))
-            account_proof = {}
     else:
         account_proof = {}
     if terminal_reasons:
@@ -483,6 +502,7 @@ def review(
         "pods": pods,
         "frozen_pods": frozen,
         "risk": result["risk"],
+        "execution_plan": result["execution_plan"],
         "result": result,
         "journal_sequence": guardian.journal.sequence + 1,
     }
@@ -550,7 +570,8 @@ def reserve(
     ):
         raise ValueError("CHECKPOINT_RESERVATION_SOURCE_OR_MANDATE")
     risk = attempt["risk"]
-    reasons, _ = _prerequisites(
+    plan = attempt["execution_plan"]
+    reasons, fresh_proof = _prerequisites(
         guardian,
         state,
         attempt["quotes"],
@@ -560,17 +581,29 @@ def reserve(
     )
     if reasons:
         raise ValueError("CHECKPOINT_RESERVATION_PREREQUISITES:" + ",".join(reasons))
+    from .checkpoint_execution import project
+
+    fresh_plan = project(
+        state,
+        risk,
+        fresh_proof,
+        guardian.markets,
+        attempt["quotes"],
+        attempt["frozen_pods"],
+        now_ms=now_ms,
+        synthetic=guardian.gateway.synthetic,
+    )
+    if fresh_plan != plan:
+        raise ValueError("CHECKPOINT_EXECUTION_PROOF_CHANGED")
     intents = []
-    for market in sorted(set(risk["targets"]) | set(state["positions"])):
+    for market in sorted(set(plan["targets"]) | set(state["positions"])):
         old, target = (
             decimal(state["positions"].get(market, "0")),
-            decimal(risk["targets"].get(market, "0")),
+            decimal(plan["targets"].get(market, "0")),
         )
         quantity = target - old
         if not quantity:
             continue
-        if old * target < 0:
-            raise ValueError("CHECKPOINT_REVERSAL_CAPABILITY_REQUIRED")
         quote = attempt["quotes"][market]
         slip = decimal(guardian.policy["shortfall_bps"]) / 10000
         price = (
@@ -595,7 +628,7 @@ def reserve(
                 decimal(book.get(market, "0"))
                 - decimal(state["pod_positions"].get(owner, {}).get(market, "0"))
             )
-            for owner, book in risk["pod_targets"].items()
+            for owner, book in plan["pod_targets"].items()
         }
         intents.append(
             {
@@ -635,12 +668,14 @@ def reserve(
         opportunity = state["checkpoint_opportunities"][identity]
         _move(
             opportunity,
-            Event.COMMIT,
+            Event.MISS if plan["opening_status"] == "MISSED" else Event.COMMIT,
             now_ms=now_ms,
             evidence_sha=digest(attempt),
-            guard="RESERVE_BEFORE_SEND",
+            guard="OPPOSITE_OPENING_MISSED_REDUCE_ONLY"
+            if plan["opening_status"] == "MISSED"
+            else "RESERVE_BEFORE_SEND",
         )
-        opportunity["commitment"] = decision_id
+        opportunity["commitment"] = None if plan["opening_status"] == "MISSED" else decision_id
     if ids:
         state["reservations"][decision_id] = {
             "loss": risk["worst_loss"],
@@ -651,9 +686,21 @@ def reserve(
     for intent in intents:
         state["intents"][intent["intent_id"]] = intent
     record["intent_ids"] = ids
-    record["result"] = dict(record["result"], status="COMMITTED_ONCE", intent_ids=ids)
+    record["result"] = dict(
+        record["result"],
+        status="COMMITTED_ONCE",
+        intent_ids=ids,
+        opening_status=plan["opening_status"],
+    )
     state["runtime"].update(
         state="SHADOW_READY" if ids else "DISARMED",
+        flat_confirmed=(
+            not ids
+            and state["runtime"].get("flat_confirmed", False)
+            and not any(
+                decimal(q) for book in state["pod_positions"].values() for q in book.values()
+            )
+        ),
         permit=(
             {
                 "decision_id": decision_id,
@@ -673,7 +720,16 @@ def reserve(
     return ids
 
 
-def validate_history(previous: dict[str, Any], current: dict[str, Any], kind: str) -> None:
+def validate_history(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    kind: str,
+    *,
+    previous_head: str | None = None,
+) -> None:
+    from .guardian_protection import validate_protection
+
+    validate_protection(previous, current, kind, previous_head)
     from .checkpoint_accounting import validate_attribution
     from .checkpoint_netting import validate_claims
 
@@ -806,6 +862,7 @@ def validate_history(previous: dict[str, Any], current: dict[str, Any], kind: st
         "boot_epoch",
         "broker_epoch",
         "account_max_age_ms",
+        "protection_id",
     )
     for identity, intent in current.get("intents", {}).items():
         if intent.get("checkpoint_policy") != POLICY:
@@ -813,6 +870,8 @@ def validate_history(previous: dict[str, Any], current: dict[str, Any], kind: st
         prior = previous.get("intents", {}).get(identity)
         if prior and any(prior.get(k) != intent.get(k) for k in immutable):
             raise ValueError("CHECKPOINT_INTENT_IMMUTABLE")
+        if intent.get("protection_id") is not None:
+            continue
         if prior is None and kind != "CHECKPOINT_RESERVE":
             raise ValueError("CHECKPOINT_INTENT_WITHOUT_COMMIT")
         if prior is None:
@@ -885,6 +944,30 @@ def _verify_attempt(
     )
     if computed != attempt["risk"]:
         raise ValueError("CHECKPOINT_RISK_REPLAY")
+    if computed["status"] == "ACCEPTED":
+        from .checkpoint_execution import project
+
+        try:
+            expected_plan = project(
+                previous,
+                computed,
+                attempt["account_proof"],
+                markets,
+                attempt["quotes"],
+                frozen,
+                now_ms=attempt["at_ms"],
+                synthetic=policy["source_mode"] == "SYNTHETIC",
+            )
+        except ValueError as exc:
+            if (
+                attempt["execution_plan"] is not None
+                or attempt["result"]["status"] != "MISSED"
+                or str(exc) not in attempt["result"]["reasons"]
+            ):
+                raise ValueError("CHECKPOINT_EXECUTION_REJECTION_REPLAY") from exc
+        else:
+            if expected_plan != attempt["execution_plan"]:
+                raise ValueError("CHECKPOINT_EXECUTION_PROJECTION_REPLAY")
 
 
 def _verify_intent(
@@ -893,13 +976,14 @@ def _verify_intent(
     record = current["checkpoint_decisions"][intent["decision_id"]]
     attempt = record["attempts"][-1]
     risk, market = attempt["risk"], intent["market"]
+    plan = attempt["execution_plan"]
     old = decimal(previous["positions"].get(market, "0"))
-    target = decimal(risk["targets"].get(market, "0"))
+    target = decimal(plan["targets"].get(market, "0"))
     expected = target - old
     changes = {
         owner: decimal(book.get(market, "0"))
         - decimal(previous["pod_positions"].get(owner, {}).get(market, "0"))
-        for owner, book in risk["pod_targets"].items()
+        for owner, book in plan["pod_targets"].items()
     }
     quote = attempt["quotes"][market]
     slip = decimal(attempt["policy"]["shortfall_bps"]) / 10000
@@ -918,6 +1002,11 @@ def _verify_intent(
             "quantity": str(expected),
         }
     )
+    if plan["opening_status"] == "MISSED" and any(
+        current["checkpoint_opportunities"][key]["state"]["phase"] != "MISSED"
+        for key in record["opportunity_ids"]
+    ):
+        raise ValueError("CHECKPOINT_REDUCE_ONLY_OPENING_DISPOSITION")
     if (
         intent["intent_id"] != expected_id
         or decimal(intent["quantity"]) != expected

@@ -83,7 +83,11 @@ def _anchor(state: dict[str, Any]) -> str:
 
 
 def apply_fill(
-    state: dict[str, Any], fill: dict[str, Any], *, previous_filled: Decimal
+    state: dict[str, Any],
+    fill: dict[str, Any],
+    *,
+    previous_filled: Decimal,
+    before_quantity: Decimal,
 ) -> dict[str, Any]:
     intent = state["intents"][fill["intent_id"]]
     changes = {p: decimal(q) for p, q in intent["pod_changes"].items()}
@@ -94,6 +98,23 @@ def apply_fill(
     before = split(previous_filled, changes)
     after = split(total, changes) if total != decimal(intent["quantity"]) else changes
     fees = split(fee, {p: abs(q) for p, q in changes.items()})
+    from .checkpoint_basis import advance_basis
+
+    basis = advance_basis(state, fill, before_quantity=before_quantity)
+    realized = decimal(basis.realized)
+    closing_weights = {
+        owner: min(
+            abs(decimal(state["pod_positions"].get(owner, {}).get(fill["market"], "0"))),
+            abs(add(after[owner], -before[owner])),
+        )
+        for owner in changes
+        if decimal(state["pod_positions"].get(owner, {}).get(fill["market"], "0"))
+        * add(after[owner], -before[owner])
+        < 0
+    }
+    if realized and not any(closing_weights.values()):
+        raise ValueError("CHECKPOINT_REALIZED_OWNER_UNPROVEN")
+    realized_shares = split(realized, closing_weights) if realized else {}
     predecessor, effects = _anchor(state), {}
     for owner in sorted(changes):
         allocated = add(after[owner], -before[owner])
@@ -106,8 +127,8 @@ def apply_fill(
             "quantity": str(allocated),
             "notional": str(notional),
             "fee": str(fees[owner]),
-            "realized": "0",
-            "cash_delta": str(-fees[owner]),
+            "realized": str(realized_shares.get(owner, ZERO)),
+            "cash_delta": str(add(realized_shares.get(owner, ZERO), -fees[owner])),
         }
     transition = AttributionTransition(
         predecessor,
@@ -119,7 +140,16 @@ def apply_fill(
         _anchor(state),
         effects,
     )
-    state.setdefault("checkpoint_allocations", {})[fill["execution_id"]] = transition.data
+    for owner, amount in realized_shares.items():
+        earned = state.setdefault("pod_realized", {})
+        earned[owner] = str(add(decimal(earned.get(owner, "0")), amount))
+    state.setdefault("checkpoint_basis", {})[fill["market"]] = {
+        "quantity": basis.successor.quantity,
+        "entry_price": basis.successor.entry_price,
+    }
+    state.setdefault("checkpoint_allocations", {})[fill["execution_id"]] = transition.data | {
+        "basis": basis.data
+    }
     return effects
 
 
@@ -127,7 +157,7 @@ def apply_internal(
     state: dict[str, Any], record: dict[str, Any], decision_id: str, now_ms: int
 ) -> None:
     attempt = record["attempts"][-1]
-    risk = attempt["risk"]
+    risk = attempt["execution_plan"]
     for market in sorted(risk["targets"]):
         if decimal(risk["targets"][market]) != decimal(state["positions"].get(market, "0")):
             continue
@@ -210,7 +240,15 @@ def validate_attribution(previous: dict[str, Any], current: dict[str, Any], kind
             intent = work["intents"][fill["intent_id"]]
             if intent.get("checkpoint_policy") != POLICY:
                 raise ValueError("CHECKPOINT_ALLOCATION_POLICY")
-            effects = apply_fill(work, fill, previous_filled=decimal(intent["filled"]))
+            effects = apply_fill(
+                work,
+                fill,
+                previous_filled=decimal(intent["filled"]),
+                before_quantity=decimal(work["positions"].get(fill["market"], "0")),
+            )
+            work["positions"][fill["market"]] = str(
+                add(decimal(work["positions"].get(fill["market"], "0")), decimal(fill["quantity"]))
+            )
             intent["filled"] = str(add(decimal(intent["filled"]), decimal(fill["quantity"])))
             if (
                 work["checkpoint_allocations"][execution_id]
@@ -224,12 +262,17 @@ def validate_attribution(previous: dict[str, Any], current: dict[str, Any], kind
                     Fraction(decimal(fill["quantity"])) * Fraction(decimal(fill["price"])),
                 ),
                 ("fee", Fraction(decimal(fill["fee"]))),
-                ("cash_delta", -Fraction(decimal(fill["fee"]))),
+                (
+                    "cash_delta",
+                    Fraction(work["checkpoint_allocations"][execution_id]["basis"]["realized"])
+                    - Fraction(decimal(fill["fee"])),
+                ),
             ):
                 if sum((Fraction(row[field]) for row in effects.values()), Fraction(0)) != expected:
                     raise ValueError("CHECKPOINT_FILL_CONSERVATION")
     if (internal or allocations) and any(
-        work.get(key, {}) != current.get(key, {}) for key in ("pod_positions", "pod_fees_paid")
+        work.get(key, {}) != current.get(key, {})
+        for key in ("pod_positions", "pod_fees_paid", "pod_realized", "checkpoint_basis")
     ):
         raise ValueError("CHECKPOINT_POD_LEDGER_CONSERVATION")
     for execution_id, fill in current.get("fills", {}).items():

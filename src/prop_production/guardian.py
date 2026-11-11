@@ -146,6 +146,13 @@ class Guardian:
 
         return reserve(self, decision_id, receiver=receiver, now_ms=now_ms)
 
+    def protective_reduce(
+        self, envelope: dict[str, Any], *, quotes: dict[str, Any], now_ms: int
+    ) -> str:
+        from .guardian_protection import protect
+
+        return protect(self, envelope, quotes=quotes, now_ms=now_ms)
+
     def recover_authenticated(self, signed_request: dict[str, Any], now_ms: int) -> int:
         """Trusted protected signer + independently fetched coherent broker state."""
         if self.recovery_key is None:
@@ -607,7 +614,15 @@ class Guardian:
         if (
             self._scope(now_ms)
             or intent["release_sha"] != self.release.release_sha
-            or state["halts"]
+            or (
+                state["halts"]
+                and not (
+                    intent.get("protection_id")
+                    and intent["reduce_only"] is True
+                    and isinstance(permit, dict)
+                    and permit.get("reduce_only") is True
+                )
+            )
             or intent["status"] != "QUEUED"
             or not permit
             or self.gateway.synthetic is not True
@@ -717,6 +732,7 @@ class Guardian:
                 errors.append("BROKER_MARK_CONFLICT")
             marks[position.market] = position.mark_price
         new_fees = ZERO
+        new_realized = ZERO
         # Charge every adverse move; gains never refill a pod budget during the day.
         for pod, book in state["pod_positions"].items():
             adverse = sum(
@@ -774,7 +790,11 @@ class Guardian:
             ):
                 errors.append("POD_FILL_ALLOCATION_INVALID")
                 continue
-            if decimal(state["positions"].get(fill.market, "0")) * fill.quantity < 0:
+            before_quantity = decimal(state["positions"].get(fill.market, "0"))
+            if (
+                before_quantity * fill.quantity < 0
+                and intent.get("checkpoint_policy") != "CWSA_CHECKPOINT_V3"
+            ):
                 # Realized PnL needs independently confirmed pod entry basis.
                 errors.append("POD_REALIZED_ATTRIBUTION_UNVERIFIED")
             new_fees += fill.fee
@@ -786,7 +806,12 @@ class Guardian:
             if intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3":
                 from .checkpoint_accounting import add, apply_fill
 
-                effects = apply_fill(state, body, previous_filled=previous_filled)
+                effects = apply_fill(
+                    state, body, previous_filled=previous_filled, before_quantity=before_quantity
+                )
+                new_realized = add(
+                    new_realized, *(decimal(e["realized"]) for e in effects.values())
+                )
                 for pod, effect in effects.items():
                     allocated = decimal(effect["quantity"])
                     execution_loss = max(
@@ -874,12 +899,17 @@ class Guardian:
         expected = {m: decimal(q) for m, q in state["positions"].items() if decimal(q)}
         if observed != expected or len(observed) != len(snapshot.positions):
             errors.append("ORPHAN_POSITION")
+        for market, basis in state.get("checkpoint_basis", {}).items():
+            native = next((p for p in snapshot.positions if p.market == market), None)
+            if decimal(basis["quantity"]) != (native.quantity if native else ZERO) or decimal(
+                basis["entry_price"]
+            ) != (native.entry_price if native else ZERO):
+                errors.append("BROKER_ENTRY_BASIS_MISMATCH")
         old_cash = state["finance"].get("cash")
         if old_cash is not None and snapshot.cash is not None:
-            # New fills explain fees only when there is no realized close. Other
-            # debits/credits (funding, corrections, transfers) require explicit
-            # typed provider evidence before assigning any pod economic effect.
-            if snapshot.cash - decimal(old_cash) != -new_fees and (
+            # Only actual fills with retained, independently checked entry basis
+            # explain checkpoint realized cash. Other flows remain unqualified.
+            if snapshot.cash - decimal(old_cash) != new_realized - new_fees and (
                 "POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors
             ):
                 errors.append("BROKER_CASH_ATTRIBUTION_UNKNOWN")
@@ -909,6 +939,12 @@ class Guardian:
             )
         flat = (
             not observed
+            and (
+                self.release.payload["schema"] != "portfolio_release_v2"
+                or not any(
+                    decimal(q) for book in state["pod_positions"].values() for q in book.values()
+                )
+            )
             and not state["reservations"]
             and not errors
             and all(i["status"] in TERMINAL for i in state["intents"].values())
