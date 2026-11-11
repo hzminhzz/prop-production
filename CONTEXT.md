@@ -27,3 +27,11 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Signed stream-head anchor**: A trusted per-stream proof of selected scope, epoch, cursor, original chain head and prospective cutoff from which successor continuity is checked; not an attestation of all earlier history.
 - **Scoped packet quarantine**: Isolation of a specific invalid source stream inside an otherwise authentic envelope while independently valid streams preserve their accepted progress.
 - **Expired new-risk opportunity**: An entry opportunity whose original due instant and authorized grace have passed without verified attempt; no restart or replay makes it fresh.
+- **Mark freshness policy**: A versioned rule for which leader price evidence is admissible at a decision cutoff; source-position validity does not imply its old price remains fresh.
+- **Canonical broker order observation**: Provider-specific order and execution evidence normalized with original status, quantity, cutoff and provenance retained for independent financial reconciliation.
+- **Forward semantic checkpoint**: An independently evidenced new financial verification boundary that leaves historical records, unknown effects and durable latches intact.
+- **Recovery request authority**: A protected, revocable role authorized to request incident-specific HALT clearance, not to attest remediation by signature alone.
+- **Versioned source cutover**: A protected switch to a new source-proof contract on an anchored prospective epoch, without reinterpreting or downgrading the older live stream.
+- **Resolved-with-quarantine packet**: An authentic packet whose invalid attributable event has an audited quarantine disposition and restored prospective baseline, but was never accepted as original continuous history.
+- **Causal consumer effect receipt**: A durable action/disposition attributable to the original source event and destination decision context, independent of other databases' transaction outcomes.
+- **Economic correction revision**: A separately identified change to future sizing/valuation semantics that preserves old frozen releases and does not itself authorize changed financial risk.
