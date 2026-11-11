@@ -13,6 +13,7 @@ from .checkpoint_opportunity import OpportunityState, advance
 from .checkpoint_source import integer, verify_transition
 from .copy_mandates import CopyMandate
 from .evidence import decimal, digest, load_json, verify
+from .gateway import execution_capability
 from .guardian_checkpoints import _authority, _source
 from .planner import validate_quotes
 from .risk import size_book
@@ -55,6 +56,10 @@ def account_anchor(state: dict[str, Any]) -> str:
                 "reservations",
                 "halts",
             )
+        }
+        | {
+            k: state.get(k, {})
+            for k in ("pod_loss_used", "pod_fees_paid", "pod_realized", "checkpoint_basis")
         }
         | {
             "runtime": {
@@ -170,6 +175,20 @@ def _prerequisites(
             or str(snapshot.equity) != state["finance"]["equity"]
         ):
             raise ValueError("INDEPENDENT_FINANCE_RECONCILIATION")
+        capabilities = {raw["instrument"]: raw for raw in snapshot.execution_capabilities}
+        if len(capabilities) != len(snapshot.execution_capabilities):
+            raise ValueError("EXECUTION_CAPABILITY_AMBIGUOUS")
+        for market in needed:
+            if market not in capabilities or not execution_capability(
+                capabilities[market],
+                "net_order",
+                account=state["account_binding"],
+                endpoint=snapshot.endpoint,
+                instrument=market,
+                now_ms=now_ms,
+                synthetic=guardian.gateway.synthetic,
+            ):
+                raise ValueError("EXECUTION_CAPABILITY_UNQUALIFIED")
         marks = {m: (price, known) for m, price, known in snapshot.market_marks}
         for market in needed:
             price, known = marks[market]
@@ -191,6 +210,7 @@ def _prerequisites(
             "positions": observed,
             "cutoff": snapshot.cutoff,
             "market_marks": [[m, str(p), t] for m, p, t in snapshot.market_marks],
+            "execution_capabilities": capabilities,
         }
     except (ValueError, KeyError, TimeoutError, ConnectionError, OSError) as exc:
         reasons.append(str(exc))
@@ -238,6 +258,9 @@ def review(
         if outcome["kind"] != "CHANGED":
             dispositions[owner] = outcome["kind"]
             continue
+        if entry["state"]["phase"] != "ACTIVE":
+            dispositions[owner] = "MANDATE_" + entry["state"]["phase"]
+            continue
         identity = digest(["checkpoint_opportunity_v3", owner, outcome["signal_id"]])
         deadline = min(row["deadline_ms"], m.data["effective_until_ms"])
         proof = receiver.checkpoint.packet_for(outcome_id)
@@ -264,6 +287,10 @@ def review(
             "order_route": "NONE",
             "trading_authorized": False,
         }
+    boundaries = {row["outcome"]["checkpoint_ms"] for _, row, _ in selected.values()}
+    if len(boundaries) != 1:
+        raise ValueError("INCOMPATIBLE_CHECKPOINT_BATCH")
+    checkpoint_ms = next(iter(boundaries))
     decision_id = digest(
         [
             "checkpoint_batch_v3",
@@ -279,6 +306,7 @@ def review(
     deadline = min(opportunities[key]["state"]["deadline_ms"] for key in selected)
     result: dict[str, Any] = {
         "decision_id": decision_id,
+        "checkpoint_ms": checkpoint_ms,
         "status": "REVIEWABLE",
         "deadline_ms": deadline,
         "intent_ids": [],
@@ -413,6 +441,11 @@ def review(
                 result["risk"] = risk
                 if risk["status"] != "ACCEPTED":
                     terminal_reasons.extend(risk["reasons"])
+                else:
+                    from .checkpoint_netting import conflicts
+
+                    if conflicts(state, risk, checkpoint_ms):
+                        terminal_reasons.append("MARKET_CHECKPOINT_ALREADY_COMMITTED")
         except (ValueError, KeyError) as exc:
             terminal_reasons.append(str(exc))
             account_proof = {}
@@ -591,8 +624,13 @@ def reserve(
             }
         )
     ids = [intent["intent_id"] for intent in intents]
-    if not ids and risk["pod_targets"] != state["pod_positions"]:
-        raise ValueError("CHECKPOINT_INTERNAL_NETTING_REQUIRES_VERIFIED_ALLOCATION")
+    from .checkpoint_accounting import apply_internal
+    from .checkpoint_netting import claims
+
+    state.setdefault("checkpoint_market_claims", {}).update(
+        claims(state, record, decision_id, now_ms)
+    )
+    apply_internal(state, record, decision_id, now_ms)
     for identity in record["opportunity_ids"]:
         opportunity = state["checkpoint_opportunities"][identity]
         _move(
@@ -615,13 +653,17 @@ def reserve(
     record["intent_ids"] = ids
     record["result"] = dict(record["result"], status="COMMITTED_ONCE", intent_ids=ids)
     state["runtime"].update(
-        state="SHADOW_READY",
-        permit={
-            "decision_id": decision_id,
-            "boot_epoch": state["runtime"]["boot_epoch"],
-            "broker_epoch": state["runtime"]["broker_epoch"],
-            "expires_at_ms": record["result"]["deadline_ms"],
-        },
+        state="SHADOW_READY" if ids else "DISARMED",
+        permit=(
+            {
+                "decision_id": decision_id,
+                "boot_epoch": state["runtime"]["boot_epoch"],
+                "broker_epoch": state["runtime"]["broker_epoch"],
+                "expires_at_ms": record["result"]["deadline_ms"],
+            }
+            if ids
+            else None
+        ),
     )
     guardian._boundary("before_checkpoint_reservation")
     guardian.journal.commit(
@@ -632,6 +674,11 @@ def reserve(
 
 
 def validate_history(previous: dict[str, Any], current: dict[str, Any], kind: str) -> None:
+    from .checkpoint_accounting import validate_attribution
+    from .checkpoint_netting import validate_claims
+
+    validate_attribution(previous, current, kind)
+    validate_claims(previous, current, kind)
     old = previous.get("checkpoint_opportunities", {})
     rows = current.get("checkpoint_opportunities", {})
     if not set(old).issubset(rows):
@@ -699,6 +746,17 @@ def validate_history(previous: dict[str, Any], current: dict[str, Any], kind: st
                 sorted(record["opportunity_ids"]),
             ]
         )
+        if {
+            source_proof(
+                rows[k]["proof"],
+                rows[k]["source_public"],
+                rows[k]["outcome_id"],
+                rows[k]["scope"],
+                rows[k]["policy"],
+            )[0]["checkpoint_ms"]
+            for k in record["opportunity_ids"]
+        } != {record["result"]["checkpoint_ms"]}:
+            raise ValueError("CHECKPOINT_BATCH_CLOCK_BINDING")
         if identity != expected_id or record["result"]["deadline_ms"] != min(
             rows[k]["state"]["deadline_ms"] for k in record["opportunity_ids"]
         ):

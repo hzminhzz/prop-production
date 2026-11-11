@@ -75,6 +75,7 @@ class BrokerSnapshot:
     uncertainty_reasons: tuple[str, ...] = ()
     native_inventory_read_complete: bool = False
     native_inventory_count: tuple[int, int, int] | None = None
+    execution_capabilities: tuple[dict[str, Any], ...] = ()
 
     def ready(self, now_ms: int, max_age_ms: int) -> bool:
         amounts = (
@@ -249,6 +250,30 @@ def normalize_broker_status(
     )
 
 
+def execution_capability(
+    raw: dict[str, Any],
+    feature: str,
+    *,
+    account: str,
+    endpoint: str,
+    instrument: str,
+    now_ms: int,
+    synthetic: bool,
+) -> bool:
+    """Validate the pinned connector evidence contract without granting a permit."""
+    contract = importlib.import_module("connectors.execution_capabilities").ExecutionCapabilities
+    return bool(
+        contract.parse(raw).permits(
+            feature,
+            account=account,
+            endpoint=endpoint,
+            instrument=instrument,
+            now_ms=now_ms,
+            synthetic=synthetic,
+        )
+    )
+
+
 class BrokerGateway(Protocol):
     synthetic: bool
 
@@ -349,6 +374,7 @@ def snapshot_from_wire(raw: dict[str, Any]) -> BrokerSnapshot:
         tuple(raw["native_inventory_count"])
         if raw.get("native_inventory_count") is not None
         else None,
+        tuple(raw.get("execution_capabilities", ())),
     )
 
 

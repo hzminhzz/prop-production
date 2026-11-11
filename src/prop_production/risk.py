@@ -174,6 +174,7 @@ def size_book(
             set(positions)
             | {o["market"] for o in pending}
             | {m for p in pods for m in p["requested_notionals"]}
+            | {m for book in pod_positions.values() for m in book}
         )
         _validate(markets, policy, needed, now_ms)
         if not needed.issubset(quotes):
@@ -218,6 +219,12 @@ def _size(
 ) -> dict[str, Any]:
     prices = {m: (decimal(q["bid"]) + decimal(q["ask"])) / 2 for m, q in quotes.items()}
     current = {m: decimal(q) for m, q in positions.items()}
+    checkpoint = quantity_price_policy == "EXECUTABLE_SIDE_V3"
+    gross_limit = (
+        decimal(policy["checkpoint_execution"]["max_gross_notional"]) if checkpoint else None
+    )
+    if gross_limit is not None and gross_limit <= 0:
+        raise ValueError("GROSS_EXPOSURE_POLICY")
     headroom = decimal(finance["headroom"]) - decimal(policy["minimum_headroom"])
     made_remaining = decimal(policy["made_limit"]) - decimal(finance["realized_made"])
     limit = min(headroom, made_remaining)
@@ -273,12 +280,38 @@ def _size(
         if not valid:
             continue
         bounds = _bounds(current, target, pending)
+        pod_bounds = {
+            pod["pod_id"]: _bounds(
+                {m: decimal(q) for m, q in pod_positions.get(pod["pod_id"], {}).items()},
+                pod_targets[pod["pod_id"]],
+                [],
+            )
+            for pod in pods
+        }
+        gross_by_market = {
+            m: sum(
+                (
+                    max(abs(b.get(m, (ZERO, ZERO))[0]), abs(b.get(m, (ZERO, ZERO))[1]))
+                    for b in pod_bounds.values()
+                ),
+                ZERO,
+            )
+            for m in bounds
+        }
+        for order in pending:
+            gross_by_market[order["market"]] = gross_by_market.get(order["market"], ZERO) + abs(
+                decimal(order["remaining"])
+            )
+        gross_notional = sum((q * prices[m] for m, q in gross_by_market.items()), ZERO)
+        if gross_limit is not None and gross_notional > gross_limit:
+            reasons.add("GROSS_EXPOSURE_CAP")
+            continue
         cost = ZERO
         costs_by_market: dict[str, Decimal] = {}
         margin = ZERO
         for m, (lo, hi) in bounds.items():
             spec = markets[m]
-            max_qty = max(abs(lo), abs(hi))
+            max_qty = gross_by_market[m] if checkpoint else max(abs(lo), abs(hi))
             max_shock = max(abs(decimal(s[m])) for s in policy["scenarios"])
             stressed_notional = max_qty * prices[m] * (ONE + max_shock)
             tier = next((t for t in spec["tiers"] if stressed_notional <= decimal(t["cap"])), None)
@@ -292,7 +325,20 @@ def _size(
                 break
             # Reserve close-out, funding and liquidation costs for the entire possible exposure.
             spread = (decimal(quotes[m]["ask"]) - decimal(quotes[m]["bid"])) / prices[m]
-            delta = abs(target.get(m, ZERO) - current.get(m, ZERO))
+            delta = (
+                sum(
+                    (
+                        abs(
+                            pod_targets[p["pod_id"]].get(m, ZERO)
+                            - decimal(pod_positions.get(p["pod_id"], {}).get(m, "0"))
+                        )
+                        for p in pods
+                    ),
+                    ZERO,
+                )
+                if checkpoint
+                else abs(target.get(m, ZERO) - current.get(m, ZERO))
+            )
             opening_cost = (
                 delta
                 * prices[m]
@@ -313,7 +359,11 @@ def _size(
             )
         if not valid:
             continue
-        loss = _loss(bounds, prices, policy["scenarios"]) + cost
+        loss = (
+            sum((_loss(b, prices, policy["scenarios"]) for b in pod_bounds.values()), ZERO)
+            if checkpoint
+            else _loss(bounds, prices, policy["scenarios"])
+        ) + cost
         pod_losses = {}
         for pod in pods:
             name = pod["pod_id"]
@@ -343,6 +393,7 @@ def _size(
                 "status": "ACCEPTED",
                 "reasons": [],
                 "scale": str(scale),
+                **({"gross_notional": str(gross_notional)} if checkpoint else {}),
                 "targets": {m: str(q) for m, q in sorted(target.items())},
                 "pod_targets": {
                     p: {m: str(q) for m, q in b.items()} for p, b in pod_targets.items()

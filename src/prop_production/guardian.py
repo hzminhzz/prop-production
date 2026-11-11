@@ -751,7 +751,8 @@ class Guardian:
             if intent is None:
                 errors.append("ORPHAN_FILL")
                 continue
-            total = decimal(intent["filled"]) + fill.quantity
+            previous_filled = decimal(intent["filled"])
+            total = previous_filled + fill.quantity
             if (
                 fill.market != intent["market"]
                 or fill.quantity * decimal(intent["quantity"]) <= 0
@@ -782,6 +783,19 @@ class Guardian:
             state["positions"][fill.market] = str(
                 decimal(state["positions"].get(fill.market, "0")) + fill.quantity
             )
+            if intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3":
+                from .checkpoint_accounting import add, apply_fill
+
+                effects = apply_fill(state, body, previous_filled=previous_filled)
+                for pod, effect in effects.items():
+                    allocated = decimal(effect["quantity"])
+                    execution_loss = max(
+                        ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price)
+                    )
+                    used[pod] = str(
+                        add(decimal(used.get(pod, "0")), decimal(effect["fee"]), execution_loss)
+                    )
+                continue
             for pod, change in changes.items():
                 book = state["pod_positions"].setdefault(pod, {})
                 allocated = change * fill.quantity / decimal(intent["quantity"])
@@ -845,6 +859,11 @@ class Guardian:
                     # A restart revokes an unsent intent; no catch-up.
                     if intent["boot_epoch"] != state["runtime"]["boot_epoch"]:
                         intent["status"] = "REVOKED"
+                    elif (
+                        intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3"
+                        and now_ms >= intent["expires_at_ms"]
+                    ):
+                        intent["status"] = "EXPIRED"
                 elif snapshot.observed_at_ms >= intent.get("sent_at_ms", intent["created_at_ms"]):
                     # Only a complete genesis-to-cutoff history proves absence.
                     if decimal(intent["filled"]) == 0:

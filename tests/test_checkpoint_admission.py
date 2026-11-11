@@ -127,7 +127,8 @@ def test_readonly_gateway_cannot_reserve_even_synthetic_source_authority(system)
         lambda: system.broker.observe(now), "fixture-account", "fake://broker"
     )
     decision = review(system, m, outcome, now)
-    assert decision["status"] == "REVIEWABLE"
+    assert decision["status"] == "PRE_DISPATCH_BLOCKED"
+    assert "EXECUTION_CAPABILITY_UNQUALIFIED" in decision["reasons"]
     with pytest.raises(PermissionError, match="REMOTE_MUTATION"):
         system.guardian.reserve_checkpoint(
             decision["decision_id"], receiver=system.receiver, now_ms=now

@@ -1,4 +1,5 @@
 """Persistent hidden broker truth. No real endpoint, credential or socket exists here."""
+
 from __future__ import annotations
 
 import json
@@ -22,10 +23,21 @@ class FakeBroker:
         self.con.execute("PRAGMA synchronous=FULL")
         self.con.execute("CREATE TABLE IF NOT EXISTS truth (id INTEGER PRIMARY KEY, payload TEXT)")
         row = self.con.execute("SELECT payload FROM truth WHERE id=1").fetchone()
-        self.__truth: dict[str, Any] = json.loads(row[0]) if row else {
-            "cash": "10000", "positions": {}, "orders": {}, "fills": [], "audit": [],
-            "ledger": [], "epoch": 1, "clock": 0, "marks": {"BTC": "10000", "ETH": "1000"},
-        }
+        self.__truth: dict[str, Any] = (
+            json.loads(row[0])
+            if row
+            else {
+                "cash": "10000",
+                "positions": {},
+                "orders": {},
+                "fills": [],
+                "audit": [],
+                "ledger": [],
+                "epoch": 1,
+                "clock": 0,
+                "marks": {"BTC": "10000", "ETH": "1000"},
+            }
+        )
         self._save()
         self.connected = True
         self.history_complete = True
@@ -33,10 +45,15 @@ class FakeBroker:
         self.fault_mode = "NONE"
         self.fill_on_submit = True
         self.maintenance_rate = Decimal("0.01")
+        self.execution_position_mode = "ONE_WAY"
+        self.cross_zero_supported = True
+        self.reduce_only_supported = True
 
     def _save(self) -> None:
-        self.con.execute("INSERT INTO truth VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
-                         (canonical(self.__truth).decode(),))
+        self.con.execute(
+            "INSERT INTO truth VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+            (canonical(self.__truth).decode(),),
+        )
 
     def audit(self) -> list[dict[str, Any]]:
         return list(json.loads(canonical(self.__truth["audit"])))
@@ -50,25 +67,41 @@ class FakeBroker:
         if intent["account_binding"] != "fixture-account" or intent["endpoint"] != "fake://broker":
             raise PermissionError("SYNTHETIC_ACCOUNT_ONLY")
         key = intent["intent_id"]
-        wire_fields = ("intent_id", "account_binding", "endpoint", "market", "quantity",
-                       "limit_price", "reduce_only", "decision_id", "release_sha")
+        wire_fields = (
+            "intent_id",
+            "account_binding",
+            "endpoint",
+            "market",
+            "quantity",
+            "limit_price",
+            "reduce_only",
+            "decision_id",
+            "release_sha",
+        )
         wire_sha = digest({k: intent[k] for k in wire_fields})
         existing = self.__truth["orders"].get(key)
         if existing:
             if existing["wire_sha"] != wire_sha:
                 raise ValueError("INTENT_PAYLOAD_CONFLICT")
             return Outcome(existing["status"], existing["broker_id"])
-        self.__truth["audit"].append({"kind": "SUBMIT", "intent_id": key, "wire_sha": wire_sha,
-                                     "commit_sequence": intent["commit_sequence"],
-                                     "commit_sha": intent["commit_sha"],
-                                     "known_at_ms": self.__truth["clock"]})
+        self.__truth["audit"].append(
+            {
+                "kind": "SUBMIT",
+                "intent_id": key,
+                "wire_sha": wire_sha,
+                "commit_sequence": intent["commit_sequence"],
+                "commit_sha": intent["commit_sha"],
+                "known_at_ms": self.__truth["clock"],
+            }
+        )
         quantity = decimal(intent["quantity"])
         if quantity == 0:
             raise ValueError("ZERO_ORDER")
         broker_id = "fake-" + key[:24]
         status = "REJECTED" if self.fault_mode == "REJECT" else "ACCEPTED"
-        self.__truth["orders"][key] = dict(intent, wire_sha=wire_sha, broker_id=broker_id,
-                                           filled="0", status=status)
+        self.__truth["orders"][key] = dict(
+            intent, wire_sha=wire_sha, broker_id=broker_id, filled="0", status=status
+        )
         self.__truth["epoch"] += 1
         self._save()
         if status != "REJECTED" and self.fill_on_submit:
@@ -113,14 +146,21 @@ class FakeBroker:
             new_entry = entry
         self.__truth["positions"][market] = {"quantity": str(new_q), "entry_price": str(new_entry)}
         self.__truth["cash"] = str(decimal(self.__truth["cash"]) + realized - fee)
-        fill = {"execution_id": "exec-" + str(len(self.__truth["fills"]) + 1),
-                "intent_id": intent_id, "market": market, "quantity": str(quantity),
-                "price": str(execution_price), "fee": str(fee),
-                "known_at_ms": self.__truth["clock"]}
+        fill = {
+            "execution_id": "exec-" + str(len(self.__truth["fills"]) + 1),
+            "intent_id": intent_id,
+            "market": market,
+            "quantity": str(quantity),
+            "price": str(execution_price),
+            "fee": str(fee),
+            "known_at_ms": self.__truth["clock"],
+        }
         self.__truth["fills"].append(fill)
         self.__truth["ledger"].append(dict(fill, kind="FILL"))
         order["filled"] = str(decimal(order["filled"]) + quantity)
-        order["status"] = "FILLED" if decimal(order["filled"]) == decimal(order["quantity"]) else "PARTIAL"
+        order["status"] = (
+            "FILLED" if decimal(order["filled"]) == decimal(order["quantity"]) else "PARTIAL"
+        )
         self.__truth["epoch"] += 1
         self._save()
 
@@ -134,8 +174,9 @@ class FakeBroker:
             self.fill(intent_id, "0.5")
         if order["status"] not in {"FILLED", "REJECTED", "EXPIRED"}:
             order["status"] = "CANCELLED"
-        self.__truth["audit"].append({"kind": "CANCEL", "intent_id": intent_id,
-                                     "known_at_ms": self.__truth["clock"]})
+        self.__truth["audit"].append(
+            {"kind": "CANCEL", "intent_id": intent_id, "known_at_ms": self.__truth["clock"]}
+        )
         self.__truth["epoch"] += 1
         self._save()
         if self.fault_mode == "CANCEL_THEN_TIMEOUT":
@@ -147,8 +188,9 @@ class FakeBroker:
             raise ValueError("PRICE")
         self.__truth["marks"][market] = price
         self.__truth["clock"] = now_ms
-        self.__truth["ledger"].append({"kind": "MARK", "market": market, "price": price,
-                                       "known_at_ms": now_ms})
+        self.__truth["ledger"].append(
+            {"kind": "MARK", "market": market, "price": price, "known_at_ms": now_ms}
+        )
         self.__truth["epoch"] += 1
         self._save()
 
@@ -170,26 +212,94 @@ class FakeBroker:
             raise TimeoutError("FAKE_PROVIDER_UNREACHABLE")
         self.__truth["clock"] = now_ms
         self._save()
-        positions = tuple(Position(m, decimal(p["quantity"]), decimal(p["entry_price"]),
-                                   decimal(self.__truth["marks"][m]))
-                          for m, p in sorted(self.__truth["positions"].items()) if decimal(p["quantity"]))
+        positions = tuple(
+            Position(
+                m,
+                decimal(p["quantity"]),
+                decimal(p["entry_price"]),
+                decimal(self.__truth["marks"][m]),
+            )
+            for m, p in sorted(self.__truth["positions"].items())
+            if decimal(p["quantity"])
+        )
         unrealized = sum((p.quantity * (p.mark_price - p.entry_price) for p in positions), ZERO)
         gross = sum((abs(p.quantity * p.mark_price) for p in positions), ZERO)
         cash = decimal(self.__truth["cash"])
-        orders = tuple(BrokerOrder(o["intent_id"], o["broker_id"], o["market"],
-                                   decimal(o["quantity"]), decimal(o["filled"]), o["status"],
-                                   o["reduce_only"]) for o in self.__truth["orders"].values())
-        fills = tuple(Execution(f["execution_id"], f["intent_id"], f["market"],
-                                decimal(f["quantity"]), decimal(f["price"]), decimal(f["fee"]),
-                                f["known_at_ms"]) for f in self.__truth["fills"])
-        return BrokerSnapshot("fixture-account", "fake://broker", max(0, now_ms - self.stale_by_ms),
-                              now_ms, self.__truth["epoch"], cash, cash + unrealized, unrealized,
-                              gross * Decimal("0.1"), gross * self.maintenance_rate,
-                              positions, orders, fills,
-                              cutoff=f"fake-genesis-through-{self.__truth['epoch']}" if self.history_complete else None,
-                              history_complete=self.history_complete, connected=True, financial_complete=True,
-                              market_marks=tuple((m, decimal(price), max(0, now_ms - self.stale_by_ms))
-                                                 for m, price in sorted(self.__truth["marks"].items())))
+        orders = tuple(
+            BrokerOrder(
+                o["intent_id"],
+                o["broker_id"],
+                o["market"],
+                decimal(o["quantity"]),
+                decimal(o["filled"]),
+                o["status"],
+                o["reduce_only"],
+            )
+            for o in self.__truth["orders"].values()
+        )
+        fills = tuple(
+            Execution(
+                f["execution_id"],
+                f["intent_id"],
+                f["market"],
+                decimal(f["quantity"]),
+                decimal(f["price"]),
+                decimal(f["fee"]),
+                f["known_at_ms"],
+            )
+            for f in self.__truth["fills"]
+        )
+        from connectors.execution_capabilities import CapabilityFact, ExecutionCapabilities
+
+        def fact(feature: str, supported: bool = True) -> CapabilityFact:
+            return CapabilityFact(
+                "SYNTHETIC" if supported else "UNKNOWN",
+                digest(["independent-fixture-v1", feature]) if supported else None,
+                "independent-fixture-transport-v1" if supported else None,
+            )
+
+        capabilities = tuple(
+            ExecutionCapabilities(
+                "native_execution_capabilities_v1",
+                "fixture-account",
+                "fake://broker",
+                market,
+                max(0, now_ms - self.stale_by_ms),
+                now_ms,
+                now_ms + 2000,
+                self.execution_position_mode,
+                fact("net_order"),
+                fact("reduce_only", self.reduce_only_supported),
+                fact("cross_zero", self.cross_zero_supported),
+            ).to_dict()
+            for market in self.__truth["marks"]
+        )
+        return BrokerSnapshot(
+            "fixture-account",
+            "fake://broker",
+            max(0, now_ms - self.stale_by_ms),
+            now_ms,
+            self.__truth["epoch"],
+            cash,
+            cash + unrealized,
+            unrealized,
+            gross * Decimal("0.1"),
+            gross * self.maintenance_rate,
+            positions,
+            orders,
+            fills,
+            cutoff=f"fake-genesis-through-{self.__truth['epoch']}"
+            if self.history_complete
+            else None,
+            history_complete=self.history_complete,
+            connected=True,
+            financial_complete=True,
+            market_marks=tuple(
+                (m, decimal(price), max(0, now_ms - self.stale_by_ms))
+                for m, price in sorted(self.__truth["marks"].items())
+            ),
+            execution_capabilities=capabilities,
+        )
 
     def close(self) -> None:
         self.con.close()
