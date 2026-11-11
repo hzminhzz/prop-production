@@ -1,4 +1,5 @@
 """The single account financial writer and sole synthetic dispatch authority."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -24,31 +25,86 @@ ZERO = Decimal("0")
 def _halt(state: State, reason: str) -> None:
     if reason not in state["halts"]:
         state["halts"].append(reason)
-    state["runtime"].update(state="UNRESOLVED", certainty="UNKNOWN", permit=None, flat_confirmed=False)
+    state["runtime"].update(
+        state="UNRESOLVED", certainty="UNKNOWN", permit=None, flat_confirmed=False
+    )
 
 
 class Guardian:
-    def __init__(self, journal: Journal, release: VerifiedRelease, floor: ReleaseFloor,
-                 source_key: Ed25519PublicKey, rules: Rulebook, policy: dict[str, Any],
-                 markets: dict[str, Any], gateway: BrokerGateway):
+    def __init__(
+        self,
+        journal: Journal,
+        release: VerifiedRelease,
+        floor: ReleaseFloor,
+        source_key: Ed25519PublicKey,
+        rules: Rulebook,
+        policy: dict[str, Any],
+        markets: dict[str, Any],
+        gateway: BrokerGateway,
+        recovery_key: Ed25519PublicKey | None = None,
+        expected_recovery_key_sha: str | None = None,
+        revoked_recovery_key_shas: frozenset[str] = frozenset(),
+        revoked_recovery_nonces: frozenset[str] = frozenset(),
+    ):
         self.journal, self.release, self.floor = journal, release, floor
         self.source_key, self.rules = source_key, rules
         self.policy, self.markets, self.gateway = policy, markets, gateway
+        if (
+            recovery_key is not None
+            and recovery_key.public_bytes_raw() == source_key.public_bytes_raw()
+        ):
+            raise ValueError("GUARDIAN_RECOVERY_SIGNER_MUST_BE_DISTINCT")
+        import re
+        from hashlib import sha256
+
+        self.recovery_key = recovery_key
+        self.expected_recovery_key_sha = expected_recovery_key_sha
+        if journal.snapshot()["account_binding"] != "fixture-account" and recovery_key is not None:
+            current_sha = sha256(recovery_key.public_bytes_raw()).hexdigest()
+            if (
+                not isinstance(expected_recovery_key_sha, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_recovery_key_sha) is None
+                or expected_recovery_key_sha != current_sha
+            ):
+                raise ValueError("GUARDIAN_RECOVERY_KEY_NOT_INDEPENDENTLY_PINNED")
+        self.revoked_recovery_key_shas = revoked_recovery_key_shas
+        self.revoked_recovery_nonces = revoked_recovery_nonces
         self.fault: Callable[[str], None] | None = None
         if journal.snapshot()["account_binding"] != release.payload["account_binding"]:
             raise ValueError("ACCOUNT_BINDING")
-        if (digest({"policy": policy, "markets": markets}) != release.payload["risk_policy_sha"]
-                or rules.sha != release.payload["rulebook_sha"]):
+        if (
+            digest({"policy": policy, "markets": markets}) != release.payload["risk_policy_sha"]
+            or rules.sha != release.payload["rulebook_sha"]
+        ):
             raise ValueError("POLICY_BINDING")
         floor.require_active(release)
         active = journal.snapshot().get("active_release_sha")
         if active != release.release_sha:
+
             def bind(s: State) -> None:
                 if active is not None:
                     _halt(s, "RELEASE_CHANGED_REQUIRES_REVIEW")
                 s["active_release_sha"] = release.release_sha
                 s["runtime"]["permit"] = None
+
             journal.update("BIND_RELEASE_DISARMED", 0, bind)
+
+    def recover_authenticated(self, signed_request: dict[str, Any], now_ms: int) -> int:
+        """Trusted protected signer + independently fetched coherent broker state."""
+        if self.recovery_key is None:
+            raise PermissionError("GUARDIAN_RECOVERY_AUTHORITY_NOT_PINNED")
+        from hashlib import sha256
+
+        return self.journal.recover_authenticated(
+            signed_request,
+            recovery_key=self.recovery_key,
+            gateway=self.gateway,
+            now_ms=now_ms,
+            expected_recovery_key_sha=self.expected_recovery_key_sha,
+            revoked_key_shas=set(self.revoked_recovery_key_shas),
+            revoked_nonces=set(self.revoked_recovery_nonces),
+            forbidden_key_shas={sha256(self.source_key.public_bytes_raw()).hexdigest()},
+        )
 
     def _boundary(self, name: str) -> None:
         if self.fault:
@@ -64,8 +120,9 @@ class Guardian:
             reasons.append("HALT_STORAGE")
         return reasons
 
-    def decide(self, proposal: TargetBatchProposal, quotes: dict[str, Any],
-               now_ms: int) -> DecisionReceipt:
+    def decide(
+        self, proposal: TargetBatchProposal, quotes: dict[str, Any], now_ms: int
+    ) -> DecisionReceipt:
         proposal = TargetBatchProposal.from_dict(proposal.data)
         p = proposal.data
         state = self.journal.snapshot()
@@ -76,12 +133,18 @@ class Guardian:
             return DecisionReceipt.from_dict(existing["receipt"])
         reasons = self._scope(now_ms)
         status = "BLOCKED"
-        if p["release_sha"] != self.release.release_sha or p["account_binding"] != state["account_binding"]:
+        if (
+            p["release_sha"] != self.release.release_sha
+            or p["account_binding"] != state["account_binding"]
+        ):
             reasons.append("RELEASE_OR_ACCOUNT_SCOPE")
         if p["broker_epoch"] != state["runtime"]["broker_epoch"]:
             reasons.append("BROKER_EPOCH")
-        if (p["decision_ms"] > now_ms or now_ms - p["decision_ms"] > 5000
-                or not any(r["local_known_ms"] == p["first_known_ms"] for r in p["source_receipts"])):
+        if (
+            p["decision_ms"] > now_ms
+            or now_ms - p["decision_ms"] > 5000
+            or not any(r["local_known_ms"] == p["first_known_ms"] for r in p["source_receipts"])
+        ):
             reasons.append("CAUSAL_CLOCK")
         if p["quote_sha"] != digest(quotes):
             reasons.append("QUOTE_BINDING")
@@ -98,13 +161,19 @@ class Guardian:
             reasons.extend(state["halts"])
         if state["runtime"]["certainty"] != "COHERENT":
             reasons.append("RECONCILIATION_UNCERTAIN")
-        if (state["runtime"].get("last_snapshot_ms") is None
-                or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000):
+        if (
+            state["runtime"].get("last_snapshot_ms") is None
+            or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000
+        ):
             reasons.append("BROKER_STALE")
-        if state["reservations"] or any(i["status"] not in TERMINAL for i in state["intents"].values()):
+        if state["reservations"] or any(
+            i["status"] not in TERMINAL for i in state["intents"].values()
+        ):
             reasons.append("PENDING_RESERVATION")
         try:
-            expected = compile_pods(p["source_receipts"], self.release, self.source_key, p["decision_ms"])
+            expected = compile_pods(
+                p["source_receipts"], self.release, self.source_key, p["decision_ms"]
+            )
             if canonical(expected) != canonical(p["pods"]):
                 raise ValueError("SOURCE_REQUEST_MISMATCH")
             for receipt in p["source_receipts"]:
@@ -117,28 +186,55 @@ class Guardian:
             status = "REJECTED"
         risk: dict[str, Any] = {}
         if not reasons:
-            pending = [{"market": i["market"], "remaining": str(decimal(i["quantity"]) - decimal(i["filled"]))}
-                       for i in state["intents"].values() if i["status"] not in TERMINAL]
-            risk = size_book(p["pods"], quotes, self.markets, self.policy,
-                             dict(state["finance"], pod_loss_used=state.get("pod_loss_used", {})),
-                             state["positions"], state["pod_positions"], pending, now_ms=now_ms)
+            pending = [
+                {
+                    "market": i["market"],
+                    "remaining": str(decimal(i["quantity"]) - decimal(i["filled"])),
+                }
+                for i in state["intents"].values()
+                if i["status"] not in TERMINAL
+            ]
+            risk = size_book(
+                p["pods"],
+                quotes,
+                self.markets,
+                self.policy,
+                dict(state["finance"], pod_loss_used=state.get("pod_loss_used", {})),
+                state["positions"],
+                state["pod_positions"],
+                pending,
+                now_ms=now_ms,
+            )
             status = "PREVIEW" if risk["status"] == "ACCEPTED" else risk["status"]
             reasons.extend(risk["reasons"])
         body: dict[str, Any] = {
-            "schema": "guardian_decision_v1", "proposal_id": p["proposal_id"],
-            "release_sha": self.release.release_sha, "status": status,
-            "reasons": sorted(set(reasons)), "risk": risk, "known_at_ms": now_ms,
+            "schema": "guardian_decision_v1",
+            "proposal_id": p["proposal_id"],
+            "release_sha": self.release.release_sha,
+            "status": status,
+            "reasons": sorted(set(reasons)),
+            "risk": risk,
+            "known_at_ms": now_ms,
             "journal_epoch": state["runtime"]["boot_epoch"],
-            "broker_epoch": state["runtime"]["broker_epoch"], "quote_sha": p["quote_sha"],
-            "scenario_sha": digest(self.policy["scenarios"]), "rulebook_sha": self.rules.sha,
-            "requested_pods": p["pods"], "trading_authorized": False,
+            "broker_epoch": state["runtime"]["broker_epoch"],
+            "quote_sha": p["quote_sha"],
+            "scenario_sha": digest(self.policy["scenarios"]),
+            "rulebook_sha": self.rules.sha,
+            "requested_pods": p["pods"],
+            "trading_authorized": False,
         }
         body["decision_id"] = digest(body)
+
         def record(s: State) -> None:
             s["decisions"][p["proposal_id"]] = {
-                "proposal_sha": digest(p), "receipt": body, "proposal": p,
-                "quotes": quotes, "decision_sequence": self.journal.sequence + 1, "intent_ids": [],
+                "proposal_sha": digest(p),
+                "receipt": body,
+                "proposal": p,
+                "quotes": quotes,
+                "decision_sequence": self.journal.sequence + 1,
+                "intent_ids": [],
             }
+
         self.journal.update("DECISION", now_ms, record)
         return DecisionReceipt.from_dict(body)
 
@@ -286,52 +382,94 @@ class Guardian:
 
     def reserve(self, decision_id: str, now_ms: int) -> list[str]:
         state = self.journal.snapshot()
-        record = next((d for d in state["decisions"].values()
-                       if d["receipt"]["decision_id"] == decision_id), None)
+        record = next(
+            (d for d in state["decisions"].values() if d["receipt"]["decision_id"] == decision_id),
+            None,
+        )
         if record is None:
             raise ValueError("DECISION_UNKNOWN")
         if record.get("reservation_committed"):
             return list(record["intent_ids"])
         receipt = record["receipt"]
         reasons = self._scope(now_ms)
-        if (reasons or receipt["release_sha"] != self.release.release_sha
-                or receipt["status"] != "PREVIEW" or state["halts"]
-                or state["runtime"]["certainty"] != "COHERENT"
-                or receipt["broker_epoch"] != state["runtime"]["broker_epoch"]
-                or receipt["journal_epoch"] != state["runtime"]["boot_epoch"]
-                or record["decision_sequence"] != self.journal.sequence
-                or not 0 <= now_ms - receipt["known_at_ms"] <= 5000 or state["reservations"]):
+        if (
+            reasons
+            or receipt["release_sha"] != self.release.release_sha
+            or receipt["status"] != "PREVIEW"
+            or state["halts"]
+            or state["runtime"]["certainty"] != "COHERENT"
+            or receipt["broker_epoch"] != state["runtime"]["broker_epoch"]
+            or receipt["journal_epoch"] != state["runtime"]["boot_epoch"]
+            or record["decision_sequence"] != self.journal.sequence
+            or not 0 <= now_ms - receipt["known_at_ms"] <= 5000
+            or state["reservations"]
+        ):
             raise ValueError("RESERVATION_NOT_PERMITTED")
         # This binary has no live authorizer. Authenticated remote gateways are read-only.
-        if (self.gateway.synthetic is not True or self.release.payload["source_mode"] != "SYNTHETIC"
-                or self.rules.status != "SYNTHETIC" or state["account_binding"] != "fixture-account"):
+        if (
+            self.gateway.synthetic is not True
+            or self.release.payload["source_mode"] != "SYNTHETIC"
+            or self.rules.status != "SYNTHETIC"
+            or state["account_binding"] != "fixture-account"
+        ):
             raise PermissionError("REMOTE_MUTATION_UNAVAILABLE")
         risk = receipt["risk"]
         intents = []
         for market in sorted(set(risk["targets"]) | set(state["positions"])):
-            quantity = decimal(risk["targets"].get(market, "0")) - decimal(state["positions"].get(market, "0"))
+            quantity = decimal(risk["targets"].get(market, "0")) - decimal(
+                state["positions"].get(market, "0")
+            )
             if not quantity:
                 continue
             quote = record["quotes"][market]
             slip = decimal(self.policy["shortfall_bps"]) / 10000
-            price = decimal(quote["ask"]) * (1 + slip) if quantity > 0 else decimal(quote["bid"]) * (1 - slip)
+            price = (
+                decimal(quote["ask"]) * (1 + slip)
+                if quantity > 0
+                else decimal(quote["bid"]) * (1 - slip)
+            )
             tick = decimal(self.markets[market]["price_tick"])
-            price = (price / tick).to_integral_value(rounding=ROUND_FLOOR if quantity > 0 else ROUND_CEILING) * tick
-            intent_id = digest({"account": state["account_binding"], "decision": decision_id,
-                                "market": market, "quantity": str(quantity)})
-            changes = {pod: str(decimal(target.get(market, "0")) -
-                                decimal(state["pod_positions"].get(pod, {}).get(market, "0")))
-                       for pod, target in risk["pod_targets"].items()}
-            intents.append({
-                "intent_id": intent_id, "account_binding": state["account_binding"],
-                "endpoint": "fake://broker", "decision_id": decision_id,
-                "release_sha": self.release.release_sha, "market": market, "quantity": str(quantity),
-                "limit_price": str(price), "reduce_only": False, "status": "QUEUED",
-                "filled": "0", "broker_id": None, "broker_epoch": receipt["broker_epoch"],
-                "boot_epoch": receipt["journal_epoch"], "expires_at_ms": receipt["known_at_ms"] + 5000,
-                "created_at_ms": now_ms, "pod_changes": changes,
-                "proof_sha": digest(receipt), "reservation_id": decision_id,
-            })
+            price = (price / tick).to_integral_value(
+                rounding=ROUND_FLOOR if quantity > 0 else ROUND_CEILING
+            ) * tick
+            intent_id = digest(
+                {
+                    "account": state["account_binding"],
+                    "decision": decision_id,
+                    "market": market,
+                    "quantity": str(quantity),
+                }
+            )
+            changes = {
+                pod: str(
+                    decimal(target.get(market, "0"))
+                    - decimal(state["pod_positions"].get(pod, {}).get(market, "0"))
+                )
+                for pod, target in risk["pod_targets"].items()
+            }
+            intents.append(
+                {
+                    "intent_id": intent_id,
+                    "account_binding": state["account_binding"],
+                    "endpoint": "fake://broker",
+                    "decision_id": decision_id,
+                    "release_sha": self.release.release_sha,
+                    "market": market,
+                    "quantity": str(quantity),
+                    "limit_price": str(price),
+                    "reduce_only": False,
+                    "status": "QUEUED",
+                    "filled": "0",
+                    "broker_id": None,
+                    "broker_epoch": receipt["broker_epoch"],
+                    "boot_epoch": receipt["journal_epoch"],
+                    "expires_at_ms": receipt["known_at_ms"] + 5000,
+                    "created_at_ms": now_ms,
+                    "pod_changes": changes,
+                    "proof_sha": digest(receipt),
+                    "reservation_id": decision_id,
+                }
+            )
         ids = [i["intent_id"] for i in intents]
         # Exact opposing pod targets can cross internally only in the synthetic fixture.
         # There is no external execution, cash movement, fee, or broker position.
@@ -340,40 +478,64 @@ class Guardian:
         internal_cross: dict[str, dict[str, str]] = {}
         if not ids:
             for pod, book in risk["pod_targets"].items():
-                delta = {market: str(decimal(quantity) - decimal(
-                    state["pod_positions"].get(pod, {}).get(market, "0")))
-                    for market, quantity in book.items()}
+                delta = {
+                    market: str(
+                        decimal(quantity)
+                        - decimal(state["pod_positions"].get(pod, {}).get(market, "0"))
+                    )
+                    for market, quantity in book.items()
+                }
                 for market, quantity in state["pod_positions"].get(pod, {}).items():
                     if market not in delta:
                         delta[market] = str(-decimal(quantity))
                 if any(decimal(quantity) for quantity in delta.values()):
                     internal_cross[pod] = delta
-            if any(sum((decimal(book.get(market, "0")) for book in internal_cross.values()), ZERO)
-                   for market in {m for book in internal_cross.values() for m in book}):
+            if any(
+                sum((decimal(book.get(market, "0")) for book in internal_cross.values()), ZERO)
+                for market in {m for book in internal_cross.values() for m in book}
+            ):
                 raise ValueError("INTERNAL_CROSS_NOT_NET_ZERO")
+
         def commit(s: State) -> None:
             if internal_cross:
                 for pod, deltas in internal_cross.items():
                     book = s["pod_positions"].setdefault(pod, {})
                     for market, quantity in deltas.items():
                         book[market] = str(decimal(book.get(market, "0")) + decimal(quantity))
-                s.setdefault("internal_allocations", []).append({
-                    "decision_id": decision_id, "known_at_ms": now_ms,
-                    "pod_deltas": internal_cross, "scope": "SYNTHETIC_ZERO_BROKER_NET"})
+                s.setdefault("internal_allocations", []).append(
+                    {
+                        "decision_id": decision_id,
+                        "known_at_ms": now_ms,
+                        "pod_deltas": internal_cross,
+                        "scope": "SYNTHETIC_ZERO_BROKER_NET",
+                    }
+                )
             if ids:
-                s["reservations"][decision_id] = {"loss": risk["worst_loss"],
-                    "margin": risk["stressed_margin"], "cost": risk["cost_reserve"], "intent_ids": ids}
+                s["reservations"][decision_id] = {
+                    "loss": risk["worst_loss"],
+                    "margin": risk["stressed_margin"],
+                    "cost": risk["cost_reserve"],
+                    "intent_ids": ids,
+                }
             for intent in intents:
                 s["intents"][intent["intent_id"]] = intent
             for item in record["proposal"]["source_receipts"]:
                 b = item["envelope"]["payload"]
                 s["source_cursors"][b["source_identity"]] = max(
-                    s["source_cursors"].get(b["source_identity"], -1), b["sequence"])
+                    s["source_cursors"].get(b["source_identity"], -1), b["sequence"]
+                )
             s["decisions"][receipt["proposal_id"]]["intent_ids"] = ids
             s["decisions"][receipt["proposal_id"]]["reservation_committed"] = True
-            s["runtime"].update(permit={"decision_id": decision_id,
-                "boot_epoch": receipt["journal_epoch"], "broker_epoch": receipt["broker_epoch"],
-                "expires_at_ms": receipt["known_at_ms"] + 5000}, state="SHADOW_READY")
+            s["runtime"].update(
+                permit={
+                    "decision_id": decision_id,
+                    "boot_epoch": receipt["journal_epoch"],
+                    "broker_epoch": receipt["broker_epoch"],
+                    "expires_at_ms": receipt["known_at_ms"] + 5000,
+                },
+                state="SHADOW_READY",
+            )
+
         self._boundary("before_reservation")
         self.journal.update("RESERVE_AND_OUTBOX", now_ms, commit)
         self._boundary("after_reservation")
@@ -383,18 +545,26 @@ class Guardian:
         state = self.journal.snapshot()
         intent = state["intents"][intent_id]
         permit = state["runtime"]["permit"]
-        if (self._scope(now_ms) or intent["release_sha"] != self.release.release_sha
-                or state["halts"] or intent["status"] != "QUEUED"
-                or not permit or self.gateway.synthetic is not True
-                or intent["boot_epoch"] != state["runtime"]["boot_epoch"]
-                or intent["broker_epoch"] != state["runtime"]["broker_epoch"]
-                or permit["decision_id"] != intent["decision_id"]
-                or now_ms > intent["expires_at_ms"]
-                or state["runtime"]["certainty"] != "COHERENT"
-                or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000):
+        if (
+            self._scope(now_ms)
+            or intent["release_sha"] != self.release.release_sha
+            or state["halts"]
+            or intent["status"] != "QUEUED"
+            or not permit
+            or self.gateway.synthetic is not True
+            or intent["boot_epoch"] != state["runtime"]["boot_epoch"]
+            or intent["broker_epoch"] != state["runtime"]["broker_epoch"]
+            or permit["decision_id"] != intent["decision_id"]
+            or now_ms > intent["expires_at_ms"]
+            or state["runtime"]["certainty"] != "COHERENT"
+            or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000
+        ):
             raise ValueError("DISPATCH_NOT_PERMITTED")
-        self.journal.update("DISPATCHING", now_ms,
-                            lambda s: s["intents"][intent_id].update(status="DISPATCHING", sent_at_ms=now_ms))
+        self.journal.update(
+            "DISPATCHING",
+            now_ms,
+            lambda s: s["intents"][intent_id].update(status="DISPATCHING", sent_at_ms=now_ms),
+        )
         wire = self.journal.snapshot()["intents"][intent_id]
         wire.update(commit_sequence=self.journal.sequence, commit_sha=self.journal.head)
         if self.journal.in_transaction:
@@ -406,15 +576,22 @@ class Guardian:
             if outcome.status not in {"ACCEPTED", "FILLED", "PARTIAL", "REJECTED"}:
                 raise TimeoutError("OUTCOME_NOT_DEFINITIVE")
         except (TimeoutError, ConnectionError, OSError):
+
             def unknown(s: State) -> None:
                 s["intents"][intent_id]["status"] = "UNKNOWN"
                 _halt(s, "UNKNOWN_OUTCOME")
+
             self.journal.update("SEND_UNKNOWN", now_ms, unknown)
             return
         # Even a FILLED acknowledgement requires authoritative fills before reservation release.
-        self.journal.update("ACK", now_ms, lambda s: s["intents"][intent_id].update(
-            status="ACKNOWLEDGED" if outcome.status != "REJECTED" else "REJECT_PENDING_PROOF",
-            broker_id=outcome.broker_id))
+        self.journal.update(
+            "ACK",
+            now_ms,
+            lambda s: s["intents"][intent_id].update(
+                status="ACKNOWLEDGED" if outcome.status != "REJECTED" else "REJECT_PENDING_PROOF",
+                broker_id=outcome.broker_id,
+            ),
+        )
         self._boundary("after_ack")
 
     def cancel(self, intent_id: str, now_ms: int) -> None:
@@ -423,8 +600,11 @@ class Guardian:
             raise PermissionError("CANCEL_NOT_PERMITTED")
         if state["intents"][intent_id]["status"] in TERMINAL:
             return
-        self.journal.update("CANCEL_REQUESTED", now_ms,
-                            lambda s: s["intents"][intent_id].update(status="CANCEL_PENDING"))
+        self.journal.update(
+            "CANCEL_REQUESTED",
+            now_ms,
+            lambda s: s["intents"][intent_id].update(status="CANCEL_PENDING"),
+        )
         self._boundary("before_cancel")
         try:
             self.gateway.cancel(intent_id)
@@ -437,7 +617,9 @@ class Guardian:
         try:
             snapshot = self.gateway.observe(now_ms)
         except (TimeoutError, ConnectionError, OSError):
-            self.journal.update("BROKER_UNREACHABLE", now_ms, lambda s: _halt(s, "BROKER_UNREACHABLE"))
+            self.journal.update(
+                "BROKER_UNREACHABLE", now_ms, lambda s: _halt(s, "BROKER_UNREACHABLE")
+            )
             return {"state": "UNRESOLVED", "certainty": "UNKNOWN", "flat_confirmed": False}
         return self.apply_snapshot(snapshot, now_ms)
 
@@ -454,8 +636,11 @@ class Guardian:
             self._reconcile_economics(state, snapshot, now_ms)
         state["runtime"]["last_progress_ms"] = now_ms
         self.journal.commit("RECONCILE", now_ms, state, expected_sequence=self.journal.sequence)
-        return {"state": state["runtime"]["state"], "certainty": state["runtime"]["certainty"],
-                "flat_confirmed": state["runtime"].get("flat_confirmed", False)}
+        return {
+            "state": state["runtime"]["state"],
+            "certainty": state["runtime"]["certainty"],
+            "flat_confirmed": state["runtime"].get("flat_confirmed", False),
+        }
 
     def _reconcile_economics(self, state: State, snapshot: BrokerSnapshot, now_ms: int) -> None:
         errors = []
@@ -469,17 +654,29 @@ class Guardian:
         new_fees = ZERO
         # Charge every adverse move; gains never refill a pod budget during the day.
         for pod, book in state["pod_positions"].items():
-            adverse = sum((max(ZERO, -decimal(q) * (marks[m] - decimal(previous_marks[m])))
-                           for m, q in book.items() if m in marks and m in previous_marks), ZERO)
+            adverse = sum(
+                (
+                    max(ZERO, -decimal(q) * (marks[m] - decimal(previous_marks[m])))
+                    for m, q in book.items()
+                    if m in marks and m in previous_marks
+                ),
+                ZERO,
+            )
             if any(decimal(q) and m not in marks for m, q in book.items()):
                 errors.append("POD_MARK_UNKNOWN")
             # Broker cash belongs to the account; charging the full debit to
             # every pod would double-count common fees and funding.
             used[pod] = str(decimal(used.get(pod, "0")) + adverse)
         for fill in sorted(snapshot.fills, key=lambda f: (f.known_at_ms, f.execution_id)):
-            body = {"execution_id": fill.execution_id, "intent_id": fill.intent_id, "market": fill.market,
-                    "quantity": str(fill.quantity), "price": str(fill.price), "fee": str(fill.fee),
-                    "known_at_ms": fill.known_at_ms}
+            body = {
+                "execution_id": fill.execution_id,
+                "intent_id": fill.intent_id,
+                "market": fill.market,
+                "quantity": str(fill.quantity),
+                "price": str(fill.price),
+                "fee": str(fill.fee),
+                "known_at_ms": fill.known_at_ms,
+            }
             prior = state["fills"].get(fill.execution_id)
             if prior:
                 if prior != body:
@@ -490,15 +687,25 @@ class Guardian:
                 errors.append("ORPHAN_FILL")
                 continue
             total = decimal(intent["filled"]) + fill.quantity
-            if (fill.market != intent["market"] or fill.quantity * decimal(intent["quantity"]) <= 0
-                    or abs(total) > abs(decimal(intent["quantity"])) or fill.price <= 0
-                    or fill.fee < 0 or fill.known_at_ms > snapshot.observed_at_ms):
+            if (
+                fill.market != intent["market"]
+                or fill.quantity * decimal(intent["quantity"]) <= 0
+                or abs(total) > abs(decimal(intent["quantity"]))
+                or fill.price <= 0
+                or fill.fee < 0
+                or fill.known_at_ms > snapshot.observed_at_ms
+            ):
                 errors.append("FILL_INCONSISTENT")
                 continue
-            changes = {pod: decimal(change) for pod, change in intent.get("pod_changes", {}).items()}
+            changes = {
+                pod: decimal(change) for pod, change in intent.get("pod_changes", {}).items()
+            }
             gross_changes = sum((abs(change) for change in changes.values()), ZERO)
-            if (not changes or not gross_changes
-                    or sum(changes.values(), ZERO) != decimal(intent["quantity"])):
+            if (
+                not changes
+                or not gross_changes
+                or sum(changes.values(), ZERO) != decimal(intent["quantity"])
+            ):
                 errors.append("POD_FILL_ALLOCATION_INVALID")
                 continue
             if decimal(state["positions"].get(fill.market, "0")) * fill.quantity < 0:
@@ -507,7 +714,9 @@ class Guardian:
             new_fees += fill.fee
             intent["filled"] = str(total)
             state["fills"][fill.execution_id] = body
-            state["positions"][fill.market] = str(decimal(state["positions"].get(fill.market, "0")) + fill.quantity)
+            state["positions"][fill.market] = str(
+                decimal(state["positions"].get(fill.market, "0")) + fill.quantity
+            )
             for pod, change in changes.items():
                 book = state["pod_positions"].setdefault(pod, {})
                 allocated = change * fill.quantity / decimal(intent["quantity"])
@@ -517,7 +726,9 @@ class Guardian:
                 fee = fill.fee * abs(change) / gross_changes
                 pod_fees = state.setdefault("pod_fees_paid", {})
                 pod_fees[pod] = str(decimal(pod_fees.get(pod, "0")) + fee)
-                execution_loss = max(ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price))
+                execution_loss = max(
+                    ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price)
+                )
                 used[pod] = str(decimal(used.get(pod, "0")) + fee + execution_loss)
         known_orders: dict[str, BrokerOrder] = {}
         for order in snapshot.orders:
@@ -528,9 +739,12 @@ class Guardian:
             if intent is None:
                 errors.append("ORPHAN_ORDER")
                 continue
-            if (order.market != intent["market"] or order.quantity != decimal(intent["quantity"])
-                    or order.filled != decimal(intent["filled"])
-                    or order.reduce_only != intent["reduce_only"]):
+            if (
+                order.market != intent["market"]
+                or order.quantity != decimal(intent["quantity"])
+                or order.filled != decimal(intent["filled"])
+                or order.reduce_only != intent["reduce_only"]
+            ):
                 errors.append("ORDER_FILL_MISMATCH")
                 continue
             # A provider terminal label is not independent proof that its
@@ -542,9 +756,18 @@ class Guardian:
             if order.status in {"REJECTED", "NOT_ACCEPTED"} and order.filled != ZERO:
                 errors.append("BROKER_TERMINAL_EXECUTION_CONFLICT")
                 continue
-            if order.status not in {"QUEUED", "ACCEPTED", "PARTIAL", "FILLED",
-                                    "CANCELLED", "EXPIRED", "REJECTED", "NOT_ACCEPTED",
-                                    "UNKNOWN", "DISPATCHING"}:
+            if order.status not in {
+                "QUEUED",
+                "ACCEPTED",
+                "PARTIAL",
+                "FILLED",
+                "CANCELLED",
+                "EXPIRED",
+                "REJECTED",
+                "NOT_ACCEPTED",
+                "UNKNOWN",
+                "DISPATCHING",
+            }:
                 errors.append("BROKER_STATUS_UNKNOWN")
                 continue
             if order.status == "UNKNOWN":
@@ -573,13 +796,16 @@ class Guardian:
             # debits/credits (funding, corrections, transfers) require explicit
             # typed provider evidence before assigning any pod economic effect.
             if snapshot.cash - decimal(old_cash) != -new_fees and (
-                    "POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors):
+                "POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors
+            ):
                 errors.append("BROKER_CASH_ATTRIBUTION_UNKNOWN")
         finance, finance_errors = account_step(state["finance"], snapshot, self.rules, now_ms)
         previous_day = state["finance"].get("day")
         state["finance"] = finance
         errors.extend(finance_errors)
-        if any(decimal(amount) >= decimal(self.policy["pod_loss_budget"]) for amount in used.values()):
+        if any(
+            decimal(amount) >= decimal(self.policy["pod_loss_budget"]) for amount in used.values()
+        ):
             errors.append("POD_DAILY_STOP")
         if previous_day is not None and finance.get("day") != previous_day:
             state["pod_loss_used"] = {pod: "0" for pod in used}
@@ -591,9 +817,16 @@ class Guardian:
             for reservation, value in list(state["reservations"].items()):
                 if all(state["intents"][key]["status"] in TERMINAL for key in value["intent_ids"]):
                     del state["reservations"][reservation]
-            state["runtime"].update(certainty="COHERENT", last_snapshot_ms=snapshot.observed_at_ms,
-                                    provider_cutoff=snapshot.cutoff,
-                                    state="HALTED" if state["halts"] else "DISARMED")
-        flat = not observed and not state["reservations"] and not errors and all(
-            i["status"] in TERMINAL for i in state["intents"].values())
+            state["runtime"].update(
+                certainty="COHERENT",
+                last_snapshot_ms=snapshot.observed_at_ms,
+                provider_cutoff=snapshot.cutoff,
+                state="HALTED" if state["halts"] else "DISARMED",
+            )
+        flat = (
+            not observed
+            and not state["reservations"]
+            and not errors
+            and all(i["status"] in TERMINAL for i in state["intents"].values())
+        )
         state["runtime"]["flat_confirmed"] = flat

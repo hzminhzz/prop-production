@@ -145,9 +145,10 @@ def test_independent_sqlite_cursor_writers_are_fenced_before_predecessor_read(tm
         first.con.execute("ROLLBACK")
     assert first.ingest(baseline, now_ms=101) == []
     assert second.ingest(baseline, now_ms=101) == []
-    assert second.con.execute(
-        "SELECT cursor FROM streams WHERE identity=?", (IDENTITY,)
-    ).fetchone()[0] == 1
+    assert (
+        second.con.execute("SELECT cursor FROM streams WHERE identity=?", (IDENTITY,)).fetchone()[0]
+        == 1
+    )
     first.close()
     second.close()
 

@@ -1,4 +1,5 @@
 """One financial writer; atomic hash-chained snapshots and durable outbox state."""
+
 from __future__ import annotations
 
 import copy
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .evidence import canonical, digest, load_json
+from .financial_semantics import CONTRACT as SEMANTIC_V2
+from .financial_semantics import validate_transition
 
 ZERO = "0" * 64
 State = dict[str, Any]
@@ -23,16 +26,34 @@ class StorageUnavailable(RuntimeError):
 
 def initial_state(account_binding: str) -> State:
     return {
-        "schema": "guardian_journal_v1", "account_binding": account_binding, "sequence": 0,
-        "finance": {}, "halts": [], "decisions": {}, "intents": {}, "positions": {},
-        "pod_positions": {}, "fills": {}, "reservations": {}, "source_cursors": {},
-        "runtime": {"state": "DISARMED", "boot_epoch": 0, "broker_epoch": 0,
-                    "certainty": "UNKNOWN", "permit": None, "last_progress_ms": None},
+        "schema": "guardian_journal_v1",
+        "_semantic_contract": SEMANTIC_V2,
+        "account_binding": account_binding,
+        "sequence": 0,
+        "finance": {},
+        "halts": [],
+        "decisions": {},
+        "intents": {},
+        "positions": {},
+        "pod_positions": {},
+        "fills": {},
+        "reservations": {},
+        "source_cursors": {},
+        "runtime": {
+            "state": "DISARMED",
+            "boot_epoch": 0,
+            "broker_epoch": 0,
+            "certainty": "UNKNOWN",
+            "permit": None,
+            "last_progress_ms": None,
+        },
     }
 
 
 def _verify(
-    con: sqlite3.Connection, *, finance_history: deque[dict[str, Any]] | None = None,
+    con: sqlite3.Connection,
+    *,
+    finance_history: deque[dict[str, Any]] | None = None,
 ) -> tuple[State, int, str]:
     if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
         raise ValueError("CORRUPT_DATABASE")
@@ -47,30 +68,37 @@ def _verify(
         if seq != sequence + 1 or prev != previous:
             raise ValueError("JOURNAL_CHAIN_GAP")
         parsed = load_json(payload)
-        expected = digest({"seq": seq, "kind": kind, "at_ms": at_ms,
-                           "payload": parsed, "prev": prev})
+        expected = digest(
+            {"seq": seq, "kind": kind, "at_ms": at_ms, "payload": parsed, "prev": prev}
+        )
         if expected != row_sha or parsed["sequence"] != seq:
             raise ValueError("JOURNAL_TAMPER")
+        if parsed.get("_semantic_contract") == SEMANTIC_V2:
+            validate_transition(state, parsed, kind, previous_head=previous)
+        elif state.get("_semantic_contract") == SEMANTIC_V2:
+            raise ValueError("JOURNAL_SEMANTIC_VERSION_DOWNGRADE")
         previous, state, sequence = row_sha, parsed, seq
         if finance_history is not None and kind == "RECONCILE":
             finance = parsed.get("finance")
             if isinstance(finance, dict) and type(finance.get("observed_at_ms")) is int:
-                finance_history.append({
-                    "journal_sequence": seq,
-                    "reconciled_at_ms": at_ms,
-                    "observed_at_ms": finance["observed_at_ms"],
-                    "release_sha": parsed.get("active_release_sha"),
-                    "equity": finance.get("equity"),
-                    "unrealized": finance.get("unrealized"),
-                    "cash": finance.get("cash"),
-                    "risk_floor": finance.get("risk_floor"),
-                    "daily_floor": finance.get("daily_floor"),
-                    "internal_floor": finance.get("internal_floor"),
-                    "trailing_floor": finance.get("trailing_floor"),
-                    "headroom": finance.get("headroom"),
-                    "day": finance.get("day"),
-                    "realized_made": finance.get("realized_made"),
-                })
+                finance_history.append(
+                    {
+                        "journal_sequence": seq,
+                        "reconciled_at_ms": at_ms,
+                        "observed_at_ms": finance["observed_at_ms"],
+                        "release_sha": parsed.get("active_release_sha"),
+                        "equity": finance.get("equity"),
+                        "unrealized": finance.get("unrealized"),
+                        "cash": finance.get("cash"),
+                        "risk_floor": finance.get("risk_floor"),
+                        "daily_floor": finance.get("daily_floor"),
+                        "internal_floor": finance.get("internal_floor"),
+                        "trailing_floor": finance.get("trailing_floor"),
+                        "headroom": finance.get("headroom"),
+                        "day": finance.get("day"),
+                        "realized_made": finance.get("realized_made"),
+                    }
+                )
     snap = con.execute("SELECT seq,payload,sha FROM snapshot WHERE id=1").fetchone()
     if sequence and (snap is None or snap != (sequence, canonical(state).decode(), previous)):
         raise ValueError("SNAPSHOT_MISMATCH")
@@ -126,9 +154,13 @@ class Journal:
     @staticmethod
     def _restart(state: State) -> None:
         runtime = state["runtime"]
-        runtime.update(state="DISARMED", certainty="UNKNOWN", permit=None,
-                       boot_epoch=runtime["boot_epoch"] + 1,
-                       broker_epoch=runtime["broker_epoch"] + 1)
+        runtime.update(
+            state="DISARMED",
+            certainty="UNKNOWN",
+            permit=None,
+            boot_epoch=runtime["boot_epoch"] + 1,
+            broker_epoch=runtime["broker_epoch"] + 1,
+        )
         for intent in state["intents"].values():
             if intent["status"] == "DISPATCHING":
                 intent["status"] = "UNKNOWN"
@@ -165,12 +197,25 @@ class Journal:
         new_state = copy.deepcopy(state)
         sequence = self._seq + 1
         new_state["sequence"] = sequence
+        if new_state.get("_semantic_contract") == SEMANTIC_V2:
+            validate_transition(self._state, new_state, kind, previous_head=self._head)
+        elif self._state.get("_semantic_contract") == SEMANTIC_V2:
+            raise ValueError("JOURNAL_SEMANTIC_VERSION_DOWNGRADE")
+        elif kind in {"RESERVE_AND_OUTBOX", "ARM", "DISPATCHING", "COMMIT_INTENT"}:
+            raise ValueError("GUARDIAN_LEGACY_FINANCE_REQUIRES_FORWARD_CHECKPOINT")
         payload = canonical(new_state).decode()
         if len(payload) > 8_000_000:
             self.storage_healthy = False
             raise StorageUnavailable("HALT_STORAGE_CAPACITY")
-        row_sha = digest({"seq": sequence, "kind": kind, "at_ms": at_ms,
-                          "payload": new_state, "prev": self._head})
+        row_sha = digest(
+            {
+                "seq": sequence,
+                "kind": kind,
+                "at_ms": at_ms,
+                "payload": new_state,
+                "prev": self._head,
+            }
+        )
         try:
             if self.fault:
                 self.fault("before_begin")
@@ -178,8 +223,10 @@ class Journal:
             current = self.con.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
             if current != expected_sequence or current != self._seq:
                 raise ValueError("WRITER_FENCE_MISMATCH")
-            self.con.execute("INSERT INTO events VALUES (?,?,?,?,?,?)",
-                             (sequence, kind, at_ms, payload, self._head, row_sha))
+            self.con.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (sequence, kind, at_ms, payload, self._head, row_sha),
+            )
             self.con.execute(
                 "INSERT INTO snapshot VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                 "seq=excluded.seq,payload=excluded.payload,sha=excluded.sha",
@@ -203,10 +250,19 @@ class Journal:
             if reason not in state["halts"]:
                 state["halts"].append(reason)
             state["runtime"].update(state="HALTED", permit=None)
+
         return self.update("HALT_" + reason, at_ms, apply)
 
-    def recover(self, reason: str, at_ms: int, *, operator: str, incident_id: str,
-                evidence_sha: str, reset_daily_baseline: bool = False) -> int:
+    def recover(
+        self,
+        reason: str,
+        at_ms: int,
+        *,
+        operator: str,
+        incident_id: str,
+        evidence_sha: str,
+        reset_daily_baseline: bool = False,
+    ) -> int:
         """Evidence-gated recovery: HALTED → RECOVERY_REQUESTED → RECOVERY_VERIFIED.
 
         Requires the exact existing HALT, operator identity, incident ID and a
@@ -219,14 +275,20 @@ class Journal:
         discarded (audited here) and the next boundary-aligned reconcile
         bootstraps fresh from provider evidence.
         """
+        if self.snapshot()["account_binding"] != "fixture-account":
+            # SHA-shaped text is not remediation of a protected financial HALT.
+            raise ValueError("PROTECTED_RECOVERY_REQUIRES_SIGNED_CAUSE_SPECIFIC_PROOF")
         if reason not in self.snapshot()["halts"]:
             raise ValueError(f"HALT_NOT_PRESENT: {reason}")
         if reset_daily_baseline and reason != "MIDNIGHT_BASELINE_UNKNOWN":
             raise ValueError("DAILY_BASELINE_RESET_ONLY_FOR_MIDNIGHT_INCIDENTS")
         if not operator.strip() or not incident_id.strip():
             raise ValueError("RECOVERY_IDENTITY_REQUIRED")
-        if (not isinstance(evidence_sha, str) or len(evidence_sha) != 64
-                or any(c not in "0123456789abcdef" for c in evidence_sha.lower())):
+        if (
+            not isinstance(evidence_sha, str)
+            or len(evidence_sha) != 64
+            or any(c not in "0123456789abcdef" for c in evidence_sha.lower())
+        ):
             raise ValueError("RECOVERY_EVIDENCE_DIGEST_INVALID")
 
         def apply(state: State) -> None:
@@ -239,19 +301,197 @@ class Journal:
             if reset_daily_baseline:
                 state["finance"] = {}  # stale baseline discarded; boundary re-bootstraps
             runtime["last_recovery"] = {
-                "recovery_state": "RECOVERY_VERIFIED", "reason": reason,
-                "operator": operator, "incident_id": incident_id,
-                "evidence_sha256": evidence_sha.lower(), "at_ms": at_ms,
+                "recovery_state": "RECOVERY_VERIFIED",
+                "reason": reason,
+                "operator": operator,
+                "incident_id": incident_id,
+                "evidence_sha256": evidence_sha.lower(),
+                "at_ms": at_ms,
                 "daily_baseline_reset": reset_daily_baseline,
                 "remaining_halts": list(state["halts"]),
             }
+
         return self.update("RECOVER_" + reason, at_ms, apply)
+
+    def recover_authenticated(
+        self,
+        signed_request: dict[str, Any],
+        *,
+        recovery_key: Any,
+        gateway: Any,
+        now_ms: int,
+        revoked_key_shas: set[str] | None = None,
+        expected_recovery_key_sha: str | None = None,
+        revoked_nonces: set[str] | None = None,
+        forbidden_key_shas: set[str] | None = None,
+    ) -> int:
+        """Clear one HALT after protected signature *and* independent broker proof.
+
+        The gateway read happens before SQLite BEGIN. A signed operator request
+        never substitutes for verified provider history, conservation or scope.
+        Production keys/trust pins are injected externally; none are provisioned.
+        """
+        import re
+
+        from .evidence import digest as evidence_digest
+        from .evidence import verify as verify_evidence
+        from .recovery import require_real_remediation
+
+        if not hasattr(recovery_key, "public_bytes_raw"):
+            raise ValueError("RECOVERY_PROTECTED_SIGNER_REQUIRED")
+        key_sha = hashlib.sha256(recovery_key.public_bytes_raw()).hexdigest()
+        prior = self.snapshot()
+        if prior["account_binding"] != "fixture-account" and (
+            expected_recovery_key_sha != key_sha or not forbidden_key_shas
+        ):
+            raise ValueError("RECOVERY_PROTECTED_KEY_TRUST_FLOOR_MISSING")
+        if key_sha in (revoked_key_shas or set()) or key_sha in (forbidden_key_shas or set()):
+            raise ValueError("RECOVERY_SIGNER_REVOKED_OR_WRONG_AUTHORITY")
+        request = verify_evidence(signed_request, recovery_key, "guardian-recovery-operator")
+        runtime = prior["runtime"]
+        nonce = request.get("nonce")
+        reason = request.get("reason")
+        if (
+            request.get("schema") != "guardian_recovery_request_v2"
+            or request.get("role") != "protected_guardian_recovery"
+            or request.get("account_binding") != prior["account_binding"]
+            or request.get("journal_head") != self._head
+            or request.get("journal_sequence") != self._seq
+            or request.get("boot_epoch") != runtime["boot_epoch"]
+            or request.get("release_sha") != prior.get("active_release_sha")
+            or request.get("recovery_key_sha") != key_sha
+            or not isinstance(nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+            or nonce in (revoked_nonces or set())
+            or nonce in prior.get("recovery_nonces", {})
+            or type(request.get("issued_at_ms")) is not int
+            or type(request.get("expires_at_ms")) is not int
+            or type(now_ms) is not int
+            or not request["issued_at_ms"] <= now_ms < request["expires_at_ms"]
+            or not 0 < request["expires_at_ms"] - request["issued_at_ms"] <= 900_000
+            or not isinstance(request.get("operator"), str)
+            or not request["operator"].strip()
+            or not isinstance(request.get("incident_id"), str)
+            or not request["incident_id"].strip()
+        ):
+            raise ValueError("RECOVERY_REQUEST_SCOPE_EXPIRY_OR_REPLAY")
+        if not isinstance(reason, str) or reason not in prior["halts"]:
+            raise ValueError("RECOVERY_HALT_REASON_NOT_PRESENT")
+        if request.get("reset_daily_baseline") is not False:
+            raise ValueError("RECOVERY_FINANCIAL_BASELINE_RESET_NOT_VERIFIED")
+
+        # The protected BrokerGateway owns provider authentication and scope.
+        # An unavailable/coherently incomplete provider cannot clear a HALT.
+        provider_snapshot = gateway.observe(now_ms)
+        proof_sha = require_real_remediation(
+            reason=reason, state=prior, snapshot=provider_snapshot, now_ms=now_ms
+        )
+        if request.get("remediation_sha") != proof_sha:
+            raise ValueError("RECOVERY_INDEPENDENT_REMEDIATION_DIGEST_MISMATCH")
+
+        next_state = self.snapshot()
+        next_state["halts"].remove(reason)
+        new_runtime = next_state["runtime"]
+        new_runtime["state"] = "HALTED" if next_state["halts"] else "DISARMED"
+        new_runtime["permit"] = None
+        new_runtime["boot_epoch"] += 1
+        new_runtime["broker_epoch"] += 1
+        next_state.setdefault("recovery_nonces", {})[nonce] = {
+            "request_sha": evidence_digest(request),
+            "head_at_request": self._head,
+            "remediation_sha": proof_sha,
+        }
+        new_runtime["last_recovery"] = {
+            "recovery_state": "RECOVERY_VERIFIED",
+            "account_binding": prior["account_binding"],
+            "reason": reason,
+            "operator": request["operator"],
+            "incident_id": request["incident_id"],
+            "request_sha": evidence_digest(request),
+            "remediation_sha": proof_sha,
+            "recovery_key_sha": key_sha,
+            "at_ms": now_ms,
+            "remaining_halts": list(next_state["halts"]),
+        }
+        return self.commit(
+            "RECOVER_AUTH_" + reason,
+            now_ms,
+            next_state,
+            expected_sequence=self._seq,
+        )
+
+    def append_semantic_checkpoint(
+        self,
+        *,
+        gateway: Any,
+        now_ms: int,
+        expected_head: str,
+    ) -> int:
+        """Add v2 semantic admission only after genuine independent provider proof.
+
+        Entire old v1 event bytes and snapshot history are preserved. This
+        records new forward assurance, NOT a restatement of old financial data
+        or permission for protected trading.
+        """
+        from .recovery import require_real_remediation
+
+        previous = self.snapshot()
+        if previous.get("_semantic_contract") == SEMANTIC_V2:
+            raise ValueError("GUARDIAN_SEMANTIC_CHECKPOINT_ALREADY_ESTABLISHED")
+        if expected_head != self._head:
+            raise ValueError("GUARDIAN_SEMANTIC_CHECKPOINT_HEAD_STALE")
+        # Gateway I/O outside BEGIN, with coherent account/cutoff/finance,
+        # terminal cumulative executions and no unresolved reservations.
+        provider_snapshot = gateway.observe(now_ms)
+        proof_sha = require_real_remediation(
+            reason="RECONCILIATION_UNCERTAIN",
+            state=previous,
+            snapshot=provider_snapshot,
+            now_ms=now_ms,
+        )
+        next_state = copy.deepcopy(previous)
+        next_state["_semantic_contract"] = SEMANTIC_V2
+        next_state["_semantic_checkpoint"] = {
+            "schema": "guardian_semantic_checkpoint_v2",
+            "legacy_head": self._head,
+            "legacy_sequence": self._seq,
+            "independent_remediation_sha": proof_sha,
+            "provider_cutoff": provider_snapshot.cutoff,
+            "provider_epoch": provider_snapshot.epoch,
+            "source_release_sha": previous.get("active_release_sha"),
+            "prior_halts": list(previous["halts"]),
+            "original_obligations": {
+                "intents": len(previous["intents"]),
+                "fills": len(previous["fills"]),
+                "reservations": len(previous["reservations"]),
+                "positions": len(previous["positions"]),
+            },
+        }
+        next_state["runtime"].update(
+            state="DISARMED" if not previous["halts"] else "HALTED",
+            permit=None,
+            boot_epoch=previous["runtime"]["boot_epoch"] + 1,
+            broker_epoch=previous["runtime"]["broker_epoch"] + 1,
+        )
+        return self.commit(
+            "SEMANTIC_CHECKPOINT_V2",
+            now_ms,
+            next_state,
+            expected_sequence=self._seq,
+        )
 
     def verify(self) -> dict[str, Any]:
         if self.con is None:
             raise StorageUnavailable("JOURNAL_CLOSED")
-        _, seq, head = _verify(self.con)
-        return {"integrity": "VERIFIED", "sequence": seq, "head": head}
+        checked, seq, head = _verify(self.con)
+        semantic = (
+            "FORWARD_V2_LEGACY_HISTORY_PRESERVED"
+            if checked.get("_semantic_checkpoint")
+            else "VERIFIED_V2"
+            if checked.get("_semantic_contract") == SEMANTIC_V2
+            else "LEGACY_UNVERIFIABLE_V1"
+        )
+        return {"integrity": "VERIFIED", "sequence": seq, "head": head, "semantic_status": semantic}
 
     def checkpoint(self) -> tuple[int, int, int]:
         if self.con is None or self.in_transaction:
@@ -270,9 +510,13 @@ class Journal:
         finally:
             target.close()
         os.chmod(destination, 0o600)
-        return {"sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
-                "sequence": seq, "head": head, "account_binding": self._state["account_binding"],
-                "release_sha": self._state.get("active_release_sha")}
+        return {
+            "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "sequence": seq,
+            "head": head,
+            "account_binding": self._state["account_binding"],
+            "release_sha": self._state.get("active_release_sha"),
+        }
 
     @staticmethod
     def restore(source: Path, destination: Path, proof: dict[str, Any]) -> None:
@@ -281,9 +525,11 @@ class Journal:
         if hashlib.sha256(source.read_bytes()).hexdigest() != proof["sha256"]:
             raise StorageUnavailable("BACKUP_DIGEST_MISMATCH")
         restored = Journal.read(source)
-        if (restored["sequence"] != proof["sequence"] or
-                restored["account_binding"] != proof["account_binding"] or
-                restored.get("active_release_sha") != proof.get("release_sha")):
+        if (
+            restored["sequence"] != proof["sequence"]
+            or restored["account_binding"] != proof["account_binding"]
+            or restored.get("active_release_sha") != proof.get("release_sha")
+        ):
             raise StorageUnavailable("BACKUP_SCOPE_MISMATCH")
         src = sqlite3.connect(f"file:{source.resolve()}?mode=ro", uri=True)
         dst = sqlite3.connect(destination)
@@ -318,7 +564,9 @@ class Journal:
 
     @staticmethod
     def read_with_finance_history(
-        path: Path, *, limit: int = 256,
+        path: Path,
+        *,
+        limit: int = 256,
     ) -> tuple[State, list[dict[str, Any]]]:
         """Owner-only full-chain verification; never call on a dashboard refresh.
 
