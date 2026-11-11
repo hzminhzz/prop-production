@@ -20,6 +20,12 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Mandate pause**: Termination of permission to open new follower exposure while existing positions, unknown orders and protective responsibilities persist.
 - **Netted follower order**: A broker order representing eligible changes across independently risk-owned pods, with separately conserved attribution.
 - **Explicit financial flatten**: An independently authorized protected account action to close existing exposure, never implied by disabling a copy relationship.
+- **Explicit domain transition**: A state move under one authority whose predecessor, original trigger, policy/version, permission, guard, resulting local effect and replay meaning are checked; never an inference from status-like booleans.
+- **Source continuity state**: CWSA-owned lifecycle of whether selected-source checkpoint states are continuously comparable; independent from Guardian broker certainty and an individual copy mandate's activation.
+- **Mandate generation**: One immutable signed version of a follower's leader/scope/k/risk relationship; does not reset the shared CWSA source scope when only the follower changes.
+- **Unknown broker obligation**: A potentially dispatched financial effect that retains conservative exposure and attribution until broker order/execution evidence proves final outcome.
+- **Scoped failure isolation**: A fault prevents new risk only for its causal dependents, subject to shared account/portfolio caps and genuinely shared financial or signing failures.
+- **Capability-specific qualification**: Separate evidence for engineering invariants, native-source operations, prospective follower economics and explicit account-bound trading authorization.
 - **Financial authority**: Protected Guardian ownership of follower financial state, reservations, HALT, permits and broker reconciliation; distinct from research finance.
 - **Domain-owned transition**: A state change whose permitted predecessor, successor and postconditions are verified by the owner of that state.
 - **Financial conservation**: Mutual consistency of cumulative fills, orders, reservations, positions, fees and account/pod financial effects; a journal hash alone does not establish it.

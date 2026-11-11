@@ -1,7 +1,7 @@
 # ADR: Shared five-minute source signals, Guardian financial independence
 
 **Date:** 2026-11-11
-**Status:** OWNER-APPROVED TARGET ARCHITECTURE (Q1–Q16; Q2=B, Q13=B, all others A). Documentation-only, not implemented, deployed, scientifically qualified or trading-authorized.
+**Status:** OWNER-APPROVED TARGET ARCHITECTURE (Q1–Q20; Q2=B, Q13=B, all others A), including explicit domain-owned transitions. Documentation-only, not implemented, deployed, scientifically qualified or trading-authorized.
 **Companion:** `copytrade-pm/docs/decisions/2026-11-11-canonical-5m-checkpoint-grill.md`.
 **Current installed contract:** `V4ShadowProjection` uses original transition T0+300 and remains unchanged.
 
@@ -60,6 +60,21 @@ These are **product API contracts**, not verified HyperX internal engine algorit
 - **Q16=A — pause/retire is not flatten:** Pause disables all new-risk openings for the signed mandate but retains existing follower inventory, attribution, durable HALTs and unresolved financial effects under Guardian protection. Reducing/closing risk remains available under independent account limits. Flattening is a separate explicit protected action, not a side effect of disable, delete or source GAP.
 
 **Existing implementation gap:** Current `ReleaseVerifier` strictly requires `portfolio_release_v1` and a fixed `batch_seconds=300` and knows no copy-mandate activation/paused/retired state. Existing `V4ShadowProjection` owns a separate T0+300 eligibility clock. Both are old-policy implementation facts, **not** evidence Q9–Q16 is deployed. Next design frontier: new signed mandate/source schema and epoch cutover, finite pre-dispatch expiry and unknown/reversal semantics, isolation and qualification gates. No new microservice or source scheduler is authorized.
+
+## Owner-approved Round 5 — explicit Guardian boundary (2026-11-12)
+
+- **Q17=A — scoped independence:** A missing/incomplete leader B checkpoint fences B's new risk, not independently proven A/C source signals. Guardian nevertheless applies common account/portfolio risk limits; a shared broker uncertainty, compromised signature authority, global market failure or portfolio cap can correctly fence all dependent openings. Portfolio comparison with missing B evidence is not declared economically complete.
+- **Q18=A — immutable signed mandate succession:** Material follower-policy changes create a prospective **copy-mandate generation** (new signed source-to-pod mapping/rules and activation baseline). Preserve all prior financial intents, pod ownership, cash, HALTs, reservations, unknown effects and old signature proofs. The source's shared CWSA epoch **does not change** merely because one follower reconfigures; only genuine selected-source scope changes can create a new CWSA source epoch.
+- **Q19=A — conservative unknown-broker ownership:** Possibly dispatched orders keep original unique financial effect IDs, partial fills and conservative reservations until independently reconciled. Conflicting account/pod openings are barred; protective reductions require separate native evidence and cannot assume the old order failed. No timestamp, source resync, restart, stale service heartbeat, retry flag or signed vendor ACK erases that obligation.
+- **Q20=A — separate capability proofs:** Engineering/replay invariants; native 14-account/all-DEX source cadence and resource proof; prospective costed follower economics versus old T0+300; and actual broker/account reconciliation plus explicit signed trading authorization are **distinct** requirements. OBSERVE and source-only Shadow remain independent of protected Live qualification.
+
+### Explicit transition ownership, not an implicit/global state machine
+
+Use [the existing protected invariant design](ADR-INVARIANT-ENFORCEMENT-GRILL-ROUND5-20261111.md) and its proof-carrying, domain-owned transition rule. The proposed future model has three **separately owned** logical aggregates: CWSA source continuity (UNANCHORED/CONTINUOUS/FENCED), signed mandate generation (AWAITING_BASELINE/ACTIVE/PAUSED/RETIRED), and the *consumer-level new-risk opportunity* (UNDECIDED/REVIEWABLE/PRE_DISPATCH_BLOCKED/COMMITTED_ONCE/MISSED). Each must have an explicit legal transition table specifying predecessor, event, original proof, guard, actor, journal effect and replay meaning. Names and exact wire schema are not yet implemented; final field choices are pending. **Do not implement another Guardian, another global FSM, or a second financial journal.**
+
+Guardian's existing `financial_semantics.validate_transition` already verifies financial history, status admissibility, reservation consistency and protected recovery conditions. It does **not** prove that the new source/mandate/opportunity graph exists, nor automatically enforce every future legal status edge. An opportunity consumed by possible dispatch is distinct from broker `QUEUED`, `DISPATCHING`, `UNKNOWN`, `PARTIAL`, `FILLED` and other existing order statuses. New-risk permission is derived from individually verifiable source + active signed mandate + native account/quote/risk facts + unconsumed opportunity, **not** from `runtime=GREEN`, `is_active`, elapsed time or any aggregate readiness bit. Protected HALT survives independently. Preserve v1 financial journal semantics and require explicit new forward-only wire/release versions.
+
+**Open next decision frontier:** residual positions when mandates are revised, finite original-checkpoint opportunity expiry, one-order safe reversal versus reduce-only fallback, and single-active protected policy with evidence-preserving rollback. No change to installed V4 T0+300 projection, live broker routing, journals, release trust floor or authorizations is implied.
 
 ## Migration constraints
 
