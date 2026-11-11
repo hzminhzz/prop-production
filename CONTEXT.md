@@ -1,0 +1,41 @@
+# Guardian and protected source domain glossary
+
+Canonical business meanings. Not an implementation plan or authorization.
+
+- **Financial authority**: Protected Guardian ownership of follower financial state, reservations, HALT, permits and broker reconciliation; distinct from research finance.
+- **Domain-owned transition**: A state change whose permitted predecessor, successor and postconditions are verified by the owner of that state.
+- **Financial conservation**: Mutual consistency of cumulative fills, orders, reservations, positions, fees and account/pod financial effects; a journal hash alone does not establish it.
+- **Unknown execution outcome**: A dispatched order effect that has not been independently reconciled and cannot be safely retried as a fresh order.
+- **Recovery evidence receipt**: Independently verifiable, authenticated and incident-scoped proof that one HALT cause has been remediated; a digest-shaped operator assertion is not proof.
+- **Recovery requested**: An auditable request to validate remediation, not clearance.
+- **Recovery verified**: Verified clearance of a specific HALT cause; the last clearance leads only to DISARMED.
+- **Source-notional fixed-k**: Signed selected native position valued at an independent source mark, multiplied by frozen k and converted using an independent follower quote.
+- **Source packet**: Authenticated transport envelope containing individual source events, not a global financial commit.
+- **Packet completion**: All events in that envelope have reached an accepted terminal processing outcome, distinct from a partially accepted prefix.
+- **Protected source projection**: Durable signed source timing/eligibility evidence, not proof of follower holding or broker permission.
+- **Consumer cursor**: Durable identity of one consumer's accepted stream prefix, independent of other consumers' acknowledgements.
+- **Admissible source mark**: A source-venue valuation with verified account/contract provenance and freshness at the decision cutoff; independent of follower executable pricing.
+- **Terminal broker order**: An order whose terminal provider status, actual cumulative executions and complete cutoff evidence agree; residual uncertainty remains financially accountable.
+- **Semantic journal replay**: Verification of each committed state change under the invariant rules of its historical event version, distinct from checking SHA-chain integrity alone.
+- **Legacy-unverifiable financial event**: A historical event whose available original evidence cannot establish a required present-day financial invariant; not automatically fraudulent, but not a basis for new protected admission.
+- **Remediation proof**: Independent source, account or broker evidence establishing the particular HALT cause was corrected; distinct from the operator's authenticated recovery request.
+- **Predecessor chain proof**: Authenticated verification that one source occurrence follows the expected previous stream identity, not only that a signer supplied a current chain digest.
+- **Consumer effect identity**: A stable association of one original source event to its uniquely owned downstream finance or paper consequence across crashes and retries.
+- **Missed due opportunity**: An original new-risk deadline reached without verified execution, which cannot be turned into a fresh signal by source replay.
+- **Account-scoped financial HALT**: A latched refusal of new financial exposure on one protected account when its broker/financial evidence is incoherent; it does not imply an unrelated source account has lost continuity.
+- **Recovery signer**: A protected role-scoped authority that authenticates a request to verify one incident's remediation, without establishing that remediation has actually succeeded.
+- **Signed stream-head anchor**: A trusted per-stream proof of selected scope, epoch, cursor, original chain head and prospective cutoff from which successor continuity is checked; not an attestation of all earlier history.
+- **Scoped packet quarantine**: Isolation of a specific invalid source stream inside an otherwise authentic envelope while independently valid streams preserve their accepted progress.
+- **Expired new-risk opportunity**: An entry opportunity whose original due instant and authorized grace have passed without verified attempt; no restart or replay makes it fresh.
+- **Mark freshness policy**: A versioned rule for which leader price evidence is admissible at a decision cutoff; source-position validity does not imply its old price remains fresh.
+- **Canonical broker order observation**: Provider-specific order and execution evidence normalized with original status, quantity, cutoff and provenance retained for independent financial reconciliation.
+- **Forward semantic checkpoint**: An independently evidenced new financial verification boundary that leaves historical records, unknown effects and durable latches intact.
+- **Recovery request authority**: A protected, revocable role authorized to request incident-specific HALT clearance, not to attest remediation by signature alone.
+- **Versioned source cutover**: A protected switch to a new source-proof contract on an anchored prospective epoch, without reinterpreting or downgrading the older live stream.
+- **Resolved-with-quarantine packet**: An authentic packet whose invalid attributable event has an audited quarantine disposition and restored prospective baseline, but was never accepted as original continuous history.
+- **Causal consumer effect receipt**: A durable action/disposition attributable to the original source event and destination decision context, independent of other databases' transaction outcomes.
+- **Economic correction revision**: A separately identified change to future sizing/valuation semantics that preserves old frozen releases and does not itself authorize changed financial risk.
+- **Proof-carrying transition**: A protected state change justified by original authenticated evidence, causal timing, versioned policy and the owning financial authority, not by a valid-looking provider acknowledgment alone.
+- **Owned effect**: A local durable financial or source-projection consequence, rejection or unresolved obligation that no other context may silently create or cancel.
+- **Capability-scoped acceptance**: Verified correctness of one specific operation under its applicable safety and authority prerequisites, not universal approval to deploy or trade.
+- **Nonrewinding rollback**: Returning to compatible code and services while preserving source continuity, financial journals, unknown execution effects, HALT and signer trust floors.

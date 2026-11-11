@@ -14,7 +14,7 @@ import re
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -59,6 +59,9 @@ class V4ShadowProjection:
         source_key: Ed25519PublicKey,
         cutoff_ms: int,
         initial_cursors: dict[str, int] | None = None,
+        initial_chains: dict[str, str] | None = None,
+        anchor_sha: str | None = None,
+        wire_epoch: str | None = None,
     ):
         if (
             path.is_symlink()
@@ -78,6 +81,16 @@ class V4ShadowProjection:
             self.members.setdefault(member["source_identity"], []).append(member)
         self.release = release
         self.source_key = source_key
+        if (anchor_sha is None) != (wire_epoch is None):
+            raise ValueError("V4_V2_INCOMPLETE_PIN")
+        if anchor_sha is not None and (
+            re.fullmatch(r"[0-9a-f]{64}", anchor_sha) is None
+            or wire_epoch is None
+            or re.fullmatch(r"[0-9a-f]{32}", wire_epoch) is None
+        ):
+            raise ValueError("V4_V2_WIRE_PIN_INVALID")
+        self.anchor_sha = anchor_sha
+        self.wire_epoch = wire_epoch
         existed = path.exists()
         self.con = sqlite3.connect(path, timeout=0.1, isolation_level=None)
         if not existed:
@@ -102,6 +115,13 @@ class V4ShadowProjection:
             "first_known_ms INTEGER NOT NULL,due_ms INTEGER NOT NULL,"
             "source_receipt_sha TEXT,created_ms INTEGER NOT NULL);"
         )
+        if self.anchor_sha is not None:
+            self.con.execute(
+                "CREATE TABLE IF NOT EXISTS v2_event_receipts ("
+                "identity TEXT NOT NULL,cursor INTEGER NOT NULL,"
+                "chain_sha TEXT NOT NULL,receipt_sha TEXT NOT NULL,"
+                "PRIMARY KEY(identity,cursor))"
+            )
         if self.con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("V4_PROJECTION_CORRUPT")
         row = self.con.execute("SELECT release_sha,cutoff_ms FROM config WHERE id=1").fetchone()
@@ -111,9 +131,16 @@ class V4ShadowProjection:
                 start = (initial_cursors or {}).get(identity, 0)
                 if type(start) is not int or start < 0:
                     raise ValueError("V4_INITIAL_CURSOR_INVALID")
+                initial_chain = (initial_chains or {}).get(identity, "0" * 64)
+                if re.fullmatch(r"[0-9a-f]{64}", initial_chain) is None:
+                    raise ValueError("V4_INITIAL_CHAIN_INVALID")
+                if self.anchor_sha is not None and (
+                    initial_chains is None or identity not in initial_chains
+                ):
+                    raise ValueError("V4_V2_AUTHENTIC_CHAIN_REQUIRED")
                 self.con.execute(
                     "INSERT INTO streams VALUES (?,?,?,?,?,?,?)",
-                    (identity, start, "0" * 64, None, 0, cutoff_ms, None),
+                    (identity, start, initial_chain, None, 0, cutoff_ms, None),
                 )
         elif row != (release.release_sha, cutoff_ms):
             raise ValueError("V4_PROJECTION_RELEASE_OR_CUTOFF_CHANGED")
@@ -127,8 +154,20 @@ class V4ShadowProjection:
         if set(record) != {"proof", "book"}:
             raise ValueError("V4_RECEIPT_SCHEMA")
         proof = verify(record["proof"], self.source_key, "source-observer-v4")
-        if proof.get("schema") != "v4_official_event_proof_v1":
+        expected_schema = (
+            "v4_official_event_proof_v2"
+            if self.anchor_sha is not None
+            else "v4_official_event_proof_v1"
+        )
+        if proof.get("schema") != expected_schema:
             raise ValueError("V4_PROOF_SCHEMA")
+        if self.anchor_sha is not None and (
+            proof.get("anchor_sha") != self.anchor_sha
+            or proof.get("wire_epoch") != self.wire_epoch
+            or not isinstance(proof.get("previous_stream_chain_sha"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", proof["previous_stream_chain_sha"]) is None
+        ):
+            raise ValueError("V4_V2_PREDECESSOR_OR_EPOCH_PROOF_INVALID")
         identity = proof.get("source_identity")
         if identity not in self.members:
             raise ValueError("V4_SOURCE_NOT_RELEASE_SELECTED")
@@ -184,8 +223,37 @@ class V4ShadowProjection:
     def cutoff_ms(self) -> int:
         return int(self.con.execute("SELECT cutoff_ms FROM config WHERE id=1").fetchone()[0])
 
-    def ingest(self, record: dict[str, Any], *, now_ms: int) -> list[dict[str, Any]]:
-        """Atomically record one prospective source event and protective actions."""
+    def ingest(
+        self,
+        record: dict[str, Any],
+        *,
+        now_ms: int,
+        on_commit: Callable[[sqlite3.Connection], None] | None = None,
+        require_new: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fence concurrent cursor writers before reading the predecessor."""
+        # Signature verification is independent of the SQLite cursor lock.
+        # The owner must re-read cursor/head after acquiring the write lease.
+        self._validate_record(record, now_ms=now_ms)
+        self.con.execute("BEGIN IMMEDIATE")
+        try:
+            actions = self._ingest_locked(record, now_ms=now_ms, require_new=require_new)
+            if on_commit is not None:
+                # Source cursor and consumer effect progress share one
+                # destination-owned SQLite transaction.
+                on_commit(self.con)
+            if self.con.in_transaction:
+                self.con.execute("COMMIT")
+            return actions
+        except BaseException:
+            if self.con.in_transaction:
+                self.con.execute("ROLLBACK")
+            raise
+
+    def _ingest_locked(
+        self, record: dict[str, Any], *, now_ms: int, require_new: bool = False
+    ) -> list[dict[str, Any]]:
+        """Apply source cursor and local projected effects under the write lease."""
         proof, book = self._validate_record(record, now_ms=now_ms)
         identity = proof["source_identity"]
         stream = self.con.execute(
@@ -195,9 +263,23 @@ class V4ShadowProjection:
         if stream is None:
             raise ValueError("V4_SOURCE_UNKNOWN")
         cursor, old_chain, old_epoch, continuous, last_known, old_book = stream
+        if self.anchor_sha is not None and proof["stream_cursor"] == cursor + 1:
+            if proof["previous_stream_chain_sha"] != old_chain:
+                raise ValueError("V4_V2_SOURCE_PREDECESSOR_MISMATCH")
         if proof["stream_cursor"] <= cursor:
-            # Exact duplicate is idempotent. Conflicting chains at the same
-            # cursor are source equivocation, not a harmless retry.
+            if require_new:
+                raise ValueError("V4_RECOVERY_BASELINE_MUST_ADVANCE_CURSOR")
+            if self.anchor_sha is not None:
+                receipt = self.con.execute(
+                    "SELECT chain_sha,receipt_sha FROM v2_event_receipts "
+                    "WHERE identity=? AND cursor=?",
+                    (identity, proof["stream_cursor"]),
+                ).fetchone()
+                if receipt is None:
+                    raise ValueError("V4_V2_ANCHORED_OR_UNPROVEN_HISTORY_REPLAY")
+                if receipt != (proof["stream_chain_sha"], digest(record)):
+                    raise ValueError("V4_V2_CURSOR_PAYLOAD_EQUIVOCATION")
+                return []
             if proof["stream_cursor"] == cursor and proof["stream_chain_sha"] != old_chain:
                 raise ValueError("V4_SOURCE_CURSOR_EQUIVOCATION")
             return []
@@ -215,7 +297,6 @@ class V4ShadowProjection:
             raise ValueError("V4_EPOCH_CHANGED_WITHOUT_BASELINE")
         state = dict(_quantity_map(book)) if book is not None else {}
         actions: list[dict[str, Any]] = []
-        self.con.execute("BEGIN IMMEDIATE")
         try:
             if kind in {"GAP", "SCOPE", "STOP", "START"}:
                 # No inferred flat and no pending risk through a source gap.
@@ -351,9 +432,14 @@ class V4ShadowProjection:
             )
             for action in actions:
                 self._insert_action(action, now_ms)
-            self.con.execute("COMMIT")
+            if self.anchor_sha is not None:
+                self.con.execute(
+                    "INSERT INTO v2_event_receipts VALUES (?,?,?,?)",
+                    (identity, proof["stream_cursor"], proof["stream_chain_sha"], digest(record)),
+                )
         except BaseException:
-            self.con.execute("ROLLBACK")
+            if self.con.in_transaction:
+                self.con.execute("ROLLBACK")
             raise
         return actions
 
@@ -478,9 +564,8 @@ class V4ShadowProjection:
             raise ValueError("V4_ACTION_SOURCE_NOT_CONTINUOUS")
         if not 0 <= now_ms - row[1] <= STALE_MS:
             raise ValueError("V4_ACTION_SOURCE_STALE")
-        if (
-            digest(json.loads(row[2])) != action["source_receipt_sha"]
-            or decimal(row[3]) != decimal(action["eligible_source_qty"])
+        if digest(json.loads(row[2])) != action["source_receipt_sha"] or decimal(row[3]) != decimal(
+            action["eligible_source_qty"]
         ):
             raise ValueError("V4_ACTION_SUPERSEDED")
         return action

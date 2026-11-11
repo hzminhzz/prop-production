@@ -134,6 +134,50 @@ def test_replay_old_epoch_and_expired_release_cannot_reserve(tmp_path):
     floor.close()
 
 
+def test_false_filled_terminal_latches_halt_and_keeps_reservation(tmp_path):
+    """Outside provider evidence contradicts FILLED despite a coherent cutoff."""
+    guardian, broker, journal, proposal, floor = setup_system(tmp_path)
+    decision = guardian.decide(proposal, quote(), 301000)
+    intent_id = guardian.reserve(decision.data["decision_id"], 301000)[0]
+    broker.fill_on_submit = False
+    guardian.dispatch(intent_id, 301000)
+    broker.fill(intent_id, "0.6")
+    snapshot = broker.observe(301001)
+    assert snapshot.orders[0].status == "PARTIAL"
+    assert snapshot.orders[0].filled != snapshot.orders[0].quantity
+    false_terminal = replace(snapshot.orders[0], status="FILLED")
+    guardian.apply_snapshot(replace(snapshot, orders=(false_terminal,)), 301001)
+    state = journal.snapshot()
+    assert "BROKER_FALSE_FILLED_TERMINAL" in state["halts"]
+    assert state["runtime"]["state"] == "UNRESOLVED"
+    assert state["runtime"]["permit"] is None
+    assert state["reservations"]
+    assert state["intents"][intent_id]["status"] != "FILLED"
+    assert Decimal(state["intents"][intent_id]["filled"]) == snapshot.orders[0].filled
+    assert broker.audit() and len([row for row in broker.audit() if row["kind"] == "SUBMIT"]) == 1
+    journal.close()
+    broker.close()
+    floor.close()
+
+
+def test_unknown_broker_status_halts_without_releasing_reservation(tmp_path):
+    guardian, broker, journal, proposal, floor = setup_system(tmp_path)
+    decision = guardian.decide(proposal, quote(), 301000)
+    intent_id = guardian.reserve(decision.data["decision_id"], 301000)[0]
+    broker.fill_on_submit = False
+    guardian.dispatch(intent_id, 301000)
+    snapshot = broker.observe(301001)
+    unknown = replace(snapshot.orders[0], status="PROVIDER_NEW_TERMINAL")
+    guardian.apply_snapshot(replace(snapshot, orders=(unknown,)), 301001)
+    state = journal.snapshot()
+    assert "BROKER_STATUS_UNKNOWN" in state["halts"]
+    assert state["reservations"]
+    assert state["intents"][intent_id]["status"] != "PROVIDER_NEW_TERMINAL"
+    journal.close()
+    broker.close()
+    floor.close()
+
+
 def test_duplicate_fills_are_deduped_and_conflicts_halt(tmp_path):
     guardian, broker, journal, proposal, floor = setup_system(tmp_path)
     decision = guardian.decide(proposal, quote(), 301000)

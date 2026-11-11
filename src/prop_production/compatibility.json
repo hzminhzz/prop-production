@@ -4,7 +4,7 @@
   "repositories": {
     "copytrade-pm": {
       "repository": "hzminhzz/copytrade-pm",
-      "commit": "76e587b70b7fa9e8f3e288aaf99a5d773e033252"
+      "commit": "b76365c4a823db4ed4b035329c3c60e946e2203b"
     },
     "trading-connector": {
       "repository": "hzminhzz/trading-connector",
@@ -18,6 +18,8 @@
     "default_sizing_policy": "FIXED_K_NATIVE_QUANTITY",
     "legacy_sizing_policy": "ALLOCATION_OVER_LIVE_NAV",
     "execution_mode": "SHADOW",
+    "source_wire_versions": [1, 2],
+    "active_source_wire": 1,
     "trading_authorized": false
   },
   "dependencies": {
