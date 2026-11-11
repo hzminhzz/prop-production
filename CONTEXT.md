@@ -14,3 +14,11 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Packet completion**: All events in that envelope have reached an accepted terminal processing outcome, distinct from a partially accepted prefix.
 - **Protected source projection**: Durable signed source timing/eligibility evidence, not proof of follower holding or broker permission.
 - **Consumer cursor**: Durable identity of one consumer's accepted stream prefix, independent of other consumers' acknowledgements.
+- **Admissible source mark**: A source-venue valuation with verified account/contract provenance and freshness at the decision cutoff; independent of follower executable pricing.
+- **Terminal broker order**: An order whose terminal provider status, actual cumulative executions and complete cutoff evidence agree; residual uncertainty remains financially accountable.
+- **Semantic journal replay**: Verification of each committed state change under the invariant rules of its historical event version, distinct from checking SHA-chain integrity alone.
+- **Legacy-unverifiable financial event**: A historical event whose available original evidence cannot establish a required present-day financial invariant; not automatically fraudulent, but not a basis for new protected admission.
+- **Remediation proof**: Independent source, account or broker evidence establishing the particular HALT cause was corrected; distinct from the operator's authenticated recovery request.
+- **Predecessor chain proof**: Authenticated verification that one source occurrence follows the expected previous stream identity, not only that a signer supplied a current chain digest.
+- **Consumer effect identity**: A stable association of one original source event to its uniquely owned downstream finance or paper consequence across crashes and retries.
+- **Missed due opportunity**: An original new-risk deadline reached without verified execution, which cannot be turned into a fresh signal by source replay.
