@@ -2,6 +2,35 @@
 
 Canonical business meanings. Not an implementation plan or authorization.
 
+- **Canonical target-state signal**: A provenance-bound selected-leader exposure observed at a versioned five-minute checkpoint, shared between paper and protected consumers without granting follower financial authority.
+- **Guardian Execution Lane**: The account-bound, proof-carrying lifecycle under the existing Guardian that independently validates evidence, authorizes and records local intent, and reconciles uncertain external execution; it does not originate leader source signals.
+- **Checkpoint-policy verification**: Independent validation of a canonical source checkpoint and signed policy by a financial consumer without introducing another source timing clock.
+- **Checkpoint observation time**: Source-state evidence known and verified at an actual instant; distinct from scheduled UTC checkpoint identity and an earlier provider state timestamp.
+- **Target-state reconciliation**: Guardian's protected comparison of signed desired source exposure against actual follower holdings, pending reservations and unresolved broker effects; a target is not an instruction to place an order.
+- **Grid-timed source exit**: A leader reduction or close reflected only at an admitted periodic source checkpoint, not a restriction on independently triggered follower-account loss protection.
+- **Canonical checkpoint outcome**: A durable per-source/scope/policy/boundary disposition that remains meaningful even when no new source target-change signal exists.
+- **Recovery baseline**: Complete authenticated leader state first restored after a source continuity gap, not a new-exposure invitation.
+- **Recovery reduction-only reconciliation**: Financially admitted risk decrease toward a separately verified restored source book without authorizing a new increase or position flip.
+- **Target-change signal**: A verified economic change across continuous eligible source checkpoints; distinct from a checkpoint receipt, desired exposure and Guardian financial intent.
+- **Single new-risk opportunity**: One bounded guarded attempt per eligible changed checkpoint and per financial consumer; an unchanged target, replay or incomplete fill is not a second opportunity.
+- **Copy mandate**: A signed, account-bound leader-to-follower relationship with frozen sizing, allowed markets, activation and risk policy; separate from the common source signal and from broker authority.
+- **Activation baseline**: First admissible source state after a new relationship or material revision, establishing prospective reference but no immediate copy-current entry.
+- **Full-target follow-on increase**: A new eligible source increase that permits one fresh risk-checked attempt toward the current full target even if a prior opening was missed; not a retry of an uncertain previous order.
+- **Pre-dispatch re-evaluation**: Bounded repeat of admission checks on one unexpired opportunity, provably before any broker side effect could have happened.
+- **Mandate pause**: Termination of permission to open new follower exposure while existing positions, unknown orders and protective responsibilities persist.
+- **Netted follower order**: A broker order representing eligible changes across independently risk-owned pods, with separately conserved attribution.
+- **Explicit financial flatten**: An independently authorized protected account action to close existing exposure, never implied by disabling a copy relationship.
+- **Explicit domain transition**: A state move under one authority whose predecessor, original trigger, policy/version, permission, guard, resulting local effect and replay meaning are checked; never an inference from status-like booleans.
+- **Source continuity state**: CWSA-owned lifecycle of whether selected-source checkpoint states are continuously comparable; independent from Guardian broker certainty and an individual copy mandate's activation.
+- **Mandate generation**: One immutable signed version of a follower's leader/scope/k/risk relationship; does not reset the shared CWSA source scope when only the follower changes.
+- **Unknown broker obligation**: A potentially dispatched financial effect that retains conservative exposure and attribution until broker order/execution evidence proves final outcome.
+- **Scoped failure isolation**: A fault prevents new risk only for its causal dependents, subject to shared account/portfolio caps and genuinely shared financial or signing failures.
+- **Capability-specific qualification**: Separate evidence for engineering invariants, native-source operations, prospective follower economics and explicit account-bound trading authorization.
+- **Old-mandate residual exposure**: Outstanding financial positions, reservations or uncertain effects under an earlier signed copy generation, not transferred or erased merely by replacement.
+- **Opportunity expiry**: Original immutable cutoff for admitting new-risk dispatch from one changed source checkpoint, at or before the next grid boundary and its earlier signed deadline.
+- **Cross-zero reversal**: A broker position change from one sign to the other; the new opening component may execute only with independent account and venue proof, otherwise reduce-only is separate.
+- **One effective opening policy**: A destination account/pod permits new exposure from exactly one signed generation even while older and newer signal policies are observed in read-only mode.
+- **Forward-only cutover**: A future-effective signed policy transition that never rewinds protected finance, trusted signing floors, old evidence or broker uncertainty.
 - **Financial authority**: Protected Guardian ownership of follower financial state, reservations, HALT, permits and broker reconciliation; distinct from research finance.
 - **Domain-owned transition**: A state change whose permitted predecessor, successor and postconditions are verified by the owner of that state.
 - **Financial conservation**: Mutual consistency of cumulative fills, orders, reservations, positions, fees and account/pod financial effects; a journal hash alone does not establish it.

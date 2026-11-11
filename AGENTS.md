@@ -31,6 +31,10 @@ credentials. Bybit equity and available buying power are not ledger cash;
 REST order/position reads are not coherent history. See docs/BYBIT-DEMO-INTEGRATION.md.
 Planner cannot supply trusted broker equity, grant permits or access credentials.
 
+## Approved future checkpoint lifecycle: explicit transitions only (2026-11-12)
+
+The isolated [CWSA/Guardian design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Q1–Q24, **not implemented or trading-authorized**. Read [the local adversarial acceptance map](docs/CANONICAL-5M-ACCEPTANCE-20261112.md) before any future implementation. Reuse existing Guardian-owned finance and durable journals. Never implement an implicit state machine using `is_active`, `ready`, age alone, missing rows, service statuses or mixed concern enums. Future source continuity, signed mandate generations and new-risk opportunities must have separately owned typed predecessor/trigger/guard/next-state/durable-effect contracts; the existing broker order journal remains the only protected financial truth. Shared CWSA continuity does not reset when one follower's copy mandate changes; unknown orders and HALTs cannot be cleared by source health. No third supervisor, second Guardian or global FSM.
+
 ## Binding owner decision: source NAV is not a universal gate (2026-11-06)
 
 - **Default copy policy:** risk-budgeted, fixed-k mirroring of an explicitly selected leader account/perpetual position scope. `FIXED_K_NATIVE_QUANTITY` is the signed release member policy: follower target **notional** is `k * leader native position quantity * source mark`, then quantity is determined at the independent follower quote and checked by Guardian. Source `nav=null` is valid in this mode and MUST NOT cause a `SOURCE_NAV` rejection or a request to reconstruct parent/subaccount/whole-wallet equity.
