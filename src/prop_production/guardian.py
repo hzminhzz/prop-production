@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .contracts import DecisionReceipt, TargetBatchProposal
+from .copy_mandates import MandateState
+
+if TYPE_CHECKING:
+    from .v4_source_receiver import SourcePacketReceiver
 from .evidence import canonical, decimal, digest
 from .finance import Rulebook, account_step
 from .gateway import BrokerGateway, BrokerOrder, BrokerSnapshot
@@ -45,9 +49,16 @@ class Guardian:
         expected_recovery_key_sha: str | None = None,
         revoked_recovery_key_shas: frozenset[str] = frozenset(),
         revoked_recovery_nonces: frozenset[str] = frozenset(),
+        mandate_key: Ed25519PublicKey | None = None,
     ):
         self.journal, self.release, self.floor = journal, release, floor
         self.source_key, self.rules = source_key, rules
+        if (
+            mandate_key is not None
+            and mandate_key.public_bytes_raw() == source_key.public_bytes_raw()
+        ):
+            raise ValueError("MANDATE_AUTHORITY_MUST_BE_DISTINCT_FROM_SOURCE")
+        self.mandate_key = mandate_key
         self.policy, self.markets, self.gateway = policy, markets, gateway
         if (
             recovery_key is not None
@@ -89,6 +100,23 @@ class Guardian:
 
             journal.update("BIND_RELEASE_DISARMED", 0, bind)
 
+    def activate_copy_mandate(self, envelope: dict[str, Any], *, now_ms: int) -> MandateState:
+        from .guardian_checkpoints import activate_mandate
+
+        return activate_mandate(self, envelope, now_ms=now_ms)
+
+    def control_copy_mandate(self, envelope: dict[str, Any], *, now_ms: int) -> MandateState:
+        from .guardian_checkpoints import control_mandate
+
+        return control_mandate(self, envelope, now_ms=now_ms)
+
+    def baseline_copy_mandate(
+        self, owner: str, receiver: SourcePacketReceiver, *, now_ms: int
+    ) -> MandateState:
+        from .guardian_checkpoints import baseline_mandate
+
+        return baseline_mandate(self, owner, receiver, now_ms=now_ms)
+
     def recover_authenticated(self, signed_request: dict[str, Any], now_ms: int) -> int:
         """Trusted protected signer + independently fetched coherent broker state."""
         if self.recovery_key is None:
@@ -123,6 +151,8 @@ class Guardian:
     def decide(
         self, proposal: TargetBatchProposal, quotes: dict[str, Any], now_ms: int
     ) -> DecisionReceipt:
+        if self.release.payload["schema"] != "portfolio_release_v1":
+            raise ValueError("CHECKPOINT_RELEASE_REQUIRES_CHECKPOINT_ADMISSION")
         proposal = TargetBatchProposal.from_dict(proposal.data)
         p = proposal.data
         state = self.journal.snapshot()

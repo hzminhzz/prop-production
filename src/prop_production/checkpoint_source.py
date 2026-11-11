@@ -139,6 +139,25 @@ class CheckpointProjection:
 
     def _verify_heads(self) -> None:
         assert self.con is not None
+        proofs: dict[tuple[str, int], str] = {}
+        for packet_sha, raw, received_ms in self.con.execute("SELECT * FROM cwsa_receiver_packets"):
+            if sha256(raw.encode()).hexdigest() != packet_sha:
+                raise ValueError("CWSA_RESTART_PACKET_HASH")
+            body = self._packet(raw.encode(), now_ms=received_ms)
+            for event in body["transitions"]:
+                verify_transition(
+                    body["scope"],
+                    body["policy"],
+                    event,
+                    body["originals"],
+                    issued_ms=body["issued_ms"],
+                )
+                key = (body["scope"]["source_id"], event["sequence"])
+                event_sha = digest(event)
+                if key in proofs and proofs[key] != event_sha:
+                    raise ValueError("CWSA_RESTART_EQUIVOCATION")
+                proofs[key] = event_sha
+        seen = set()
         for source, seq, state, head in self.con.execute("SELECT * FROM cwsa_receiver_heads"):
             previous = ZERO
             current = None
@@ -151,16 +170,19 @@ class CheckpointProjection:
                 if (
                     number != count + 1
                     or digest(event) != event_sha
+                    or proofs.get((source, number)) != event_sha
                     or event["prior_sha"] != previous
                     or (current is not None and event["predecessor"] != current)
                 ):
                     raise ValueError("CWSA_RECEIVER_CHAIN")
+                seen.add((source, number))
                 current, previous, count = event["successor"], event_sha, number
             if count != seq or current != load_json(state) or previous != head:
                 raise ValueError("CWSA_RECEIVER_HEAD")
+        if seen != set(proofs):
+            raise ValueError("CWSA_RESTART_PROOF_COVERAGE")
 
-    def ingest(self, raw: bytes, *, now_ms: int) -> dict[str, Any]:
-        assert self.con is not None
+    def _packet(self, raw: bytes, *, now_ms: int) -> dict[str, Any]:
         integer(now_ms)
         if len(raw) > 16 * 1024 * 1024:
             raise ValueError("CWSA_PACKET_LIMIT")
@@ -192,6 +214,12 @@ class CheckpointProjection:
         for raw_sha, original in body["originals"].items():
             if not isinstance(original, str) or sha256(original.encode()).hexdigest() != raw_sha:
                 raise ValueError("CWSA_ORIGINAL_HASH")
+        return body
+
+    def ingest(self, raw: bytes, *, now_ms: int) -> dict[str, Any]:
+        assert self.con is not None
+        body = self._packet(raw, now_ms=now_ms)
+        scope, policy, transitions = body["scope"], body["policy"], body["transitions"]
         packet_sha = sha256(raw).hexdigest()
         if self.con.execute(
             "SELECT 1 FROM cwsa_receiver_packets WHERE sha=?", (packet_sha,)
@@ -565,6 +593,8 @@ def verify_transition(
         or after["sequence"] != event["sequence"]
     ):
         raise ValueError("CWSA_TRANSITION_SEQUENCE")
+    if event["sequence"] == 1 and event["event"] != "REGISTER":
+        raise ValueError("CWSA_GENESIS_REQUIRES_REGISTER")
     expected = dict(before, sequence=event["sequence"])
     effect = event["effect"]
     if event["event"] == "REGISTER":

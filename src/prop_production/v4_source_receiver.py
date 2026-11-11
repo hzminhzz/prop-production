@@ -189,6 +189,14 @@ class SourcePacketReceiver:
 
         self.checkpoint: CheckpointProjection | None = None
         if wire_version == 3:
+            if release.payload["schema"] == "portfolio_release_v2":
+                signed_pins = {
+                    "policy": release.payload["checkpoint_policy"],
+                    "scopes": release.payload["checkpoint_scopes"],
+                }
+                if checkpoint_pins is not None and checkpoint_pins != signed_pins:
+                    raise ValueError("CWSA_RELEASE_PIN_DRIFT")
+                checkpoint_pins = signed_pins
             if checkpoint_pins is None:
                 raise ValueError("CWSA_EXTERNAL_POLICY_PINS_REQUIRED")
             self.checkpoint = CheckpointProjection(

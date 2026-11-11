@@ -267,3 +267,32 @@ def test_receiver_sigkill_never_commits_partial_source_packet(tmp_path, point):
     receiver.ingest(fixture_packet(), now_ms=now)
     assert receiver.checkpoint_status()["sources"]["fixture-leader"]["cursor"] == 3
     receiver.close()
+
+
+def test_fabricated_continuous_genesis_is_rejected(tmp_path):
+    release, _key = fresh_release(tmp_path)
+    receiver = SourcePacketReceiver(
+        tmp_path / "genesis.sqlite3",
+        release=release,
+        source_key=KEY.public_key(),
+        wire_version=3,
+        checkpoint_pins=PINS,
+    )
+    body = json.loads(fixture_packet())["payload"]
+    before = dict(body["transitions"][-1]["predecessor"], sequence=0)
+    event = dict(
+        body["transitions"][-1],
+        sequence=1,
+        prior_sha="0" * 64,
+        predecessor=before,
+        event="LATE",
+        evidence_sha="e" * 64,
+        guard="REORDERED",
+        successor=dict(before, sequence=1, phase="FENCED"),
+        effect=None,
+    )
+    body["transitions"] = [event]
+    with pytest.raises(ValueError, match="CWSA_GENESIS"):
+        receiver.ingest(canonical(sign(body, KEY, "cwsa-checkpoint-v3")), now_ms=body["issued_ms"])
+    assert receiver.checkpoint_status()["source_count"] == 0
+    receiver.close()
