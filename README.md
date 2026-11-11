@@ -19,7 +19,7 @@ hold financial mutation authority; this release provides zero-capital interfaces
 
 ## Approved future shared checkpoint policy (not implemented)
 
-[2026-11-11 five-minute source checkpoint / Guardian Execution Lane design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Grill Q1=A. Source checkpoint truth belongs to the canonical source authority; protected account execution remains Guardian-owned. This is a different strategy from current T0+300 and is **not** merged, deployed or trading-authorized. Q2 provider authority and dependent contracts remain unresolved.
+[2026-11-11 five-minute source checkpoint / Guardian Execution Lane design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Grill Q1=A and Q3=A/Q4=A/Q5=A. The source authority owns fresh bounded five-minute samples and complete target-state signals for all source changes; protected account execution and independent intragrid risk protection remain Guardian-owned. This is a different strategy from current T0+300 and is **not** merged, deployed or trading-authorized. Q2 source-provider authority remains open after Vike five-minute snapshot freshness/capture-lag audit.
 
 ## Official V4 position-source SHADOW integration
 

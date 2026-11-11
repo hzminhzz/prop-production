@@ -5,6 +5,9 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Canonical target-state signal**: A provenance-bound selected-leader exposure observed at a versioned five-minute checkpoint, shared between paper and protected consumers without granting follower financial authority.
 - **Guardian Execution Lane**: The account-bound, proof-carrying lifecycle under the existing Guardian that independently validates evidence, authorizes and records local intent, and reconciles uncertain external execution; it does not originate leader source signals.
 - **Checkpoint-policy verification**: Independent validation of a canonical source checkpoint and signed policy by a financial consumer without introducing another source timing clock.
+- **Checkpoint observation time**: Source-state evidence known and verified at an actual instant; distinct from scheduled UTC checkpoint identity and an earlier provider state timestamp.
+- **Target-state reconciliation**: Guardian's protected comparison of signed desired source exposure against actual follower holdings, pending reservations and unresolved broker effects; a target is not an instruction to place an order.
+- **Grid-timed source exit**: A leader reduction or close reflected only at an admitted periodic source checkpoint, not a restriction on independently triggered follower-account loss protection.
 - **Financial authority**: Protected Guardian ownership of follower financial state, reservations, HALT, permits and broker reconciliation; distinct from research finance.
 - **Domain-owned transition**: A state change whose permitted predecessor, successor and postconditions are verified by the owner of that state.
 - **Financial conservation**: Mutual consistency of cumulative fills, orders, reservations, positions, fees and account/pod financial effects; a journal hash alone does not establish it.
