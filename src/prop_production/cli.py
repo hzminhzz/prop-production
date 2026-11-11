@@ -163,6 +163,14 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         return demo_report(
             load_json(args.path.read_bytes()) if args.path else None, now_ms=now_ms
         ), 2
+    if args.command == "session":
+        from .evidence import load_json
+        from .execution_session import assess
+
+        if args.path is None:
+            raise ValueError("SESSION_EVIDENCE_PATH_REQUIRED")
+        result = assess(load_json(args.path.read_bytes()), now_ms=now_ms)
+        return result, 0 if result["verdict"] != "BLOCKED" else 2
     if args.command == "readiness":
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -239,6 +247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "paper",
             "judge",
             "readiness",
+            "session",
             "demo",
             "economics",
             "fixture",

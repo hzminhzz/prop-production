@@ -43,6 +43,10 @@ private account responses, datasets or signing secrets in Git.
 Production permission requires account-bound independent evidence and explicit
 owner authorization. A mode flag, test result or service restart never grants it.
 
+## Execution Session diagnostics (2026-11-11)
+
+Read [Execution Session v1](docs/EXECUTION-SESSION-20261111.md) before changing admission logic. `prop-production session --path` is a strictly read-only, account-scoped, *unverified-claims* diagnostic. It must not be consumed as a broker permit, financial attestation, or authority to clear HALT. Only the existing Guardian journal may authorize committed order intents. A healthy synthetic broker socket is not provider mutation readiness; current native Propr order authority is unavailable.
+
 ## Verification
 
 For this private program, GitHub Actions is not required. Use the commit-bound
