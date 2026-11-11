@@ -27,6 +27,10 @@ They do not replace the installed synthetic Planner or authorize broker orders.
 The protected cross-user transfer and signed prospective release still require
 independent verification before a deployable integrated service exists.
 
+## Execution Session (nonactivating)
+
+The read-only, account-scoped `prop-production session --path PRIVATE_EVIDENCE.json` command produces a versioned, redacted diagnostic of OBSERVE/PAPER/DEMO/LIVE claim completeness. It never validates arbitrary claims as native proofs, issues financial permits, or enables mutations. See [Execution Session v1](docs/EXECUTION-SESSION-20261111.md) for boundaries and remaining admission work.
+
 ## Native Propr evidence integration
 
 The optional provider connector exposes `propr_native_evidence_v1`. `BrokerGateway` consumes the versioned read-only evidence, including exact Decimal provider balance, equity formula provenance, buying power, native account/attempt identity, inventory and explicit uncertainty reasons. Propr `availableBalance` is buying power, **not** trusted Guardian cash. No `equity - unrealized` cash proxy is created. Offset REST pages and WebSocket events do not establish a coherent provider fill cutoff, so Propr returns `RECONCILIATION_UNCERTAIN`, `history_complete=False` and **NO_TRADE** even when the diagnostic inventory reads successfully. The Guardian alone owns SQLite financial state, durable intents and risk authorization. Optional ML4T 0.1.2 remains a separate consumer; no ML4T runtime is imported here. See [native integration notes](docs/NATIVE-CONNECTOR-INTEGRATION.md).
