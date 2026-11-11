@@ -17,6 +17,10 @@ hold financial mutation authority; this release provides zero-capital interfaces
 
 **Sizing policy:** risk-budgeted fixed-k mirroring is the approved default for new design work; leader whole-account NAV is *not* an admission prerequisite for `FIXED_K_NATIVE_QUANTITY`. The signed policy requires an explicit k and complete selected account-position scope, while Guardian still controls follower equity, risk, limits, and execution. Existing `ALLOCATION_OVER_LIVE_NAV` releases retain strict NAV requirements. See [the sizing policy](docs/SIZING-POLICY.md).
 
+## Approved future shared checkpoint policy (not implemented)
+
+[2026-11-11 five-minute source checkpoint / Guardian Execution Lane design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Grill Q1=A. Source checkpoint truth belongs to the canonical source authority; protected account execution remains Guardian-owned. This is a different strategy from current T0+300 and is **not** merged, deployed or trading-authorized. Q2 provider authority and dependent contracts remain unresolved.
+
 ## Official V4 position-source SHADOW integration
 
 The additive, externally authenticated source export, per-transition T+300
