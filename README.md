@@ -19,7 +19,7 @@ hold financial mutation authority; this release provides zero-capital interfaces
 
 ## Approved future shared checkpoint policy (not implemented)
 
-[2026-11-11 five-minute source checkpoint / Guardian Execution Lane design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Grill Q1=A and Q3=A/Q4=A/Q5=A. The source authority owns fresh bounded five-minute samples and complete target-state signals for all source changes; protected account execution and independent intragrid risk protection remain Guardian-owned. This is a different strategy from current T0+300 and is **not** merged, deployed or trading-authorized. Q2 source-provider authority remains open after Vike five-minute snapshot freshness/capture-lag audit.
+[2026-11-11 five-minute source checkpoint / Guardian Execution Lane design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Q1–Q8 (Q2=B). CWSA uses native Hyperliquid REST complete-position checkpoints as the **approved future** source of truth; Vike remains a raw-event/research/comparison transport. Durable checkpoint outcomes are distinct from change signals; missing checkpoints create nonactionable recovery baselines; each changed checkpoint permits at most one Guardian-guarded new-risk attempt, never automatic target chasing. Guardian retains independent financial execution, unknown-outcome and intragrid risk protection. This is a different strategy from current T0+300 and is **not** implemented, merged, deployed, scientifically qualified or trading-authorized.
 
 ## Official V4 position-source SHADOW integration
 

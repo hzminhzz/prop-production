@@ -8,6 +8,11 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Checkpoint observation time**: Source-state evidence known and verified at an actual instant; distinct from scheduled UTC checkpoint identity and an earlier provider state timestamp.
 - **Target-state reconciliation**: Guardian's protected comparison of signed desired source exposure against actual follower holdings, pending reservations and unresolved broker effects; a target is not an instruction to place an order.
 - **Grid-timed source exit**: A leader reduction or close reflected only at an admitted periodic source checkpoint, not a restriction on independently triggered follower-account loss protection.
+- **Canonical checkpoint outcome**: A durable per-source/scope/policy/boundary disposition that remains meaningful even when no new source target-change signal exists.
+- **Recovery baseline**: Complete authenticated leader state first restored after a source continuity gap, not a new-exposure invitation.
+- **Recovery reduction-only reconciliation**: Financially admitted risk decrease toward a separately verified restored source book without authorizing a new increase or position flip.
+- **Target-change signal**: A verified economic change across continuous eligible source checkpoints; distinct from a checkpoint receipt, desired exposure and Guardian financial intent.
+- **Single new-risk opportunity**: One bounded guarded attempt per eligible changed checkpoint and per financial consumer; an unchanged target, replay or incomplete fill is not a second opportunity.
 - **Financial authority**: Protected Guardian ownership of follower financial state, reservations, HALT, permits and broker reconciliation; distinct from research finance.
 - **Domain-owned transition**: A state change whose permitted predecessor, successor and postconditions are verified by the owner of that state.
 - **Financial conservation**: Mutual consistency of cumulative fills, orders, reservations, positions, fees and account/pod financial effects; a journal hash alone does not establish it.
