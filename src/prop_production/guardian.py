@@ -533,6 +533,23 @@ class Guardian:
                     or order.reduce_only != intent["reduce_only"]):
                 errors.append("ORDER_FILL_MISMATCH")
                 continue
+            # A provider terminal label is not independent proof that its
+            # cumulative executions filled the requested signed quantity.
+            # Preserve the reservation and latch new risk on contradiction.
+            if order.status == "FILLED" and order.filled != order.quantity:
+                errors.append("BROKER_FALSE_FILLED_TERMINAL")
+                continue
+            if order.status in {"REJECTED", "NOT_ACCEPTED"} and order.filled != ZERO:
+                errors.append("BROKER_TERMINAL_EXECUTION_CONFLICT")
+                continue
+            if order.status not in {"QUEUED", "ACCEPTED", "PARTIAL", "FILLED",
+                                    "CANCELLED", "EXPIRED", "REJECTED", "NOT_ACCEPTED",
+                                    "UNKNOWN", "DISPATCHING"}:
+                errors.append("BROKER_STATUS_UNKNOWN")
+                continue
+            if order.status == "UNKNOWN":
+                errors.append("BROKER_ORDER_UNKNOWN")
+                continue
             intent.update(status=order.status, broker_id=order.broker_id)
         for key, intent in state["intents"].items():
             if key not in known_orders and intent["status"] not in TERMINAL:

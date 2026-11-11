@@ -125,6 +125,33 @@ def event(
     }
 
 
+def test_independent_sqlite_cursor_writers_are_fenced_before_predecessor_read(tmp_path):
+    """The second process cannot read a stale cursor while writer A holds its lease."""
+    import sqlite3
+
+    first, release, signer = setup(tmp_path)
+    second = V4ShadowProjection(
+        tmp_path / "v4.sqlite",
+        release=release,
+        source_key=signer.public_key(),
+        cutoff_ms=100,
+    )
+    baseline = event(signer, 1, 101, 0, kind="BASELINE")
+    first.con.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            second.ingest(baseline, now_ms=101)
+    finally:
+        first.con.execute("ROLLBACK")
+    assert first.ingest(baseline, now_ms=101) == []
+    assert second.ingest(baseline, now_ms=101) == []
+    assert second.con.execute(
+        "SELECT cursor FROM streams WHERE identity=?", (IDENTITY,)
+    ).fetchone()[0] == 1
+    first.close()
+    second.close()
+
+
 def test_baseline_not_trade_nonresetting_t300_and_duplicate(tmp_path):
     planner, _, key = setup(tmp_path)
     assert planner.ingest(event(key, 1, 101, 0, kind="BASELINE"), now_ms=101) == []

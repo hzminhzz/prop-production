@@ -185,7 +185,23 @@ class V4ShadowProjection:
         return int(self.con.execute("SELECT cutoff_ms FROM config WHERE id=1").fetchone()[0])
 
     def ingest(self, record: dict[str, Any], *, now_ms: int) -> list[dict[str, Any]]:
-        """Atomically record one prospective source event and protective actions."""
+        """Fence concurrent cursor writers before reading the predecessor."""
+        # Signature verification is independent of the SQLite cursor lock.
+        # The owner must re-read cursor/head after acquiring the write lease.
+        self._validate_record(record, now_ms=now_ms)
+        self.con.execute("BEGIN IMMEDIATE")
+        try:
+            actions = self._ingest_locked(record, now_ms=now_ms)
+            if self.con.in_transaction:  # duplicate: no row was written
+                self.con.execute("COMMIT")
+            return actions
+        except BaseException:
+            if self.con.in_transaction:
+                self.con.execute("ROLLBACK")
+            raise
+
+    def _ingest_locked(self, record: dict[str, Any], *, now_ms: int) -> list[dict[str, Any]]:
+        """Apply source cursor and local projected effects under the write lease."""
         proof, book = self._validate_record(record, now_ms=now_ms)
         identity = proof["source_identity"]
         stream = self.con.execute(
@@ -215,7 +231,6 @@ class V4ShadowProjection:
             raise ValueError("V4_EPOCH_CHANGED_WITHOUT_BASELINE")
         state = dict(_quantity_map(book)) if book is not None else {}
         actions: list[dict[str, Any]] = []
-        self.con.execute("BEGIN IMMEDIATE")
         try:
             if kind in {"GAP", "SCOPE", "STOP", "START"}:
                 # No inferred flat and no pending risk through a source gap.
