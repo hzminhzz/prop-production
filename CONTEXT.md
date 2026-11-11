@@ -22,3 +22,8 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Predecessor chain proof**: Authenticated verification that one source occurrence follows the expected previous stream identity, not only that a signer supplied a current chain digest.
 - **Consumer effect identity**: A stable association of one original source event to its uniquely owned downstream finance or paper consequence across crashes and retries.
 - **Missed due opportunity**: An original new-risk deadline reached without verified execution, which cannot be turned into a fresh signal by source replay.
+- **Account-scoped financial HALT**: A latched refusal of new financial exposure on one protected account when its broker/financial evidence is incoherent; it does not imply an unrelated source account has lost continuity.
+- **Recovery signer**: A protected role-scoped authority that authenticates a request to verify one incident's remediation, without establishing that remediation has actually succeeded.
+- **Signed stream-head anchor**: A trusted per-stream proof of selected scope, epoch, cursor, original chain head and prospective cutoff from which successor continuity is checked; not an attestation of all earlier history.
+- **Scoped packet quarantine**: Isolation of a specific invalid source stream inside an otherwise authentic envelope while independently valid streams preserve their accepted progress.
+- **Expired new-risk opportunity**: An entry opportunity whose original due instant and authorized grace have passed without verified attempt; no restart or replay makes it fresh.
