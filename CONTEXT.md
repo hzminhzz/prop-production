@@ -35,3 +35,7 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Resolved-with-quarantine packet**: An authentic packet whose invalid attributable event has an audited quarantine disposition and restored prospective baseline, but was never accepted as original continuous history.
 - **Causal consumer effect receipt**: A durable action/disposition attributable to the original source event and destination decision context, independent of other databases' transaction outcomes.
 - **Economic correction revision**: A separately identified change to future sizing/valuation semantics that preserves old frozen releases and does not itself authorize changed financial risk.
+- **Proof-carrying transition**: A protected state change justified by original authenticated evidence, causal timing, versioned policy and the owning financial authority, not by a valid-looking provider acknowledgment alone.
+- **Owned effect**: A local durable financial or source-projection consequence, rejection or unresolved obligation that no other context may silently create or cancel.
+- **Capability-scoped acceptance**: Verified correctness of one specific operation under its applicable safety and authority prerequisites, not universal approval to deploy or trade.
+- **Nonrewinding rollback**: Returning to compatible code and services while preserving source continuity, financial journals, unknown execution effects, HALT and signer trust floors.
