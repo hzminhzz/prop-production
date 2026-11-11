@@ -26,6 +26,11 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Unknown broker obligation**: A potentially dispatched financial effect that retains conservative exposure and attribution until broker order/execution evidence proves final outcome.
 - **Scoped failure isolation**: A fault prevents new risk only for its causal dependents, subject to shared account/portfolio caps and genuinely shared financial or signing failures.
 - **Capability-specific qualification**: Separate evidence for engineering invariants, native-source operations, prospective follower economics and explicit account-bound trading authorization.
+- **Old-mandate residual exposure**: Outstanding financial positions, reservations or uncertain effects under an earlier signed copy generation, not transferred or erased merely by replacement.
+- **Opportunity expiry**: Original immutable cutoff for admitting new-risk dispatch from one changed source checkpoint, at or before the next grid boundary and its earlier signed deadline.
+- **Cross-zero reversal**: A broker position change from one sign to the other; the new opening component may execute only with independent account and venue proof, otherwise reduce-only is separate.
+- **One effective opening policy**: A destination account/pod permits new exposure from exactly one signed generation even while older and newer signal policies are observed in read-only mode.
+- **Forward-only cutover**: A future-effective signed policy transition that never rewinds protected finance, trusted signing floors, old evidence or broker uncertainty.
 - **Financial authority**: Protected Guardian ownership of follower financial state, reservations, HALT, permits and broker reconciliation; distinct from research finance.
 - **Domain-owned transition**: A state change whose permitted predecessor, successor and postconditions are verified by the owner of that state.
 - **Financial conservation**: Mutual consistency of cumulative fills, orders, reservations, positions, fees and account/pod financial effects; a journal hash alone does not establish it.
