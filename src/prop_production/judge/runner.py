@@ -22,7 +22,11 @@ class Worker:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             close_fds=True, env={"PATH": os.defpath, "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"},
         )
-        self.read()
+        try:
+            self.read()
+        except BaseException:
+            self.close()
+            raise
 
     def read(self) -> dict[str, Any]:
         assert self.process.stdout is not None
