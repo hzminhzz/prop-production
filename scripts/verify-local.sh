@@ -94,7 +94,7 @@ if [[ "$MODE" == "all" ]]; then
     (
         cd "$PROP_RESEARCH_ROOT"
         uv sync --frozen --all-extras --group dev
-        uv run --no-sync pytest -q
+        PYTHONPATH="$PROP_RESEARCH_ROOT" uv run --no-sync pytest -q
         uv run --no-sync ruff check src tests scripts
         uv run --no-sync ruff format --check src tests
         uv build --offline --quiet
