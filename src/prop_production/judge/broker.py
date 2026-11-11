@@ -249,29 +249,31 @@ class FakeBroker:
             )
             for f in self.__truth["fills"]
         )
-        from connectors.execution_capabilities import CapabilityFact, ExecutionCapabilities
 
-        def fact(feature: str, supported: bool = True) -> CapabilityFact:
-            return CapabilityFact(
-                "SYNTHETIC" if supported else "UNKNOWN",
-                digest(["independent-fixture-v1", feature]) if supported else None,
-                "independent-fixture-transport-v1" if supported else None,
-            )
+        def fact(feature: str, supported: bool = True) -> dict[str, Any]:
+            return {
+                "status": "SYNTHETIC" if supported else "UNKNOWN",
+                "evidence_sha": digest(["independent-fixture-v1", feature]) if supported else None,
+                "provenance": "independent-fixture-transport-v1" if supported else None,
+            }
 
+        # The independent fixture emits wire evidence; it imports neither the
+        # optional native SDK nor the Guardian's acceptance implementation.
         capabilities = tuple(
-            ExecutionCapabilities(
-                "native_execution_capabilities_v1",
-                "fixture-account",
-                "fake://broker",
-                market,
-                max(0, now_ms - self.stale_by_ms),
-                now_ms,
-                now_ms + 2000,
-                self.execution_position_mode,
-                fact("net_order"),
-                fact("reduce_only", self.reduce_only_supported),
-                fact("cross_zero", self.cross_zero_supported),
-            ).to_dict()
+            {
+                "schema": "native_execution_capabilities_v1",
+                "account": "fixture-account",
+                "endpoint": "fake://broker",
+                "instrument": market,
+                "observed_at_ms": max(0, now_ms - self.stale_by_ms),
+                "known_at_ms": now_ms,
+                "valid_until_ms": now_ms + 2000,
+                "position_mode": self.execution_position_mode,
+                "net_order": fact("net_order"),
+                "reduce_only": fact("reduce_only", self.reduce_only_supported),
+                "cross_zero": fact("cross_zero", self.cross_zero_supported),
+                "trading_authorized": False,
+            }
             for market in self.__truth["marks"]
         )
         return BrokerSnapshot(

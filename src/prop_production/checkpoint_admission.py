@@ -202,24 +202,19 @@ def _prerequisites(
                 raise ValueError("INDEPENDENT_QUOTE_MARK_MISMATCH")
             if (decimal(q["ask"]) - decimal(q["bid"])) / decimal(q["bid"]) > Decimal("0.01"):
                 raise ValueError("INDEPENDENT_QUOTE_SPREAD")
-        evidence = {
-            "account_binding": snapshot.account_binding,
-            "endpoint": snapshot.endpoint,
-            "observed_at_ms": snapshot.observed_at_ms,
-            "received_at_ms": snapshot.received_at_ms,
-            "epoch": snapshot.epoch,
-            "cash": str(snapshot.cash),
-            "equity": str(snapshot.equity),
-            "positions": observed,
-            "cutoff": snapshot.cutoff,
-            "market_marks": [[m, str(p), t] for m, p, t in snapshot.market_marks],
-            "execution_capabilities": capabilities,
-            "position_basis": {
-                p.market: {"quantity": str(p.quantity), "entry_price": str(p.entry_price)}
-                for p in snapshot.positions
-                if p.quantity
-            },
-        }
+        from .checkpoint_account_proof import capture, validate
+
+        evidence = capture(snapshot)
+        validate(
+            state,
+            evidence,
+            quotes,
+            cfg,
+            needed,
+            now_ms=now_ms,
+            synthetic=guardian.gateway.synthetic,
+            feature=capability_feature,
+        )
     except (ValueError, KeyError, TimeoutError, ConnectionError, OSError) as exc:
         reasons.append(str(exc))
     return reasons, evidence
@@ -915,6 +910,20 @@ def _verify_attempt(
     if attempt["risk"] is None:
         return
     policy, markets = attempt["policy"], attempt["markets"]
+    from .checkpoint_account_proof import validate
+
+    needed = set(previous["positions"]) | {
+        market for pod in attempt["pods"] for market in pod["requested_notionals"]
+    }
+    validate(
+        previous,
+        attempt["account_proof"],
+        attempt["quotes"],
+        effective_policy(previous, policy, markets)["checkpoint_execution"],
+        needed,
+        now_ms=attempt["at_ms"],
+        synthetic=policy["source_mode"] == "SYNTHETIC",
+    )
     mapping = {spec["source_instrument"]: market for market, spec in markets.items()}
     pods, owners = [], set()
     for identity in record["opportunity_ids"]:

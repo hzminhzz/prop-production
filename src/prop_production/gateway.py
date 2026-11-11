@@ -261,16 +261,11 @@ def execution_capability(
     synthetic: bool,
 ) -> bool:
     """Validate the pinned connector evidence contract without granting a permit."""
-    contract = importlib.import_module("connectors.execution_capabilities").ExecutionCapabilities
-    return bool(
-        contract.parse(raw).permits(
-            feature,
-            account=account,
-            endpoint=endpoint,
-            instrument=instrument,
-            now_ms=now_ms,
-            synthetic=synthetic,
-        )
+    from .execution_capabilities import permits
+
+    return permits(
+        raw, feature, account=account, endpoint=endpoint, instrument=instrument,
+        now_ms=now_ms, synthetic=synthetic,
     )
 
 

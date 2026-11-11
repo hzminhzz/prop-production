@@ -4,15 +4,18 @@
   "repositories": {
     "copytrade-pm": {
       "repository": "hzminhzz/copytrade-pm",
-      "commit": "b76365c4a823db4ed4b035329c3c60e946e2203b"
+      "commit": "a18c8c0f7af9851cfec2f9588a92e501331d1fff"
     },
     "trading-connector": {
       "repository": "hzminhzz/trading-connector",
-      "commit": "129697e547e06056e2f6fc977d91d3358077c915"
+      "commit": "ea95f9bf9661bcda41685d6ba939aa349628f8f5"
     }
   },
   "contracts": {
     "portfolio_release": "portfolio_release_v1",
+    "portfolio_release_versions": ["portfolio_release_v1", "portfolio_release_v2"],
+    "checkpoint_source": "cwsa_checkpoint_packet_v3",
+    "copy_mandate": "copy_mandate_v1",
     "propr_evidence": "propr_native_evidence_v1",
     "bybit_evidence": "bybit_demo_snapshot_v1",
     "default_sizing_policy": "FIXED_K_NATIVE_QUANTITY",

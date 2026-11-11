@@ -276,6 +276,9 @@ def validate_attribution(previous: dict[str, Any], current: dict[str, Any], kind
     ):
         raise ValueError("CHECKPOINT_POD_LEDGER_CONSERVATION")
     for execution_id, fill in current.get("fills", {}).items():
-        if current["intents"][fill["intent_id"]].get("checkpoint_policy") == POLICY:
+        intent = current["intents"].get(fill["intent_id"])
+        if intent is None:
+            raise ValueError("GUARDIAN_SEMANTIC_ORPHAN_OR_REBOUND_FILL")
+        if intent.get("checkpoint_policy") == POLICY:
             if execution_id not in current.get("checkpoint_allocations", {}):
                 raise ValueError("CHECKPOINT_FILL_ATTRIBUTION_MISSING")

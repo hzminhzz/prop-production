@@ -64,11 +64,60 @@ def test_checkpoint_sigkill_preserves_one_shot_and_unknown_obligation(tmp_path, 
             assert next(iter(state["intents"].values()))["status"] == "UNKNOWN"
             assert state["halts"]
             assert broker.ledger()
+            final = reconcile_after_crash(tmp_path, journal, broker, 1794442200300)
+            assert final["positions"]
         assert state["runtime"]["permit"] is None
         journal.verify()
     finally:
         journal.close()
         broker.close()
+
+
+def reconcile_after_crash(root, journal, broker, now):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    from prop_production.finance import Rulebook
+    from prop_production.guardian import Guardian
+    from prop_production.release import ReleaseFloor, ReleaseVerifier
+
+    state = journal.snapshot()
+    retained = state["checkpoint_release"]
+    authority = Ed25519PublicKey.from_public_bytes(bytes.fromhex(retained["authority_public"]))
+    raw = retained["envelope"]["payload"]
+    verified = ReleaseVerifier(
+        authority,
+        retained["envelope"]["authority"],
+        state["account_binding"],
+        raw["risk_policy_sha"],
+        raw["rulebook_sha"],
+    ).verify(retained["envelope"], now_ms=now)
+    contract = next(iter(state["copy_mandates"].values()))["risk_contract"]
+    floor = ReleaseFloor(Path(root) / "floor.sqlite3")
+    try:
+        guardian = Guardian(
+            journal,
+            verified,
+            floor,
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(state["checkpoint_source_public"])),
+            Rulebook.synthetic(),
+            contract["policy"],
+            contract["markets"],
+            broker,
+            mandate_key=authority,
+        )
+        audit = broker.audit()
+        guardian.reconcile(now)
+        final = journal.snapshot()
+        assert broker.audit() == audit
+        assert final["halts"] == state["halts"]
+        assert not final["reservations"]
+        assert all(row["status"] == "FILLED" for row in final["intents"].values())
+        assert final["finance"]["cash"] == str(broker.observe(now).cash)
+        assert final["runtime"]["permit"] is None
+        journal.verify()
+        return final
+    finally:
+        floor.close()
 
 
 def reversal_crash(root, point):
@@ -124,6 +173,9 @@ def test_reversal_sigkill_retains_original_owner_basis_and_unknown(tmp_path, poi
             assert state["halts"]
             assert len(broker.audit()) == 2
             assert Decimal(broker.observe(1794442800200).positions[0].quantity) == Decimal("-0.05")
+            final = reconcile_after_crash(tmp_path, journal, broker, 1794442800300)
+            assert Decimal(final["positions"]["BTC"]) == Decimal("-0.05")
+            assert Decimal(final["checkpoint_basis"]["BTC"]["entry_price"]) == Decimal("9970")
         else:
             assert len(state["intents"]) == 1
             assert not state["reservations"]

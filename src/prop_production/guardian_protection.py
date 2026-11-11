@@ -85,6 +85,11 @@ def derive(state: dict[str, Any], record: dict[str, Any]) -> tuple[dict[str, Any
     cfg = policy["checkpoint_execution"]
     market = body["market"]
     _validate(markets, policy, {market}, at_ms)
+    from .checkpoint_account_proof import validate
+
+    validate(
+        state, proof, quotes, cfg, {market}, now_ms=at_ms, synthetic=True, feature="reduce_only"
+    )
     if state["account_binding"] != "fixture-account" or proof["endpoint"] != "fake://broker":
         raise ValueError("PROTECTIVE_SYNTHETIC_SCOPE")
     old, quantity = decimal(state["positions"].get(market, "0")), decimal(body["quantity"])

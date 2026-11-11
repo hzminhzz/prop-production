@@ -749,7 +749,7 @@ dev = [
 requires-dist = [
     { name = "ccxt", marker = "extra == 'connector'", specifier = "==4.5.74" },
     { name = "cryptography", specifier = ">=50.0.2,<51" },
-    { name = "trading-connector-library", marker = "extra == 'connector'", git = "https://github.com/hzminhzz/trading-connector.git?rev=129697e547e06056e2f6fc977d91d3358077c915" },
+    { name = "trading-connector-library", marker = "extra == 'connector'", git = "https://github.com/hzminhzz/trading-connector.git?rev=ea95f9bf9661bcda41685d6ba939aa349628f8f5" },
 ]
 provides-extras = ["connector"]
 
@@ -915,7 +915,7 @@ wheels = [
 [[package]]
 name = "trading-connector-library"
 version = "0.1.0"
-source = { git = "https://github.com/hzminhzz/trading-connector.git?rev=129697e547e06056e2f6fc977d91d3358077c915#129697e547e06056e2f6fc977d91d3358077c915" }
+source = { git = "https://github.com/hzminhzz/trading-connector.git?rev=ea95f9bf9661bcda41685d6ba939aa349628f8f5#ea95f9bf9661bcda41685d6ba939aa349628f8f5" }
 dependencies = [
     { name = "httpx" },
     { name = "requests" },
