@@ -165,6 +165,7 @@ class SourcePacketReceiver:
         source_key: Ed25519PublicKey,
         wire_version: int = 1,
         quarantine_key: Ed25519PublicKey | None = None,
+        checkpoint_pins: dict[str, Any] | None = None,
     ):
         if (
             quarantine_key is not None
@@ -172,7 +173,7 @@ class SourcePacketReceiver:
         ):
             raise ValueError("V4_QUARANTINE_AUTHORITY_NOT_SEPARATE")
         self.quarantine_key = quarantine_key
-        if wire_version not in (1, 2):
+        if wire_version not in (1, 2, 3):
             raise ValueError("V4_RECEIVER_WIRE_VERSION_INVALID")
         from .compatibility import load_manifest
 
@@ -184,6 +185,16 @@ class SourcePacketReceiver:
         self.source_key = source_key
         self.wire_version = wire_version
         self.projector: V4ShadowProjection | None = None
+        from .checkpoint_source import CheckpointProjection
+
+        self.checkpoint: CheckpointProjection | None = None
+        if wire_version == 3:
+            if checkpoint_pins is None:
+                raise ValueError("CWSA_EXTERNAL_POLICY_PINS_REQUIRED")
+            self.checkpoint = CheckpointProjection(
+                path, release_sha=release.release_sha, source_key=source_key, pins=checkpoint_pins
+            )
+            return
         if path.exists():
             with closing(sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)) as db:
                 existing = db.execute("SELECT cutoff_ms FROM config WHERE id=1").fetchone()
@@ -319,6 +330,8 @@ class SourcePacketReceiver:
             )
 
     def ingest(self, raw: bytes, *, now_ms: int) -> dict[str, Any]:
+        if self.checkpoint is not None:
+            return self.checkpoint.ingest(raw, now_ms=now_ms)
         members = {m["source_identity"] for m in self.release.payload["members"]}
         packet, selected, heads = _validated_batch(raw, self.source_key, members)
         incoming_wire = 2 if packet["schema"] == "v4_signed_source_export_v2" else 1
@@ -590,7 +603,19 @@ class SourcePacketReceiver:
             return []
         return self.projector.due(now_ms)
 
+    def checkpoint_status(self) -> dict[str, Any]:
+        if self.checkpoint is None:
+            raise ValueError("CWSA_RECEIVER_VERSION_REQUIRED")
+        return self.checkpoint.status()
+
+    def checkpoint_outcomes(self, *, now_ms: int) -> list[dict[str, Any]]:
+        if self.checkpoint is None:
+            raise ValueError("CWSA_RECEIVER_VERSION_REQUIRED")
+        return self.checkpoint.outcomes(now_ms=now_ms)
+
     def close(self) -> None:
+        if self.checkpoint is not None:
+            self.checkpoint.close()
         if self.projector is not None:
             self.projector.close()
 
@@ -603,6 +628,7 @@ def consume_once(
     source_key: Ed25519PublicKey,
     now_ms: int,
     wire_version: int = 1,
+    checkpoint_pins: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not inbox.is_dir() or inbox.is_symlink() or inbox.stat().st_mode & 0o077:
         raise ValueError("V4_PROTECTED_INBOX_INVALID")
@@ -611,6 +637,7 @@ def consume_once(
         release=release,
         source_key=source_key,
         wire_version=wire_version,
+        checkpoint_pins=checkpoint_pins,
     )
     count, scanned = 0, 0
     try:
@@ -624,6 +651,20 @@ def consume_once(
             count += result["events"]
             scanned += 1
         due = receiver.due(now_ms=now_ms)
+        if wire_version == 3:
+            return {
+                "schema": "cwsa_protected_source_status_v3",
+                "state": "SHADOW_SOURCE_ONLY_NO_ORDER_ROUTE",
+                "processed_source_events": count,
+                "packet_files_checked": scanned,
+                "checkpoint_status": receiver.checkpoint_status(),
+                "opening_candidates": sum(
+                    item["opening_candidate"]
+                    for item in receiver.checkpoint_outcomes(now_ms=now_ms)
+                ),
+                "order_route": "NONE",
+                "trading_authorized": False,
+            }
         return {
             "schema": "v4_protected_source_status_v1",
             "state": "SHADOW_SOURCE_ONLY_NO_ORDER_ROUTE",
@@ -650,6 +691,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--account-binding", required=True)
     parser.add_argument("--risk-policy-sha", required=True)
     parser.add_argument("--rulebook-sha", required=True)
+    parser.add_argument("--wire-version", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--checkpoint-pins", type=Path)
     args = parser.parse_args(argv)
     try:
         now_ms = time.time_ns() // 1_000_000
@@ -671,6 +714,10 @@ def main(argv: list[str] | None = None) -> int:
                 release=verified,
                 source_key=source,
                 now_ms=now_ms,
+                wire_version=args.wire_version,
+                checkpoint_pins=(
+                    load_json(_read_pinned(args.checkpoint_pins)) if args.checkpoint_pins else None
+                ),
             )
         print(json.dumps(result, sort_keys=True))
         return 0

@@ -28,7 +28,7 @@ def load_manifest() -> dict[str, Any]:
             or contracts["default_sizing_policy"] != "FIXED_K_NATIVE_QUANTITY"
             or contracts["legacy_sizing_policy"] != "ALLOCATION_OVER_LIVE_NAV"
             or contracts["execution_mode"] != "SHADOW"
-            or contracts.get("source_wire_versions") != [1, 2]
+            or contracts.get("source_wire_versions") != [1, 2, 3]
             or contracts.get("active_source_wire") != 1
             or contracts["trading_authorized"] is not False):
         raise ValueError("COMPATIBILITY_CONTRACT")

@@ -18,7 +18,7 @@
     "default_sizing_policy": "FIXED_K_NATIVE_QUANTITY",
     "legacy_sizing_policy": "ALLOCATION_OVER_LIVE_NAV",
     "execution_mode": "SHADOW",
-    "source_wire_versions": [1, 2],
+    "source_wire_versions": [1, 2, 3],
     "active_source_wire": 1,
     "trading_authorized": false
   },
