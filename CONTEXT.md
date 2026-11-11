@@ -13,6 +13,13 @@ Canonical business meanings. Not an implementation plan or authorization.
 - **Recovery reduction-only reconciliation**: Financially admitted risk decrease toward a separately verified restored source book without authorizing a new increase or position flip.
 - **Target-change signal**: A verified economic change across continuous eligible source checkpoints; distinct from a checkpoint receipt, desired exposure and Guardian financial intent.
 - **Single new-risk opportunity**: One bounded guarded attempt per eligible changed checkpoint and per financial consumer; an unchanged target, replay or incomplete fill is not a second opportunity.
+- **Copy mandate**: A signed, account-bound leader-to-follower relationship with frozen sizing, allowed markets, activation and risk policy; separate from the common source signal and from broker authority.
+- **Activation baseline**: First admissible source state after a new relationship or material revision, establishing prospective reference but no immediate copy-current entry.
+- **Full-target follow-on increase**: A new eligible source increase that permits one fresh risk-checked attempt toward the current full target even if a prior opening was missed; not a retry of an uncertain previous order.
+- **Pre-dispatch re-evaluation**: Bounded repeat of admission checks on one unexpired opportunity, provably before any broker side effect could have happened.
+- **Mandate pause**: Termination of permission to open new follower exposure while existing positions, unknown orders and protective responsibilities persist.
+- **Netted follower order**: A broker order representing eligible changes across independently risk-owned pods, with separately conserved attribution.
+- **Explicit financial flatten**: An independently authorized protected account action to close existing exposure, never implied by disabling a copy relationship.
 - **Financial authority**: Protected Guardian ownership of follower financial state, reservations, HALT, permits and broker reconciliation; distinct from research finance.
 - **Domain-owned transition**: A state change whose permitted predecessor, successor and postconditions are verified by the owner of that state.
 - **Financial conservation**: Mutual consistency of cumulative fills, orders, reservations, positions, fees and account/pod financial effects; a journal hash alone does not establish it.
