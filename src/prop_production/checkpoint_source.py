@@ -333,6 +333,19 @@ class CheckpointProjection:
             )
         return result
 
+    def packet_for(self, outcome_id: str) -> dict[str, Any]:
+        """Return the original signed envelope proving a committed source outcome."""
+        assert self.con is not None
+        require_sha(outcome_id)
+        for (raw,) in self.con.execute("SELECT payload FROM cwsa_receiver_packets ORDER BY rowid"):
+            envelope = load_json(raw)
+            if any(
+                t["effect"] is not None and t["effect"]["outcome_id"] == outcome_id
+                for t in envelope["payload"]["transitions"]
+            ):
+                return dict(envelope)
+        raise ValueError("CWSA_OUTCOME_PROOF_MISSING")
+
     def close(self) -> None:
         if self.con is not None:
             self.con.close()

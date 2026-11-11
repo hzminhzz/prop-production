@@ -22,6 +22,13 @@ from prop_production.v4_source_receiver import SourcePacketReceiver
 def system(tmp_path):
     authority = Ed25519PrivateKey.generate()
     rules, policy, markets = Rulebook.synthetic(), fixture_policy(), fixture_markets()
+    policy["checkpoint_execution"] = {
+        "quote_max_age_ms": 2000,
+        "account_max_age_ms": 2000,
+        "max_gross_notional": "20000",
+    }
+    markets["BTC"]["qty_step"] = "0.00001"
+    markets["BTC"]["min_qty"] = "0.00001"
     markets["BTC"]["source_instrument"] = "hyperliquid/mainnet:perp:default/BTC"
     markets["ETH"]["source_instrument"] = "hyperliquid/mainnet:perp:default/ETH"
     body = release_body(authority)

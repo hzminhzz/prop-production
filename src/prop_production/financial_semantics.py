@@ -56,6 +56,9 @@ def validate_transition(
     from .guardian_checkpoints import validate_mandate_history
 
     validate_mandate_history(previous, current, kind)
+    from .checkpoint_admission import validate_history
+
+    validate_history(previous, current, kind)
     if current.get("_semantic_contract") != CONTRACT:
         raise ValueError("GUARDIAN_SEMANTIC_CONTRACT_NOT_V2")
     if previous and previous.get("_semantic_contract") != CONTRACT:

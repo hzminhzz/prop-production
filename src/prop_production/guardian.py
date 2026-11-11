@@ -117,6 +117,35 @@ class Guardian:
 
         return baseline_mandate(self, owner, receiver, now_ms=now_ms)
 
+    def review_checkpoints(
+        self,
+        receiver: SourcePacketReceiver,
+        requests: dict[str, str],
+        *,
+        quotes: dict[str, Any],
+        now_ms: int,
+        quote_envelope: dict[str, Any] | None = None,
+        quote_key: Ed25519PublicKey | None = None,
+    ) -> dict[str, Any]:
+        from .checkpoint_admission import review
+
+        return review(
+            self,
+            receiver,
+            requests,
+            quotes=quotes,
+            now_ms=now_ms,
+            quote_envelope=quote_envelope,
+            quote_key=quote_key,
+        )
+
+    def reserve_checkpoint(
+        self, decision_id: str, *, receiver: SourcePacketReceiver, now_ms: int
+    ) -> list[str]:
+        from .checkpoint_admission import reserve
+
+        return reserve(self, decision_id, receiver=receiver, now_ms=now_ms)
+
     def recover_authenticated(self, signed_request: dict[str, Any], now_ms: int) -> int:
         """Trusted protected signer + independently fetched coherent broker state."""
         if self.recovery_key is None:
@@ -585,9 +614,15 @@ class Guardian:
             or intent["boot_epoch"] != state["runtime"]["boot_epoch"]
             or intent["broker_epoch"] != state["runtime"]["broker_epoch"]
             or permit["decision_id"] != intent["decision_id"]
-            or now_ms > intent["expires_at_ms"]
+            or (
+                now_ms >= intent["expires_at_ms"]
+                if intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3"
+                else now_ms > intent["expires_at_ms"]
+            )
             or state["runtime"]["certainty"] != "COHERENT"
-            or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000
+            or not 0
+            <= now_ms - state["runtime"]["last_snapshot_ms"]
+            <= intent.get("account_max_age_ms", 5000)
         ):
             raise ValueError("DISPATCH_NOT_PERMITTED")
         self.journal.update(
