@@ -117,6 +117,9 @@ class Journal:
         self._state: State = {}
         self._seq = 0
         self._head = ZERO
+        # In-process commit capability, granted only after an independent
+        # authenticated recovery request and broker proof have both passed.
+        self._verified_recovery_commit: tuple[str, str, str, int] | None = None
         try:
             if path.is_symlink() or not path.parent.is_dir() or not account_binding:
                 raise ValueError("UNSAFE_JOURNAL_PATH")
@@ -194,6 +197,15 @@ class Journal:
             raise StorageUnavailable("HALT_STORAGE")
         if state["account_binding"] != self._state["account_binding"]:
             raise ValueError("ACCOUNT_MISMATCH")
+        if kind.startswith("RECOVER_AUTH_"):
+            recovery = state.get("runtime", {}).get("last_recovery", {})
+            if self._verified_recovery_commit != (
+                kind,
+                recovery.get("request_sha"),
+                recovery.get("remediation_sha"),
+                expected_sequence,
+            ):
+                raise ValueError("GUARDIAN_SEMANTIC_UNAUTHORIZED_HALT_CLEARANCE")
         new_state = copy.deepcopy(state)
         sequence = self._seq + 1
         new_state["sequence"] = sequence
@@ -413,12 +425,22 @@ class Journal:
             "at_ms": now_ms,
             "remaining_halts": list(next_state["halts"]),
         }
-        return self.commit(
-            "RECOVER_AUTH_" + reason,
-            now_ms,
-            next_state,
-            expected_sequence=self._seq,
+        recovery_kind = "RECOVER_AUTH_" + reason
+        self._verified_recovery_commit = (
+            recovery_kind,
+            evidence_digest(request),
+            proof_sha,
+            self._seq,
         )
+        try:
+            return self.commit(
+                recovery_kind,
+                now_ms,
+                next_state,
+                expected_sequence=self._seq,
+            )
+        finally:
+            self._verified_recovery_commit = None
 
     def append_semantic_checkpoint(
         self,

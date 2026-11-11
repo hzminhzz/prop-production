@@ -144,6 +144,52 @@ def validate_transition(
         ):
             raise ValueError("GUARDIAN_SEMANTIC_RESERVATION_IDENTITY_INVALID")
     if previous and previous.get("_semantic_contract") == CONTRACT:
+        removed_halts = set(previous["halts"]) - set(halts)
+        if removed_halts or kind.startswith(("RECOVER_AUTH_", "RECOVER_")):
+            allowed = False
+            if len(removed_halts) == 1 and not (set(halts) - set(previous["halts"])):
+                reason = next(iter(removed_halts))
+                expected_state = "HALTED" if halts else "DISARMED"
+                basic = (
+                    runtime["state"] == expected_state
+                    and runtime.get("permit") is None
+                    and runtime["boot_epoch"] == previous["runtime"]["boot_epoch"] + 1
+                    and isinstance(runtime.get("last_recovery"), dict)
+                    and runtime["last_recovery"].get("reason") == reason
+                    and runtime["last_recovery"].get("remaining_halts") == halts
+                )
+                if kind == "RECOVER_" + reason and previous["account_binding"] == "fixture-account":
+                    allowed = basic
+                elif kind == "RECOVER_AUTH_" + reason:
+                    recovery = runtime["last_recovery"]
+                    before_nonces = previous.get("recovery_nonces", {})
+                    after_nonces = current.get("recovery_nonces", {})
+                    new_nonces = (
+                        set(after_nonces) - set(before_nonces)
+                        if isinstance(after_nonces, dict) and isinstance(before_nonces, dict)
+                        else set()
+                    )
+                    allowed = (
+                        basic
+                        and runtime["broker_epoch"] == previous["runtime"]["broker_epoch"] + 1
+                        and recovery.get("recovery_state") == "RECOVERY_VERIFIED"
+                        and recovery.get("account_binding") == current["account_binding"]
+                        and len(new_nonces) == 1
+                        and all(
+                            isinstance(recovery.get(field), str) and len(recovery[field]) == 64
+                            for field in ("request_sha", "remediation_sha", "recovery_key_sha")
+                        )
+                        and any(
+                            after_nonces[nonce].get("request_sha") == recovery["request_sha"]
+                            and after_nonces[nonce].get("remediation_sha")
+                            == recovery["remediation_sha"]
+                            and after_nonces[nonce].get("head_at_request") == previous_head
+                            for nonce in new_nonces
+                            if isinstance(after_nonces[nonce], dict)
+                        )
+                    )
+            if not allowed:
+                raise ValueError("GUARDIAN_SEMANTIC_UNAUTHORIZED_HALT_CLEARANCE")
         if not set(previous["fills"]).issubset(fills):
             raise ValueError("GUARDIAN_SEMANTIC_FILL_HISTORY_REMOVED")
         if any(previous["fills"][key] != fills[key] for key in previous["fills"]):

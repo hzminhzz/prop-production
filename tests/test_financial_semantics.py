@@ -67,6 +67,19 @@ def test_illegal_semantics_fails_before_financial_commit(tmp_path):
         assert journal.verify()["semantic_status"] == "VERIFIED_V2"
 
 
+@pytest.mark.parametrize("kind", ["RECONCILE", "RECOVER_AUTH_MANUAL"])
+def test_protected_halt_cannot_be_cleared_by_generic_or_forged_journal_commit(tmp_path, kind):
+    """A valid journal SHA must not convert an ordinary update into recovery."""
+    with Journal(tmp_path / "protected.sqlite", "protected-account", initialize=True) as journal:
+        journal.halt("MANUAL", 100)
+        sequence, head = journal.sequence, journal.head
+        with pytest.raises(ValueError, match="GUARDIAN_SEMANTIC_UNAUTHORIZED_HALT_CLEARANCE"):
+            journal.update(kind, 101, lambda state: state["halts"].clear())
+        assert journal.snapshot()["halts"] == ["MANUAL"]
+        assert (journal.sequence, journal.head) == (sequence, head)
+        assert journal.verify()["integrity"] == "VERIFIED"
+
+
 def insert_legacy_genesis(path):
     # Controlled fixture: old hash-chained bytes exactly as a v1 deployment
     # would have written, not a migration that rewrites real financial history.
