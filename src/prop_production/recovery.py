@@ -17,6 +17,7 @@ _TERMINAL = frozenset({"FILLED", "CANCELLED", "EXPIRED", "REJECTED", "NOT_ACCEPT
 _REMEDIABLE = frozenset(
     {
         "BROKER_UNREACHABLE",
+        "RELEASE_CHANGED_REQUIRES_REVIEW",
         "UNKNOWN_OUTCOME",
         "RECONCILIATION_UNCERTAIN",
         "BROKER_CLOCK_REGRESSION",
@@ -90,6 +91,26 @@ def require_real_remediation(
     """External conservation oracle: no Guardian risk calculation is reused."""
     if reason not in _REMEDIABLE:
         raise ValueError("RECOVERY_REASON_HAS_NO_VERIFIED_REMEDIATION_POLICY")
+    if reason == "RELEASE_CHANGED_REQUIRES_REVIEW":
+        from .copy_mandates import CopyMandate
+        from .guardian_checkpoints import validate_release_binding
+
+        validate_release_binding(state, state, "RECOVERY_REVIEW")
+        binding = state.get("checkpoint_release")
+        if binding is None:
+            raise ValueError("RECOVERY_CHECKPOINT_RELEASE_UNPROVEN")
+        active = {CopyMandate.parse(m).owner: m for m in binding["envelope"]["payload"]["mandates"]}
+        records = state.get("copy_mandates", {})
+        if any(
+            owner not in records
+            or records[owner]["mandate"] != m
+            or records[owner]["state"]["phase"] == "AWAITING_BASELINE"
+            for owner, m in active.items()
+        ) or any(
+            owner not in active and entry["state"]["phase"] in {"ACTIVE", "AWAITING_BASELINE"}
+            for owner, entry in records.items()
+        ):
+            raise ValueError("RECOVERY_MANDATE_SUCCESSION_UNPROVEN")
     if snapshot.account_binding != state["account_binding"]:
         raise ValueError("RECOVERY_BROKER_ACCOUNT_MISMATCH")
     if not snapshot.ready(now_ms, 5000):

@@ -8,7 +8,10 @@ import sqlite3
 from collections.abc import Mapping
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .release import VerifiedRelease
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -73,6 +76,49 @@ def validate_pins(pins: dict[str, Any]) -> None:
             raise ValueError("CWSA_PINNED_DEX_SCOPE")
 
 
+def verified_outcome(
+    envelope: dict[str, Any],
+    key: Ed25519PublicKey,
+    scope: dict[str, Any],
+    policy: dict[str, Any],
+    outcome_id: str,
+) -> dict[str, Any]:
+    """Reproduce an outcome from its signed packet and original native bodies."""
+    body = verify(envelope, key, AUTHORITY)
+    fields(
+        body,
+        {
+            "schema",
+            "scope",
+            "policy",
+            "transitions",
+            "originals",
+            "issued_ms",
+            "trading_authorized",
+        },
+    )
+    if (
+        body["schema"] != "cwsa_checkpoint_packet_v3"
+        or body["scope"] != scope
+        or body["policy"] != policy
+        or body["trading_authorized"] is not False
+    ):
+        raise ValueError("CWSA_OUTCOME_SCOPE")
+    if not isinstance(body["originals"], dict) or any(
+        not isinstance(raw, str) or sha256(raw.encode()).hexdigest() != raw_sha
+        for raw_sha, raw in body["originals"].items()
+    ):
+        raise ValueError("CWSA_OUTCOME_ORIGINAL_HASH")
+    selected = []
+    for event in body["transitions"]:
+        verify_transition(scope, policy, event, body["originals"], issued_ms=body["issued_ms"])
+        if event["effect"] is not None and event["effect"]["outcome_id"] == outcome_id:
+            selected.append(event["effect"])
+    if len(selected) != 1:
+        raise ValueError("CWSA_OUTCOME_NOT_UNIQUE")
+    return dict(selected[0])
+
+
 class CheckpointProjection:
     """Private source evidence only. No Guardian journal, permit or broker access."""
 
@@ -83,11 +129,13 @@ class CheckpointProjection:
         release_sha: str,
         source_key: Ed25519PublicKey,
         pins: dict[str, Any],
+        release: VerifiedRelease | None = None,
     ) -> None:
         fields(pins, {"policy", "scopes"})
         validate_pins(pins)
         self.pins = dict(load_json(canonical(pins)))
         self.key = source_key
+        self.release = release
         self.path = path
         self.lock: int | None = None
         self.con: sqlite3.Connection | None = None
@@ -116,6 +164,7 @@ class CheckpointProjection:
                 " payload TEXT NOT NULL,sha TEXT NOT NULL,PRIMARY KEY(source_id,seq));"
                 "CREATE TABLE IF NOT EXISTS cwsa_receiver_packets(sha TEXT PRIMARY KEY,"
                 " payload TEXT NOT NULL,received_ms INTEGER NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS cwsa_release_transitions(seq INTEGER PRIMARY KEY,payload TEXT NOT NULL);"
             )
             binding = digest(
                 {
@@ -127,8 +176,8 @@ class CheckpointProjection:
             row = self.con.execute("SELECT binding FROM cwsa_receiver_meta WHERE id=1").fetchone()
             if row is None:
                 self.con.execute("INSERT INTO cwsa_receiver_meta VALUES(1,?)", (binding,))
-            elif row[0] != binding:
-                raise ValueError("CWSA_RECEIVER_TRUST_DRIFT")
+            else:
+                self._verify_release_bindings(row[0], binding)
             os.chmod(path, 0o600)
             if self.con.execute("PRAGMA integrity_check").fetchone() != ("ok",):
                 raise ValueError("CWSA_RECEIVER_CORRUPT")
@@ -136,6 +185,59 @@ class CheckpointProjection:
         except BaseException:
             self.close()
             raise
+
+    def _verify_release_bindings(self, genesis: str, expected: str) -> None:
+        from .checkpoint_release_binding import replay
+
+        assert self.con is not None
+        previous, state, count = genesis, None, 0
+        for sequence, raw in self.con.execute(
+            "SELECT seq,payload FROM cwsa_release_transitions ORDER BY seq"
+        ):
+            if self.release is None or self.release.payload["schema"] != "portfolio_release_v2":
+                raise ValueError("CWSA_RELEASE_REBIND_CONTEXT")
+            record = replay(
+                load_json(raw),
+                authority_sha=self.release.payload["mandate_authority_sha"],
+                source_key=self.key,
+            )
+            if (
+                sequence != count + 1
+                or record["predecessor"]["binding_sha"] != previous
+                or (state is not None and record["predecessor"] != state)
+            ):
+                raise ValueError("CWSA_RELEASE_REBIND_CHAIN")
+            state = record["successor"]
+            previous, count = state["binding_sha"], sequence
+        if previous != expected:
+            raise ValueError("CWSA_RECEIVER_TRUST_DRIFT")
+
+    def rebind(self, release: VerifiedRelease, key: Ed25519PublicKey, *, now_ms: int) -> None:
+        from .checkpoint_release_binding import binding_sha, transition
+
+        assert self.con is not None
+        if self.release is None:
+            raise ValueError("CWSA_RELEASE_REBIND_CONTEXT")
+        if release.release_sha == self.release.release_sha:
+            return
+        record = transition(self.release, release, key, self.key, at_ms=now_ms).data
+        expected = binding_sha(self.release.release_sha, self.pins, self.key)
+        self.con.execute("BEGIN IMMEDIATE")
+        try:
+            genesis = self.con.execute(
+                "SELECT binding FROM cwsa_receiver_meta WHERE id=1"
+            ).fetchone()[0]
+            self._verify_release_bindings(genesis, expected)
+            count = self.con.execute("SELECT COUNT(*) FROM cwsa_release_transitions").fetchone()[0]
+            self.con.execute(
+                "INSERT INTO cwsa_release_transitions VALUES(?,?)",
+                (count + 1, canonical(record).decode()),
+            )
+            self.con.execute("COMMIT")
+        except BaseException:
+            self.con.execute("ROLLBACK")
+            raise
+        self.release = release
 
     def _verify_heads(self) -> None:
         assert self.con is not None

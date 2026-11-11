@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .checkpoint_source import fields, integer
+from .checkpoint_source import fields, integer, verified_outcome
 from .copy_mandates import CopyMandate, MandateEvent, MandateState, transition_mandate
 from .evidence import canonical, digest, load_json, require_sha, verify
 
@@ -92,6 +92,8 @@ def activate_mandate(
         "authority_public": key.public_bytes_raw().hex(),
         "release_envelope": load_json(signed_release),
         "release_sha": guardian.release.release_sha,
+        "source_public": guardian.source_key.public_bytes_raw().hex(),
+        "risk_contract": {"policy": guardian.policy, "markets": guardian.markets},
         "state": transition.successor.data,
         "history": [transition.data],
         "control_envelopes": {},
@@ -210,12 +212,67 @@ def baseline_mandate(
         row["state"] = transition.successor.data
         row["history"].append(transition.data)
         row["baseline_proof"] = proof
+        assert receiver.checkpoint is not None
+        row["baseline_envelope"] = receiver.checkpoint.packet_for(proof["outcome"]["outcome_id"])
 
     guardian.journal.update("COPY_MANDATE_BASELINE", now_ms, commit)
     return transition.successor
 
 
+def validate_release_binding(previous: dict[str, Any], current: dict[str, Any], kind: str) -> None:
+    old, new = previous.get("checkpoint_release"), current.get("checkpoint_release")
+    if old is not None and new is None:
+        raise ValueError("MANDATE_RELEASE_BINDING_REMOVED")
+    if new is None:
+        return
+    key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(new["authority_public"]))
+    body = verify(new["envelope"], key, new["envelope"]["authority"])
+    if (
+        body["schema"] != "portfolio_release_v2"
+        or body["account_binding"] != current["account_binding"]
+        or digest(body) != current.get("active_release_sha")
+        or body["mandate_authority_sha"] != sha256(key.public_bytes_raw()).hexdigest()
+    ):
+        raise ValueError("MANDATE_RELEASE_BINDING_PROOF")
+    if new != old:
+        if kind != "BIND_RELEASE_DISARMED" or current["runtime"]["permit"] is not None:
+            raise ValueError("MANDATE_RELEASE_BINDING_TRANSITION")
+        if old is not None:
+            before = verify(old["envelope"], key, old["envelope"]["authority"])
+            if (
+                old["authority_public"] != new["authority_public"]
+                or body["generation"] <= before["generation"]
+                or body["checkpoint_policy"] != before["checkpoint_policy"]
+                or body["checkpoint_scopes"] != before["checkpoint_scopes"]
+                or "RELEASE_CHANGED_REQUIRES_REVIEW" not in current["halts"]
+            ):
+                raise ValueError("MANDATE_RELEASE_FORWARD_TRUST")
+        if any(
+            previous.get(k) != current.get(k)
+            for k in (
+                "finance",
+                "positions",
+                "pod_positions",
+                "fills",
+                "intents",
+                "reservations",
+                "pod_fees_paid",
+                "pod_realized",
+                "pod_loss_used",
+                "checkpoint_basis",
+            )
+        ):
+            raise ValueError("MANDATE_RELEASE_MUTATED_OBLIGATIONS")
+
+
 def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], kind: str) -> None:
+    validate_release_binding(previous, current, kind)
+    public = current.get("checkpoint_source_public")
+    if previous.get("checkpoint_source_public") is not None:
+        if public != previous["checkpoint_source_public"]:
+            raise ValueError("MANDATE_SOURCE_AUTHORITY_REWRITTEN")
+    elif public is not None and kind != "BIND_RELEASE_DISARMED":
+        raise ValueError("MANDATE_SOURCE_AUTHORITY_UNBOUND")
     old, new = previous.get("copy_mandates", {}), current.get("copy_mandates", {})
     if not set(old).issubset(new):
         raise ValueError("MANDATE_HISTORY_REMOVED")
@@ -230,9 +287,15 @@ def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], 
                 "authority_public",
                 "release_envelope",
                 "release_sha",
+                "source_public",
+                "risk_contract",
             ):
                 if old[owner][field] != entry[field]:
                     raise ValueError("MANDATE_IMMUTABLE_GENERATION_REWRITTEN")
+            if old[owner].get("baseline_proof") is not None and any(
+                old[owner].get(k) != entry.get(k) for k in ("baseline_proof", "baseline_envelope")
+            ):
+                raise ValueError("MANDATE_BASELINE_REWRITTEN")
             if entry["history"][: len(old[owner]["history"])] != old[owner]["history"]:
                 raise ValueError("MANDATE_TRANSITIONS_REWRITTEN")
         key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(entry["authority_public"]))
@@ -243,8 +306,20 @@ def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], 
             digest(release) != entry["release_sha"]
             or release["mandate_authority_sha"] != sha256(key.public_bytes_raw()).hexdigest()
             or mandate.data not in release["mandates"]
+            or entry["source_public"] != public
+            or digest(entry["risk_contract"]) != mandate.data["risk_policy_sha"]
         ):
             raise ValueError("MANDATE_RELEASE_BINDING")
+        if owner not in old and (
+            kind != "COPY_MANDATE_ACTIVATE"
+            or entry["release_sha"] != current.get("active_release_sha")
+            or any(
+                prior["mandate"]["mandate_id"] == mandate.data["mandate_id"]
+                and prior["mandate"]["generation"] >= mandate.data["generation"]
+                for prior in old.values()
+            )
+        ):
+            raise ValueError("MANDATE_ACTIVATION_RELEASE_OR_GENERATION")
         before = MandateState.initial(mandate)
         for transition in entry["history"]:
             expected = transition_mandate(
@@ -257,6 +332,22 @@ def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], 
             )
             if canonical(expected.data) != canonical(transition):
                 raise ValueError("MANDATE_TRANSITION_REPLAY")
+            if transition["event"] == "COMPLETE_BASELINE":
+                outcome = verified_outcome(
+                    entry["baseline_envelope"],
+                    Ed25519PublicKey.from_public_bytes(bytes.fromhex(entry["source_public"])),
+                    release["checkpoint_scopes"][mandate.data["source_id"]],
+                    release["checkpoint_policy"],
+                    transition["evidence_sha"],
+                )
+                if (
+                    outcome != entry["baseline_proof"]["outcome"]
+                    or outcome["kind"]
+                    not in {"BASELINE", "UNCHANGED", "CHANGED", "RECOVERY_BASELINE"}
+                    or outcome["checkpoint_ms"] != transition["checkpoint_ms"]
+                    or outcome["published_ms"] > transition["at_ms"]
+                ):
+                    raise ValueError("MANDATE_BASELINE_PROOF")
             if transition["event"] in {"PAUSE", "RETIRE"}:
                 command = verify(
                     entry["control_envelopes"][transition["evidence_sha"]],
@@ -274,6 +365,15 @@ def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], 
             before = expected.successor
         if entry["state"] != before.data:
             raise ValueError("MANDATE_STATE_REPLAY")
+    opening = [r for r in new.values() if r["state"]["phase"] in {"ACTIVE", "AWAITING_BASELINE"}]
+    for index, entry in enumerate(opening):
+        m = entry["mandate"]
+        for other in opening[index + 1 :]:
+            n = other["mandate"]
+            if (m["account_id"], m["pod_id"]) == (n["account_id"], n["pod_id"]) and max(
+                m["effective_from_ms"], n["effective_from_ms"]
+            ) < min(m["effective_until_ms"], n["effective_until_ms"]):
+                raise ValueError("MANDATE_OPENING_INTERVAL_OVERLAP")
     if kind.startswith("COPY_MANDATE") and any(
         previous.get(field) != current.get(field)
         for field in (
@@ -283,6 +383,13 @@ def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], 
             "fills",
             "intents",
             "reservations",
+            "pod_fees_paid",
+            "pod_realized",
+            "pod_loss_used",
+            "checkpoint_basis",
+            "checkpoint_allocations",
+            "checkpoint_internal_effects",
+            "checkpoint_market_claims",
             "halts",
         )
     ):

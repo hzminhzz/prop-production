@@ -28,7 +28,9 @@ def quotes(now):
 
 
 @contextmanager
-def scenario(root, *, copies=((0, "0.025"), (1, "0.01")), gross_limit="20000"):
+def scenario(
+    root, *, copies=((0, "0.025"), (1, "0.01")), gross_limit="20000", effective_from=START
+):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     vectors = json.loads(
         (Path(__file__).parent / "fixtures/cwsa_checkpoint_vectors_v3.json").read_text()
@@ -58,6 +60,7 @@ def scenario(root, *, copies=((0, "0.025"), (1, "0.01")), gross_limit="20000"):
             mandate_id="copy-" + str(index),
             pod_id=pod,
             k=k,
+            effective_from_ms=effective_from,
             source_id=sc["source_id"],
             source_account_sha=sc["account_sha"],
             source_scope_generation=sc["generation"],

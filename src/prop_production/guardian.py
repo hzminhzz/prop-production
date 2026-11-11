@@ -13,7 +13,7 @@ from .copy_mandates import MandateState
 
 if TYPE_CHECKING:
     from .v4_source_receiver import SourcePacketReceiver
-from .evidence import canonical, decimal, digest
+from .evidence import canonical, decimal, digest, load_json
 from .finance import Rulebook, account_step
 from .gateway import BrokerGateway, BrokerOrder, BrokerSnapshot
 from .journal import Journal, State, StorageUnavailable
@@ -89,6 +89,18 @@ class Guardian:
         ):
             raise ValueError("POLICY_BINDING")
         floor.require_active(release)
+        source_public = source_key.public_bytes_raw().hex()
+        if release.payload["schema"] == "portfolio_release_v2":
+            if (
+                mandate_key is None
+                or release.signed_envelope is None
+                or sha256(mandate_key.public_bytes_raw()).hexdigest()
+                != release.payload["mandate_authority_sha"]
+            ):
+                raise ValueError("CHECKPOINT_MANDATE_AUTHORITY_NOT_PINNED")
+            pinned = journal.snapshot().get("checkpoint_source_public")
+            if pinned is not None and pinned != source_public:
+                raise ValueError("CHECKPOINT_SOURCE_AUTHORITY_CHANGED")
         active = journal.snapshot().get("active_release_sha")
         if active != release.release_sha:
 
@@ -96,6 +108,13 @@ class Guardian:
                 if active is not None:
                     _halt(s, "RELEASE_CHANGED_REQUIRES_REVIEW")
                 s["active_release_sha"] = release.release_sha
+                if release.payload["schema"] == "portfolio_release_v2":
+                    s["checkpoint_source_public"] = source_public
+                    assert mandate_key is not None and release.signed_envelope is not None
+                    s["checkpoint_release"] = {
+                        "envelope": load_json(release.signed_envelope),
+                        "authority_public": mandate_key.public_bytes_raw().hex(),
+                    }
                 s["runtime"]["permit"] = None
 
             journal.update("BIND_RELEASE_DISARMED", 0, bind)
@@ -917,10 +936,19 @@ class Guardian:
         previous_day = state["finance"].get("day")
         state["finance"] = finance
         errors.extend(finance_errors)
-        if any(
-            decimal(amount) >= decimal(self.policy["pod_loss_budget"]) for amount in used.values()
-        ):
-            errors.append("POD_DAILY_STOP")
+        try:
+            from .checkpoint_risk import loss_limit
+
+            limits = {
+                owner: loss_limit(state, owner, self.policy)
+                if self.release.payload["schema"] == "portfolio_release_v2"
+                else decimal(self.policy["pod_loss_budget"])
+                for owner in used
+            }
+            if any(decimal(amount) >= limits[owner] for owner, amount in used.items()):
+                errors.append("POD_DAILY_STOP")
+        except ValueError as exc:
+            errors.append(str(exc))
         if previous_day is not None and finance.get("day") != previous_day:
             state["pod_loss_used"] = {pod: "0" for pod in used}
         previous_marks.update({m: str(price) for m, price in marks.items()})

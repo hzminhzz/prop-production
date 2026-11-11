@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from .checkpoint_opportunity import OpportunityEvent as Event
 from .checkpoint_opportunity import OpportunityPhase as Phase
 from .checkpoint_opportunity import OpportunityState, advance
+from .checkpoint_risk import effective_policy
 from .checkpoint_source import integer, verify_transition
 from .copy_mandates import CopyMandate
 from .evidence import decimal, digest, load_json, verify
@@ -256,17 +257,25 @@ def review(
         m = CopyMandate.parse(entry["mandate"])
         outcome = row["outcome"]
         if (
-            m.data not in p["mandates"]
-            or outcome["source_id"] != m.data["source_id"]
+            outcome["source_id"] != m.data["source_id"]
             or outcome["scope_generation"] != m.data["source_scope_generation"]
             or outcome["policy_epoch"] != m.data["policy_epoch"]
         ):
             raise ValueError("CHECKPOINT_MANDATE_SCOPE")
+        if m.data not in p["mandates"]:
+            if entry["state"]["phase"] not in {"PAUSED", "RETIRED"}:
+                raise ValueError("CHECKPOINT_MANDATE_SCOPE")
+            dispositions[owner] = "RETIRED_GENERATION"
+            continue
         if outcome["kind"] != "CHANGED":
             dispositions[owner] = outcome["kind"]
             continue
         if entry["state"]["phase"] != "ACTIVE":
             dispositions[owner] = "MANDATE_" + entry["state"]["phase"]
+            continue
+        baseline = entry.get("baseline_proof", {}).get("outcome")
+        if baseline is None or outcome["checkpoint_ms"] <= baseline["checkpoint_ms"]:
+            dispositions[owner] = "ACTIVATION_BASELINE"
             continue
         identity = digest(["checkpoint_opportunity_v3", owner, outcome["signal_id"]])
         deadline = min(row["deadline_ms"], m.data["effective_until_ms"])
@@ -438,7 +447,7 @@ def review(
                     pods,
                     quotes,
                     guardian.markets,
-                    guardian.policy,
+                    effective_policy(state, guardian.policy, guardian.markets),
                     finance,
                     state["positions"],
                     state["pod_positions"],
@@ -740,10 +749,23 @@ def validate_history(
     if not set(old).issubset(rows):
         raise ValueError("CHECKPOINT_OPPORTUNITY_REMOVED")
     for identity, row in rows.items():
-        m = CopyMandate.parse(current["copy_mandates"][row["state"]["owner"]]["mandate"])
+        entry = current["copy_mandates"][row["state"]["owner"]]
+        m = CopyMandate.parse(entry["mandate"])
+        if row["source_public"] != current.get("checkpoint_source_public"):
+            raise ValueError("CHECKPOINT_SOURCE_AUTHORITY_PROOF")
         outcome, _ = source_proof(
             row["proof"], row["source_public"], row["outcome_id"], row["scope"], row["policy"]
         )
+        baseline = entry.get("baseline_proof", {}).get("outcome")
+        if (
+            baseline is None
+            or outcome["checkpoint_ms"] <= baseline["checkpoint_ms"]
+            or outcome["source_id"] != m.data["source_id"]
+            or outcome["scope_generation"] != m.data["source_scope_generation"]
+            or digest(row["policy"]) != m.data["policy_epoch"]
+            or row["scope"]["account_sha"] != m.data["source_account_sha"]
+        ):
+            raise ValueError("CHECKPOINT_POST_BASELINE_SCOPE_PROOF")
         deadline = min(
             outcome["checkpoint_ms"] + 300000,
             m.data["effective_until_ms"],
@@ -933,7 +955,7 @@ def _verify_attempt(
         pods,
         attempt["quotes"],
         markets,
-        policy,
+        effective_policy(previous, policy, markets),
         finance,
         previous["positions"],
         previous["pod_positions"],

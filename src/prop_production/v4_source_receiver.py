@@ -200,7 +200,11 @@ class SourcePacketReceiver:
             if checkpoint_pins is None:
                 raise ValueError("CWSA_EXTERNAL_POLICY_PINS_REQUIRED")
             self.checkpoint = CheckpointProjection(
-                path, release_sha=release.release_sha, source_key=source_key, pins=checkpoint_pins
+                path,
+                release_sha=release.release_sha,
+                source_key=source_key,
+                pins=checkpoint_pins,
+                release=release,
             )
             return
         if path.exists():
@@ -234,6 +238,21 @@ class SourcePacketReceiver:
                 wire_epoch=meta[2],
             )
             self._verify_meta()
+
+    def rebind_checkpoint_release(
+        self,
+        release: VerifiedRelease,
+        *,
+        authority_key: Ed25519PublicKey,
+        floor: ReleaseFloor,
+        now_ms: int,
+    ) -> None:
+        """Explicit signed forward release adoption; no source cursor or financial writes."""
+        if self.wire_version != 3 or self.checkpoint is None:
+            raise ValueError("CWSA_RELEASE_REBIND_WIRE")
+        floor.require_active(release)
+        self.checkpoint.rebind(release, authority_key, now_ms=now_ms)
+        self.release = release
 
     def _verify_meta(self) -> None:
         assert self.projector is not None

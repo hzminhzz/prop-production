@@ -265,7 +265,6 @@ def verify_release_contract(payload: dict[str, Any], authority_public: bytes) ->
             or m["policy_epoch"] != digest(payload["checkpoint_policy"])
             or m["risk_policy_sha"] != payload["risk_policy_sha"]
             or m["rulebook_sha"] != payload["rulebook_sha"]
-            or m["effective_from_ms"] < payload["created_at_ms"]
             or m["effective_until_ms"] > payload["expires_at_ms"]
         ):
             raise ValueError("MANDATE_RELEASE_SCOPE")
