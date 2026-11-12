@@ -2,17 +2,12 @@
 
 GitHub owns reviewed source and history. Local checks establish deterministic
 engineering evidence; they do not create an independent G2 certificate, provider
-qualification or trading authority. The `verify-cross-repository` GitHub Actions workflow runs on every application
-push and pull request, checking out both companion repositories at the exact
-`compatibility.json` SHAs and invoking this same verifier. Connector and
-research repositories also run their own push/PR checks. A successfully
-completed check is engineering evidence only. Branch-protection enforcement
-remains a separate GitHub repository setting; ensure this named check is required
-before relying on automatic merge prevention. A job that never starts (including
-GitHub billing lockout), a missing companion checkout, or an unavailable runner
-is **not** a passing gate. The VPS clean-pin verifier below remains the
-credential-free, independently repeatable fallback, with full output and exact
-SHAs retained as private artifacts.
+qualification or trading authority. The authoritative engineering gate for
+this program is the credential-free `scripts/verify-local.sh all` on the VPS,
+using clean, pinned copies of all three repositories. Record the exact commit
+SHAs, full terminal output, test counts and compatibility digest in private
+evidence. GitHub Actions remains an optional manual diagnostic only; hosted
+runner failures are not substitutes for, or failures of, local verification.
 Respect every separately enforced repository protection.
 
 ## One compatibility authority
@@ -50,11 +45,10 @@ The existing entrypoint runs:
 5. The complete research suite with every extra installed, lint/format, capability
    validation and package build.
 
-Hosted Actions may set `GATE_OFFLINE_BUILDS=0` to permit dependency fetching
-in otherwise identical package-build steps; the default remains offline for
-prewarmed VPS verification. The connector environment must be prepared with
-`uv venv --python 3.13` and `uv pip install --python .venv/bin/python -e '.[test]'`
-for clean ephemeral checkouts.
+The pinned research suite includes a read-only HTTP frontend contract test.
+The verifier first runs `npm ci` and `npm run build` in the pinned research
+checkout's `ops/control-center` directory. Keep companion Python environments
+prewarmed and package builds offline for reproducible VPS verification.
 
 The final receipt binds application, research and connector SHAs plus the SHA-256
 of the compatibility manifest. Record exact Python/uv versions and pass/skip counts.
