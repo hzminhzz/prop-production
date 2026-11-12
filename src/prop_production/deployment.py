@@ -13,8 +13,11 @@ import subprocess
 import time
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+from .deployment_contracts import code_recovery
 
 UNITS = tuple("prop-production-" + role + ".service" for role in (
     "broker", "guardian", "planner", "observer", "watchdog", "bybit-observer"
@@ -117,6 +120,13 @@ def backup_database(source: Path, target: Path) -> None:
                 raise ValueError("DATABASE_BACKUP_INTEGRITY")
 
 
+def _root_protected_release(path: Path) -> None:
+    for item in [path, *path.rglob("*")]:
+        protected = item.resolve().stat()
+        if protected.st_uid != 0 or protected.st_mode & 0o022:
+            raise PermissionError("RELEASE_NOT_ROOT_PROTECTED")
+
+
 def _systemctl(arguments: list[str]) -> None:
     subprocess.run(["systemctl", *arguments], check=True, timeout=90, capture_output=True)
 
@@ -137,15 +147,42 @@ def _pointer(opt: Path, release: Path | None) -> None:
         os.close(descriptor)
 
 
-def _restore(opt: Path, unit_dir: Path, record: dict[str, Any], service: ServiceCall) -> None:
+def _code_transition(source: Path, target: Path) -> dict[str, Any]:
+    verify_bundle(source)
+    verify_bundle(target)
+    return asdict(code_recovery(
+        json.loads((source / "compatibility.json").read_text()),
+        json.loads((target / "compatibility.json").read_text()),
+        at_ms=time.time_ns() // 1_000_000,
+    ))
+
+
+def _restore(opt: Path, unit_dir: Path, record: dict[str, Any], service: ServiceCall,
+             *, target: Path | None = None) -> None:
     service(["stop", *UNITS])
+    previous = target or (Path(record["previous"]) if record["previous"] else None)
+    if previous is not None:
+        if previous.is_symlink() or previous.resolve().parent != (opt / "releases").resolve():
+            raise ValueError("RECOVERY_RELEASE_OUTSIDE_ROOT")
+        transition = _code_transition(Path(record["candidate"]), previous)
+        record["rollback_transition"] = transition
+        if transition["successor"] != "COMPATIBLE":
+            raise ValueError("ROLLBACK_INCOMPATIBLE_DURABLE_CONTRACTS")
+    if target is not None:
+        for unit in UNITS:
+            shutil.copy2(target / "units" / unit, unit_dir / unit)
+        _pointer(opt, target)
+        service(["daemon-reload"])
+        if record["previous_active"]:
+            service(["start", *record["previous_active"]])
+            service(["is-active", "--quiet", *record["previous_active"]])
+        return
     for unit, existed in record["units"].items():
         target = unit_dir / unit
         if existed:
             shutil.copy2(Path(record["backup"]) / unit, target)
         else:
             target.unlink(missing_ok=True)
-    previous = Path(record["previous"]) if record["previous"] else None
     _pointer(opt, previous)
     service(["daemon-reload"])
     if record["previous_active"]:
@@ -153,14 +190,20 @@ def _restore(opt: Path, unit_dir: Path, record: dict[str, Any], service: Service
         service(["is-active", "--quiet", *record["previous_active"]])
 
 
-def recover_activation(opt: Path, unit_dir: Path, *, service: ServiceCall = _systemctl) -> None:
+def recover_activation(opt: Path, unit_dir: Path, *, service: ServiceCall = _systemctl,
+                       target: Path | None = None) -> None:
     record_path = opt / "activation.json"
     record = json.loads(record_path.read_text())
     if record["phase"] not in {"PREPARED", "ROLLBACK_FAILED"}:
         raise ValueError("NO_INTERRUPTED_ACTIVATION")
-    _restore(opt, unit_dir, record, service)
-    record["phase"] = "ROLLED_BACK"
-    _atomic_json(record_path, record)
+    try:
+        _restore(opt, unit_dir, record, service, target=target)
+        record["phase"] = "ROLLED_BACK"
+    except BaseException:
+        record["phase"] = "ROLLBACK_FAILED"
+        raise
+    finally:
+        _atomic_json(record_path, record)
 
 
 def activate_release(
@@ -183,6 +226,12 @@ def activate_release(
     previous = current.resolve(strict=True) if current.is_symlink() else None
     if previous is not None and previous.parent != (opt / "releases").resolve():
         raise ValueError("PREVIOUS_RELEASE_OUTSIDE_ROOT")
+    if previous is not None:
+        transition = _code_transition(previous, release)
+        if transition["successor"] != "COMPATIBLE":
+            service(["stop", *UNITS])
+            _atomic_json(opt / "code-fence.json", transition)
+            raise ValueError("ACTIVATION_INCOMPATIBLE_DURABLE_CONTRACTS")
     if any((unit_dir / unit).is_symlink() for unit in UNITS):
         raise ValueError("UNIT_PATH_IS_SYMLINK")
     if current.exists() and previous is None:
@@ -285,12 +334,11 @@ def main() -> None:
             if args.action == "recover":
                 if args.path.resolve() != opt:
                     raise ValueError("RECOVERY_ROOT")
-                recover_activation(opt, unit_dir)
+                if args.target is not None:
+                    _root_protected_release(args.target)
+                recover_activation(opt, unit_dir, target=args.target)
             else:
-                for item in [args.path, *args.path.rglob("*")]:
-                    protected = item.resolve().stat()
-                    if protected.st_uid != 0 or protected.st_mode & 0o022:
-                        raise PermissionError("RELEASE_NOT_ROOT_PROTECTED")
+                _root_protected_release(args.path)
                 active = [unit for unit in UNITS if subprocess.run(
                     ["systemctl", "is-active", "--quiet", unit], check=False
                 ).returncode == 0]

@@ -47,8 +47,7 @@ def bundle(opt: Path, commit: str = "a" * 40) -> Path:
 def layout(tmp_path: Path):
     opt = tmp_path / "opt"
     candidate = bundle(opt)
-    previous = opt / "releases" / ("c" * 40)
-    previous.mkdir()
+    previous = bundle(opt, "c" * 40)
     (previous / "preserved").write_text("previous code")
     (opt / "current").symlink_to(previous)
     units = tmp_path / "units"

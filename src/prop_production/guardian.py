@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .contracts import DecisionReceipt, TargetBatchProposal
-from .evidence import canonical, decimal, digest
+from .copy_mandates import MandateState
+
+if TYPE_CHECKING:
+    from .v4_source_receiver import SourcePacketReceiver
+from .evidence import canonical, decimal, digest, load_json
 from .finance import Rulebook, account_step
 from .gateway import BrokerGateway, BrokerOrder, BrokerSnapshot
 from .journal import Journal, State, StorageUnavailable
@@ -45,9 +49,16 @@ class Guardian:
         expected_recovery_key_sha: str | None = None,
         revoked_recovery_key_shas: frozenset[str] = frozenset(),
         revoked_recovery_nonces: frozenset[str] = frozenset(),
+        mandate_key: Ed25519PublicKey | None = None,
     ):
         self.journal, self.release, self.floor = journal, release, floor
         self.source_key, self.rules = source_key, rules
+        if (
+            mandate_key is not None
+            and mandate_key.public_bytes_raw() == source_key.public_bytes_raw()
+        ):
+            raise ValueError("MANDATE_AUTHORITY_MUST_BE_DISTINCT_FROM_SOURCE")
+        self.mandate_key = mandate_key
         self.policy, self.markets, self.gateway = policy, markets, gateway
         if (
             recovery_key is not None
@@ -78,6 +89,18 @@ class Guardian:
         ):
             raise ValueError("POLICY_BINDING")
         floor.require_active(release)
+        source_public = source_key.public_bytes_raw().hex()
+        if release.payload["schema"] == "portfolio_release_v2":
+            if (
+                mandate_key is None
+                or release.signed_envelope is None
+                or sha256(mandate_key.public_bytes_raw()).hexdigest()
+                != release.payload["mandate_authority_sha"]
+            ):
+                raise ValueError("CHECKPOINT_MANDATE_AUTHORITY_NOT_PINNED")
+            pinned = journal.snapshot().get("checkpoint_source_public")
+            if pinned is not None and pinned != source_public:
+                raise ValueError("CHECKPOINT_SOURCE_AUTHORITY_CHANGED")
         active = journal.snapshot().get("active_release_sha")
         if active != release.release_sha:
 
@@ -85,9 +108,69 @@ class Guardian:
                 if active is not None:
                     _halt(s, "RELEASE_CHANGED_REQUIRES_REVIEW")
                 s["active_release_sha"] = release.release_sha
+                if release.payload["schema"] == "portfolio_release_v2":
+                    s["checkpoint_source_public"] = source_public
+                    assert mandate_key is not None and release.signed_envelope is not None
+                    s["checkpoint_release"] = {
+                        "envelope": load_json(release.signed_envelope),
+                        "authority_public": mandate_key.public_bytes_raw().hex(),
+                    }
                 s["runtime"]["permit"] = None
 
             journal.update("BIND_RELEASE_DISARMED", 0, bind)
+
+    def activate_copy_mandate(self, envelope: dict[str, Any], *, now_ms: int) -> MandateState:
+        from .guardian_checkpoints import activate_mandate
+
+        return activate_mandate(self, envelope, now_ms=now_ms)
+
+    def control_copy_mandate(self, envelope: dict[str, Any], *, now_ms: int) -> MandateState:
+        from .guardian_checkpoints import control_mandate
+
+        return control_mandate(self, envelope, now_ms=now_ms)
+
+    def baseline_copy_mandate(
+        self, owner: str, receiver: SourcePacketReceiver, *, now_ms: int
+    ) -> MandateState:
+        from .guardian_checkpoints import baseline_mandate
+
+        return baseline_mandate(self, owner, receiver, now_ms=now_ms)
+
+    def review_checkpoints(
+        self,
+        receiver: SourcePacketReceiver,
+        requests: dict[str, str],
+        *,
+        quotes: dict[str, Any],
+        now_ms: int,
+        quote_envelope: dict[str, Any] | None = None,
+        quote_key: Ed25519PublicKey | None = None,
+    ) -> dict[str, Any]:
+        from .checkpoint_admission import review
+
+        return review(
+            self,
+            receiver,
+            requests,
+            quotes=quotes,
+            now_ms=now_ms,
+            quote_envelope=quote_envelope,
+            quote_key=quote_key,
+        )
+
+    def reserve_checkpoint(
+        self, decision_id: str, *, receiver: SourcePacketReceiver, now_ms: int
+    ) -> list[str]:
+        from .checkpoint_admission import reserve
+
+        return reserve(self, decision_id, receiver=receiver, now_ms=now_ms)
+
+    def protective_reduce(
+        self, envelope: dict[str, Any], *, quotes: dict[str, Any], now_ms: int
+    ) -> str:
+        from .guardian_protection import protect
+
+        return protect(self, envelope, quotes=quotes, now_ms=now_ms)
 
     def recover_authenticated(self, signed_request: dict[str, Any], now_ms: int) -> int:
         """Trusted protected signer + independently fetched coherent broker state."""
@@ -123,6 +206,8 @@ class Guardian:
     def decide(
         self, proposal: TargetBatchProposal, quotes: dict[str, Any], now_ms: int
     ) -> DecisionReceipt:
+        if self.release.payload["schema"] != "portfolio_release_v1":
+            raise ValueError("CHECKPOINT_RELEASE_REQUIRES_CHECKPOINT_ADMISSION")
         proposal = TargetBatchProposal.from_dict(proposal.data)
         p = proposal.data
         state = self.journal.snapshot()
@@ -548,16 +633,30 @@ class Guardian:
         if (
             self._scope(now_ms)
             or intent["release_sha"] != self.release.release_sha
-            or state["halts"]
+            or (
+                state["halts"]
+                and not (
+                    intent.get("protection_id")
+                    and intent["reduce_only"] is True
+                    and isinstance(permit, dict)
+                    and permit.get("reduce_only") is True
+                )
+            )
             or intent["status"] != "QUEUED"
             or not permit
             or self.gateway.synthetic is not True
             or intent["boot_epoch"] != state["runtime"]["boot_epoch"]
             or intent["broker_epoch"] != state["runtime"]["broker_epoch"]
             or permit["decision_id"] != intent["decision_id"]
-            or now_ms > intent["expires_at_ms"]
+            or (
+                now_ms >= intent["expires_at_ms"]
+                if intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3"
+                else now_ms > intent["expires_at_ms"]
+            )
             or state["runtime"]["certainty"] != "COHERENT"
-            or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000
+            or not 0
+            <= now_ms - state["runtime"]["last_snapshot_ms"]
+            <= intent.get("account_max_age_ms", 5000)
         ):
             raise ValueError("DISPATCH_NOT_PERMITTED")
         self.journal.update(
@@ -652,6 +751,7 @@ class Guardian:
                 errors.append("BROKER_MARK_CONFLICT")
             marks[position.market] = position.mark_price
         new_fees = ZERO
+        new_realized = ZERO
         # Charge every adverse move; gains never refill a pod budget during the day.
         for pod, book in state["pod_positions"].items():
             adverse = sum(
@@ -686,7 +786,8 @@ class Guardian:
             if intent is None:
                 errors.append("ORPHAN_FILL")
                 continue
-            total = decimal(intent["filled"]) + fill.quantity
+            previous_filled = decimal(intent["filled"])
+            total = previous_filled + fill.quantity
             if (
                 fill.market != intent["market"]
                 or fill.quantity * decimal(intent["quantity"]) <= 0
@@ -708,7 +809,11 @@ class Guardian:
             ):
                 errors.append("POD_FILL_ALLOCATION_INVALID")
                 continue
-            if decimal(state["positions"].get(fill.market, "0")) * fill.quantity < 0:
+            before_quantity = decimal(state["positions"].get(fill.market, "0"))
+            if (
+                before_quantity * fill.quantity < 0
+                and intent.get("checkpoint_policy") != "CWSA_CHECKPOINT_V3"
+            ):
                 # Realized PnL needs independently confirmed pod entry basis.
                 errors.append("POD_REALIZED_ATTRIBUTION_UNVERIFIED")
             new_fees += fill.fee
@@ -717,6 +822,24 @@ class Guardian:
             state["positions"][fill.market] = str(
                 decimal(state["positions"].get(fill.market, "0")) + fill.quantity
             )
+            if intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3":
+                from .checkpoint_accounting import add, apply_fill
+
+                effects = apply_fill(
+                    state, body, previous_filled=previous_filled, before_quantity=before_quantity
+                )
+                new_realized = add(
+                    new_realized, *(decimal(e["realized"]) for e in effects.values())
+                )
+                for pod, effect in effects.items():
+                    allocated = decimal(effect["quantity"])
+                    execution_loss = max(
+                        ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price)
+                    )
+                    used[pod] = str(
+                        add(decimal(used.get(pod, "0")), decimal(effect["fee"]), execution_loss)
+                    )
+                continue
             for pod, change in changes.items():
                 book = state["pod_positions"].setdefault(pod, {})
                 allocated = change * fill.quantity / decimal(intent["quantity"])
@@ -780,6 +903,11 @@ class Guardian:
                     # A restart revokes an unsent intent; no catch-up.
                     if intent["boot_epoch"] != state["runtime"]["boot_epoch"]:
                         intent["status"] = "REVOKED"
+                    elif (
+                        intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3"
+                        and now_ms >= intent["expires_at_ms"]
+                    ):
+                        intent["status"] = "EXPIRED"
                 elif snapshot.observed_at_ms >= intent.get("sent_at_ms", intent["created_at_ms"]):
                     # Only a complete genesis-to-cutoff history proves absence.
                     if decimal(intent["filled"]) == 0:
@@ -790,12 +918,17 @@ class Guardian:
         expected = {m: decimal(q) for m, q in state["positions"].items() if decimal(q)}
         if observed != expected or len(observed) != len(snapshot.positions):
             errors.append("ORPHAN_POSITION")
+        for market, basis in state.get("checkpoint_basis", {}).items():
+            native = next((p for p in snapshot.positions if p.market == market), None)
+            if decimal(basis["quantity"]) != (native.quantity if native else ZERO) or decimal(
+                basis["entry_price"]
+            ) != (native.entry_price if native else ZERO):
+                errors.append("BROKER_ENTRY_BASIS_MISMATCH")
         old_cash = state["finance"].get("cash")
         if old_cash is not None and snapshot.cash is not None:
-            # New fills explain fees only when there is no realized close. Other
-            # debits/credits (funding, corrections, transfers) require explicit
-            # typed provider evidence before assigning any pod economic effect.
-            if snapshot.cash - decimal(old_cash) != -new_fees and (
+            # Only actual fills with retained, independently checked entry basis
+            # explain checkpoint realized cash. Other flows remain unqualified.
+            if snapshot.cash - decimal(old_cash) != new_realized - new_fees and (
                 "POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors
             ):
                 errors.append("BROKER_CASH_ATTRIBUTION_UNKNOWN")
@@ -803,10 +936,19 @@ class Guardian:
         previous_day = state["finance"].get("day")
         state["finance"] = finance
         errors.extend(finance_errors)
-        if any(
-            decimal(amount) >= decimal(self.policy["pod_loss_budget"]) for amount in used.values()
-        ):
-            errors.append("POD_DAILY_STOP")
+        try:
+            from .checkpoint_risk import loss_limit
+
+            limits = {
+                owner: loss_limit(state, owner, self.policy)
+                if self.release.payload["schema"] == "portfolio_release_v2"
+                else decimal(self.policy["pod_loss_budget"])
+                for owner in used
+            }
+            if any(decimal(amount) >= limits[owner] for owner, amount in used.items()):
+                errors.append("POD_DAILY_STOP")
+        except ValueError as exc:
+            errors.append(str(exc))
         if previous_day is not None and finance.get("day") != previous_day:
             state["pod_loss_used"] = {pod: "0" for pod in used}
         previous_marks.update({m: str(price) for m, price in marks.items()})
@@ -825,6 +967,12 @@ class Guardian:
             )
         flat = (
             not observed
+            and (
+                self.release.payload["schema"] != "portfolio_release_v2"
+                or not any(
+                    decimal(q) for book in state["pod_positions"].values() for q in book.values()
+                )
+            )
             and not state["reservations"]
             and not errors
             and all(i["status"] in TERMINAL for i in state["intents"].values())

@@ -20,6 +20,7 @@ class VerifiedRelease:
     release_sha: str
     authority: str
     trading_authorized: bool = False
+    signed_envelope: bytes | None = None
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -120,7 +121,12 @@ class ReleaseVerifier:
     def verify(
         self, envelope: dict[str, Any], *, now_ms: int, floor: ReleaseFloor | None = None
     ) -> VerifiedRelease:
-        p = verify(envelope, self.key, self.authority)
+        original = verify(envelope, self.key, self.authority)
+        p = original
+        if p.get("schema") == "portfolio_release_v2":
+            from .copy_mandates import verify_release_contract
+
+            p = verify_release_contract(p, self.key.public_bytes_raw())
         required = {
             "schema",
             "generation",
@@ -230,7 +236,12 @@ class ReleaseVerifier:
         )
         if p["source_sha"] != expected_source:
             raise ValueError("PROVENANCE_DRIFT")
-        result = VerifiedRelease(canonical(p), digest(p), self.authority)
+        result = VerifiedRelease(
+            canonical(original),
+            digest(original),
+            self.authority,
+            signed_envelope=canonical(envelope),
+        )
         if floor is not None:
             floor.check(result)
         return result

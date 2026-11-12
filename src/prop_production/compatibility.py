@@ -1,4 +1,5 @@
 """Authoritative companion pins; the containing Git commit binds the application."""
+
 from __future__ import annotations
 
 import argparse
@@ -13,24 +14,33 @@ from typing import Any
 
 def load_manifest() -> dict[str, Any]:
     value = json.loads(files("prop_production").joinpath("compatibility.json").read_text())
-    if (value.get("schema") != "prop_production_compatibility_v1"
-            or value.get("application_revision") != "CONTAINING_GIT_COMMIT"):
+    if (
+        value.get("schema") != "prop_production_compatibility_v1"
+        or value.get("application_revision") != "CONTAINING_GIT_COMMIT"
+    ):
         raise ValueError("COMPATIBILITY_SCHEMA")
     for name in ("copytrade-pm", "trading-connector"):
         item = value["repositories"][name]
-        if (item["repository"] != "hzminhzz/" + name
-                or not re.fullmatch(r"[0-9a-f]{40}", item["commit"])):
+        if item["repository"] != "hzminhzz/" + name or not re.fullmatch(
+            r"[0-9a-f]{40}", item["commit"]
+        ):
             raise ValueError("COMPATIBILITY_REPOSITORY_PIN")
     contracts = value["contracts"]
-    if (contracts["portfolio_release"] != "portfolio_release_v1"
-            or contracts["propr_evidence"] != "propr_native_evidence_v1"
-            or contracts["bybit_evidence"] != "bybit_demo_snapshot_v1"
-            or contracts["default_sizing_policy"] != "FIXED_K_NATIVE_QUANTITY"
-            or contracts["legacy_sizing_policy"] != "ALLOCATION_OVER_LIVE_NAV"
-            or contracts["execution_mode"] != "SHADOW"
-            or contracts.get("source_wire_versions") != [1, 2]
-            or contracts.get("active_source_wire") != 1
-            or contracts["trading_authorized"] is not False):
+    if (
+        contracts["portfolio_release"] != "portfolio_release_v1"
+        or contracts.get("portfolio_release_versions")
+        != ["portfolio_release_v1", "portfolio_release_v2"]
+        or contracts.get("checkpoint_source") != "cwsa_checkpoint_packet_v3"
+        or contracts.get("copy_mandate") != "copy_mandate_v1"
+        or contracts["propr_evidence"] != "propr_native_evidence_v1"
+        or contracts["bybit_evidence"] != "bybit_demo_snapshot_v1"
+        or contracts["default_sizing_policy"] != "FIXED_K_NATIVE_QUANTITY"
+        or contracts["legacy_sizing_policy"] != "ALLOCATION_OVER_LIVE_NAV"
+        or contracts["execution_mode"] != "SHADOW"
+        or contracts.get("source_wire_versions") != [1, 2, 3]
+        or contracts.get("active_source_wire") != 1
+        or contracts["trading_authorized"] is not False
+    ):
         raise ValueError("COMPATIBILITY_CONTRACT")
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value["dependencies"]["bybit_ccxt"]):
         raise ValueError("COMPATIBILITY_DEPENDENCY")
@@ -67,8 +77,12 @@ def main() -> None:
     args = parser.parse_args()
     if args.check_project:
         check_dependency_constraints(args.check_project)
-    fields = {"research": RESEARCH_COMMIT, "connector": CONNECTOR_COMMIT,
-              "ccxt": BYBIT_CCXT, "sha": manifest_sha()}
+    fields = {
+        "research": RESEARCH_COMMIT,
+        "connector": CONNECTOR_COMMIT,
+        "ccxt": BYBIT_CCXT,
+        "sha": manifest_sha(),
+    }
     print(fields[args.field] if args.field else json.dumps(MANIFEST, sort_keys=True))
 
 

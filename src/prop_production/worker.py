@@ -13,6 +13,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+from .checkpoint_source import integer
 from .contracts import TargetBatchProposal
 from .evidence import canonical, digest, load_json, sign
 from .finance import Rulebook
@@ -25,6 +26,7 @@ from .judge.broker import FakeBroker
 from .planner import Planner
 from .release import ReleaseFloor, ReleaseVerifier, fixture_release
 from .risk import fixture_markets, fixture_policy
+from .v4_source_receiver import SourcePacketReceiver
 
 
 def wire(value: Any) -> Any:
@@ -175,13 +177,19 @@ def financial_worker(root: Path, role: str) -> None:
     if (settings["schema"] != "synthetic_worker_v1" or rules.status != "SYNTHETIC"
             or rules.account_binding != "fixture-account"):
         raise PermissionError("SYNTHETIC_ONLY")
+    checkpoint_mode = settings["release"]["payload"]["schema"] == "portfolio_release_v2"
+    if checkpoint_mode and role == "planner":
+        raise PermissionError("CHECKPOINTS_BYPASS_LEGACY_PLANNER")
+    # Explicit logical fixture clock; every command still verifies its own cutoff.
+    verification_ms = integer(settings["verification_ms"]) if checkpoint_mode else 1000
     floor = ReleaseFloor(root / "trust" / "floor.sqlite")
     release = ReleaseVerifier(approver, "approver", "fixture-account",
                                settings["release"]["payload"]["risk_policy_sha"], rules.sha).verify(
-                                   settings["release"], now_ms=1000, floor=floor)
+                                   settings["release"], now_ms=verification_ms, floor=floor)
     planner: Planner | None = None
     guardian: Guardian | None = None
     journal: Journal | None = None
+    receiver: SourcePacketReceiver | None = None
     if role == "planner":
         planner = Planner(root / "planner" / "receipts.sqlite", release, source)
     else:
@@ -189,7 +197,11 @@ def financial_worker(root: Path, role: str) -> None:
         client = LocalClient(root / "broker" / "b.sock", "guardian",
                              (root / "guardian" / "guardian.key").read_bytes(), os.getuid())
         guardian = Guardian(journal, release, floor, source, rules, settings["policy"],
-                            settings["markets"], ProcessBrokerGateway(client))
+                            settings["markets"], ProcessBrokerGateway(client),
+                            mandate_key=approver if checkpoint_mode else None)
+        if checkpoint_mode:
+            receiver = SourcePacketReceiver(root / "guardian" / "checkpoint-source.sqlite",
+                                            release=release, source_key=source, wire_version=3)
     _sandbox(root, role)
     print(canonical({"ready": role.upper(), "trading_authorized": False}).decode(), flush=True)
     try:
@@ -213,7 +225,23 @@ def financial_worker(root: Path, role: str) -> None:
                         raise PermissionError("PLANNER_COMMAND")
                 elif guardian and journal:
                     now = request.get("now_ms", 0)
-                    if command == "reconcile":
+                    if command == "checkpoint_ingest" and receiver:
+                        result = receiver.ingest(canonical(request["envelope"]), now_ms=now)
+                    elif command == "checkpoint_status" and receiver:
+                        result = receiver.checkpoint_status()
+                    elif command == "mandate_activate" and receiver:
+                        result = guardian.activate_copy_mandate(request["envelope"], now_ms=now).data
+                    elif command == "mandate_control" and receiver:
+                        result = guardian.control_copy_mandate(request["envelope"], now_ms=now).data
+                    elif command == "mandate_baseline" and receiver:
+                        result = guardian.baseline_copy_mandate(request["owner"], receiver, now_ms=now).data
+                    elif command == "checkpoint_review" and receiver:
+                        result = guardian.review_checkpoints(receiver, request["requests"],
+                                                             quotes=request["quotes"], now_ms=now)
+                    elif command == "checkpoint_reserve" and receiver:
+                        result = {"intent_ids": guardian.reserve_checkpoint(
+                            request["decision_id"], receiver=receiver, now_ms=now)}
+                    elif command == "reconcile":
                         result = guardian.reconcile(now)
                     elif command == "decide":
                         result = guardian.decide(TargetBatchProposal.from_dict(request["proposal"]),
@@ -247,6 +275,8 @@ def financial_worker(root: Path, role: str) -> None:
     finally:
         if planner:
             planner.close()
+        if receiver:
+            receiver.close()
         if journal:
             journal.close()
         floor.close()
