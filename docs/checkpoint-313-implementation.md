@@ -52,3 +52,23 @@ Compatibility advertises source versions 1/2/3 while `active_source_wire`
 remains 1. Exact final companion revision pins and broader integration evidence
 will be recorded after the remaining tickets. No source key, trading permission,
 protected installation or production cutover is authorized by these changes.
+
+## 2026-11-12 follow-up — market-local reversal fallback
+
+An independent review reproduced a P2 defect: the original execution projection
+applied a failed BTC cross-zero predicate to unrelated, otherwise eligible ETH
+targets. New Guardian reviews use `checkpoint_execution_projection_v2`:
+fallback changes only the affected instrument, keeps per-pod targets and
+old-generation residuals, and records the owners whose opposite-side opening
+was missed. Reservation and journal validators agree on each owner's
+COMMITTED_ONCE versus MISSED outcome. Account-wide reconciliation, gross/pod
+risk, independent quotes and native capabilities, immutable deadlines,
+reservations and one-order-per-market/checkpoint claims remain mandatory.
+
+The original `checkpoint_execution_projection_v1` algorithm and serialized
+shape are preserved only for historical journal replay and previously recorded
+decisions; old accounting evidence must never be recomputed using new
+projection economics. Regression coverage includes independent BTC/ETH targets,
+opposing retained-generation inventory, per-owner disposition tampering,
+and original v1 replay compatibility. This change does not deploy protected
+code or qualify actual source economics or real trading.

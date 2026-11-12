@@ -498,6 +498,7 @@ def review(
             )
     attempt = {
         "at_ms": now_ms,
+        "projection_version": "checkpoint_execution_projection_v2",
         "account_sha": account_anchor(state),
         "quotes": quotes,
         "policy": guardian.policy,
@@ -596,6 +597,7 @@ def reserve(
         attempt["frozen_pods"],
         now_ms=now_ms,
         synthetic=guardian.gateway.synthetic,
+        version=plan["schema"],
     )
     if fresh_plan != plan:
         raise ValueError("CHECKPOINT_EXECUTION_PROOF_CHANGED")
@@ -668,18 +670,19 @@ def reserve(
         claims(state, record, decision_id, now_ms)
     )
     apply_internal(state, record, decision_id, now_ms)
+    from .checkpoint_execution import opening_missed
+
     for identity in record["opportunity_ids"]:
         opportunity = state["checkpoint_opportunities"][identity]
+        missed = opening_missed(plan, opportunity["state"]["owner"])
         _move(
             opportunity,
-            Event.MISS if plan["opening_status"] == "MISSED" else Event.COMMIT,
+            Event.MISS if missed else Event.COMMIT,
             now_ms=now_ms,
             evidence_sha=digest(attempt),
-            guard="OPPOSITE_OPENING_MISSED_REDUCE_ONLY"
-            if plan["opening_status"] == "MISSED"
-            else "RESERVE_BEFORE_SEND",
+            guard="OPPOSITE_OPENING_MISSED_REDUCE_ONLY" if missed else "RESERVE_BEFORE_SEND",
         )
-        opportunity["commitment"] = None if plan["opening_status"] == "MISSED" else decision_id
+        opportunity["commitment"] = None if missed else decision_id
     if ids:
         state["reservations"][decision_id] = {
             "loss": risk["worst_loss"],
@@ -846,6 +849,17 @@ def validate_history(
             ] != account_anchor(previous):
                 raise ValueError("CHECKPOINT_DECISION_ACCOUNT_PREDECESSOR")
             _verify_attempt(previous, current, record)
+        if record["result"]["status"] == "COMMITTED_ONCE":
+            from .checkpoint_execution import opening_missed
+
+            plan = record["attempts"][-1]["execution_plan"]
+            for opportunity_id in record["opportunity_ids"]:
+                opportunity = rows[opportunity_id]
+                missed = opening_missed(plan, opportunity["state"]["owner"])
+                if opportunity["state"]["phase"] != (
+                    "MISSED" if missed else "COMMITTED_ONCE"
+                ) or opportunity["commitment"] != (None if missed else identity):
+                    raise ValueError("CHECKPOINT_OPENING_DISPOSITION_REPLAY")
     if kind == "CHECKPOINT_REVIEW" and any(
         previous[k] != current[k]
         for k in (
@@ -988,6 +1002,12 @@ def _verify_attempt(
                 frozen,
                 now_ms=attempt["at_ms"],
                 synthetic=policy["source_mode"] == "SYNTHETIC",
+                version=attempt.get(
+                    "projection_version",
+                    attempt["execution_plan"]["schema"]
+                    if attempt["execution_plan"] is not None
+                    else "checkpoint_execution_projection_v1",
+                ),
             )
         except ValueError as exc:
             if (
@@ -1033,8 +1053,15 @@ def _verify_intent(
             "quantity": str(expected),
         }
     )
-    if plan["opening_status"] == "MISSED" and any(
-        current["checkpoint_opportunities"][key]["state"]["phase"] != "MISSED"
+    from .checkpoint_execution import opening_missed
+
+    if any(
+        current["checkpoint_opportunities"][key]["state"]["phase"]
+        != (
+            "MISSED"
+            if opening_missed(plan, current["checkpoint_opportunities"][key]["state"]["owner"])
+            else "COMMITTED_ONCE"
+        )
         for key in record["opportunity_ids"]
     ):
         raise ValueError("CHECKPOINT_REDUCE_ONLY_OPENING_DISPOSITION")
