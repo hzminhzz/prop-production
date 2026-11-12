@@ -2,7 +2,12 @@
 
 GitHub owns reviewed source and history. Local checks establish deterministic
 engineering evidence; they do not create an independent G2 certificate, provider
-qualification or trading authority. GitHub Actions is optional for this program.
+qualification or trading authority. The authoritative engineering gate for
+this program is the credential-free `scripts/verify-local.sh all` on the VPS,
+using clean, pinned copies of all three repositories. Record the exact commit
+SHAs, full terminal output, test counts and compatibility digest in private
+evidence. GitHub Actions remains an optional manual diagnostic only; hosted
+runner failures are not substitutes for, or failures of, local verification.
 Respect every separately enforced repository protection.
 
 ## One compatibility authority
@@ -39,6 +44,11 @@ The existing entrypoint runs:
 4. Native Guardian/Propr and Bybit adapter tests in the pinned connector environment.
 5. The complete research suite with every extra installed, lint/format, capability
    validation and package build.
+
+The pinned research suite includes a read-only HTTP frontend contract test.
+The verifier first runs `npm ci` and `npm run build` in the pinned research
+checkout's `ops/control-center` directory. Keep companion Python environments
+prewarmed and package builds offline for reproducible VPS verification.
 
 The final receipt binds application, research and connector SHAs plus the SHA-256
 of the compatibility manifest. Record exact Python/uv versions and pass/skip counts.

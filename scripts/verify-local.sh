@@ -93,6 +93,13 @@ if [[ "$MODE" == "all" ]]; then
     printf '\n[research / %s]\n' "$RESEARCH_SHA"
     (
         cd "$PROP_RESEARCH_ROOT"
+        # HTTP contract tests require the independently built read-only frontend.
+        # Source and lockfile are pinned by the research commit, not app fixtures.
+        if ! command -v npm >/dev/null 2>&1; then
+            printf 'BLOCKED: npm unavailable for read-only frontend build\n' >&2
+            exit 2
+        fi
+        (cd ops/control-center && npm ci --no-audit --no-fund && npm run build)
         uv sync --frozen --all-extras --group dev
         PYTHONPATH="$PROP_RESEARCH_ROOT" uv run --no-sync pytest -q
         uv run --no-sync ruff check src tests scripts
