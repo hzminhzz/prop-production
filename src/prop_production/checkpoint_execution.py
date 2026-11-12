@@ -13,16 +13,39 @@ from .gateway import execution_capability
 
 @dataclass(frozen=True)
 class ExecutionProjection:
-    schema: Literal["checkpoint_execution_projection_v1"]
+    schema: Literal["checkpoint_execution_projection_v1", "checkpoint_execution_projection_v2"]
     mode: Literal["NET", "REDUCE_ONLY_FALLBACK"]
     opening_status: Literal["ELIGIBLE", "MISSED"]
     targets: dict[str, str]
     pod_targets: dict[str, dict[str, str]]
     reduce_only: dict[str, bool]
+    missed_owners: tuple[str, ...] = ()
 
     @property
     def data(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        if self.schema == "checkpoint_execution_projection_v1":
+            # Historical journal contents must replay byte-for-byte.
+            result.pop("missed_owners")
+        else:
+            result["missed_owners"] = list(self.missed_owners)
+        return result
+
+
+def opening_missed(plan: dict[str, Any], owner: str) -> bool:
+    """Interpret one opportunity against the projection generation that created it."""
+    if plan["schema"] == "checkpoint_execution_projection_v1":
+        return bool(plan["opening_status"] == "MISSED")
+    if plan["schema"] == "checkpoint_execution_projection_v2":
+        missed = plan["missed_owners"]
+        if (
+            not isinstance(missed, list)
+            or missed != sorted(set(missed))
+            or (plan["opening_status"] == "MISSED") != bool(missed)
+        ):
+            raise ValueError("CHECKPOINT_OPENING_DISPOSITION_PROOF")
+        return owner in missed
+    raise ValueError("CHECKPOINT_EXECUTION_PROJECTION_VERSION")
 
 
 def project(
@@ -35,6 +58,9 @@ def project(
     *,
     now_ms: int,
     synthetic: bool,
+    version: Literal[
+        "checkpoint_execution_projection_v1", "checkpoint_execution_projection_v2"
+    ] = "checkpoint_execution_projection_v2",
 ) -> dict[str, Any]:
     def permits(market: str, feature: str) -> bool:
         raw = proof.get("execution_capabilities", {}).get(market)
@@ -48,14 +74,19 @@ def project(
             synthetic=synthetic,
         )
 
+    if version not in {
+        "checkpoint_execution_projection_v1",
+        "checkpoint_execution_projection_v2",
+    }:
+        raise ValueError("CHECKPOINT_EXECUTION_PROJECTION_VERSION")
     books = deepcopy(risk["pod_targets"])
     all_markets = sorted(set(risk["targets"]) | set(state["positions"]))
-    fallback = False
+    fallback_markets: set[str] = set()
     for market in all_markets:
         old = decimal(state["positions"].get(market, "0"))
         target = decimal(risk["targets"].get(market, "0"))
         if old * target < 0 and not permits(market, "cross_zero"):
-            fallback = True
+            fallback_markets.add(market)
         for owner, residual in frozen.items():
             held = decimal(residual.get(market, "0"))
             if any(
@@ -63,20 +94,38 @@ def project(
                 for pod, book in books.items()
                 if pod != owner and pod not in frozen
             ):
-                fallback = True
-    if fallback:
-        for owner, book in books.items():
-            if owner in frozen:
-                continue
-            current = state["pod_positions"].get(owner, {})
-            for market in set(book) | set(current):
-                old = decimal(current.get(market, "0"))
-                desired = decimal(book.get(market, "0"))
-                book[market] = str(
-                    min(abs(old), abs(desired)) * (1 if old > 0 else -1)
-                    if old * desired > 0
-                    else decimal("0")
-                )
+                fallback_markets.add(market)
+
+    # Preserve the exact v1 projection for immutable historical financial replay.
+    # Only v2 applies a failure to its actual instrument instead of every market.
+    fenced_markets = (
+        set(all_markets)
+        if fallback_markets and version == "checkpoint_execution_projection_v1"
+        else fallback_markets
+    )
+    for owner, book in books.items():
+        if owner in frozen:
+            continue
+        current = state["pod_positions"].get(owner, {})
+        for market in sorted(fenced_markets & (set(book) | set(current))):
+            old = decimal(current.get(market, "0"))
+            desired = decimal(book.get(market, "0"))
+            book[market] = str(
+                min(abs(old), abs(desired)) * (1 if old > 0 else -1)
+                if old * desired > 0
+                else decimal("0")
+            )
+    missed_owners = tuple(
+        sorted(
+            owner
+            for owner, original in risk["pod_targets"].items()
+            if owner not in frozen
+            and any(
+                decimal(original.get(market, "0")) != decimal(books[owner].get(market, "0"))
+                for market in fallback_markets
+            )
+        )
+    )
     targets = {
         market: str(add(*(decimal(book.get(market, "0")) for book in books.values())))
         for market in all_markets
@@ -89,7 +138,7 @@ def project(
         reducing[market] = reduce_only
         if not quantity:
             continue
-        if fallback and not reduce_only:
+        if market in fenced_markets and not reduce_only:
             raise ValueError("NO_PROVABLE_ACCOUNT_REDUCTION")
         if reduce_only and not permits(market, "reduce_only"):
             raise ValueError("REDUCE_ONLY_CAPABILITY_UNQUALIFIED")
@@ -113,10 +162,13 @@ def project(
         ):
             raise ValueError("NATIVE_ADJUSTMENT_LOT")
     return ExecutionProjection(
-        "checkpoint_execution_projection_v1",
-        "REDUCE_ONLY_FALLBACK" if fallback else "NET",
-        "MISSED" if fallback else "ELIGIBLE",
+        version,
+        "REDUCE_ONLY_FALLBACK" if fallback_markets else "NET",
+        "MISSED"
+        if (fallback_markets if version == "checkpoint_execution_projection_v1" else missed_owners)
+        else "ELIGIBLE",
         targets,
         books,
         reducing,
+        missed_owners,
     ).data
