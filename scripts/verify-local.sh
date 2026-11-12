@@ -84,7 +84,11 @@ if [[ "$MODE" == "all" ]]; then
         cd "$PROP_CONNECTOR_ROOT"
         PYTHONPATH="$PROP_RESEARCH_ROOT/src" .venv/bin/python -m pytest -q -rs connectors
         .venv/bin/python -m ruff check connectors propr_sdk.py
-        uv build --offline --quiet
+        if [[ "${GATE_OFFLINE_BUILDS:-1}" == "1" ]]; then
+            uv build --offline --quiet
+        else
+            uv build --quiet
+        fi
     )
     printf '\n[app + native connector / %s]\n' "$CONNECTOR_SHA"
     PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --extra connector --group dev pytest -q tests/test_native_gateway.py
@@ -97,7 +101,11 @@ if [[ "$MODE" == "all" ]]; then
         PYTHONPATH="$PROP_RESEARCH_ROOT" uv run --no-sync pytest -q
         uv run --no-sync ruff check src tests scripts
         uv run --no-sync ruff format --check src tests
-        uv build --offline --quiet
+        if [[ "${GATE_OFFLINE_BUILDS:-1}" == "1" ]]; then
+            uv build --offline --quiet
+        else
+            uv build --quiet
+        fi
         uv run --no-sync copytrade-pm capabilities validate
     )
 fi

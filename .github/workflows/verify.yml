@@ -1,26 +1,68 @@
-# Optional manual diagnostics only; authoritative engineering checks run on the VPS.
-# This workflow is not a required gate and never auto-runs on push or PR.
-name: verify-manual
-on: workflow_dispatch
+# Automatic, commit-bound CWSA three-repository engineering verification.
+# A passing check is not broker, source, economic, or trading authorization.
+name: verify-cross-repository
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: cwsaverify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  verify:
+  pinned-matrix:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.13", "3.14"]
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - name: Checkout application revision
+        uses: actions/checkout@v4
+        with:
+          path: app
+          persist-credentials: false
+      - name: Read immutable companion pins
+        id: pins
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("app/src/prop_production/compatibility.json").read_text())
+          for repo, key in (("copytrade-pm", "research"), ("trading-connector", "connector")):
+              commit = manifest["repositories"][repo]["commit"]
+              assert len(commit) == 40 and all(c in "0123456789abcdef" for c in commit)
+              print(f"{key}={commit}")
+          PY
+      - name: Checkout pinned research
+        uses: actions/checkout@v4
+        with:
+          repository: hzminhzz/copytrade-pm
+          ref: ${{ steps.pins.outputs.research }}
+          path: research
+          persist-credentials: false
+      - name: Checkout pinned connector
+        uses: actions/checkout@v4
+        with:
+          repository: hzminhzz/trading-connector
+          ref: ${{ steps.pins.outputs.connector }}
+          path: connector
+          persist-credentials: false
+      - name: Install Python toolchain
+        uses: astral-sh/setup-uv@v6
         with:
           version: "0.12.15"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: uv sync --frozen --group dev
-      - run: uv run --frozen pytest -q
-      - run: uv run --frozen ruff check src tests
-      - run: uv run --frozen mypy
-      - run: uv build --no-sources
-      - run: uv run --frozen prop-production smoke
+          enable-cache: true
+      - name: Install Python 3.13 and 3.14
+        run: uv python install 3.13 3.14
+      - name: Prepare pinned connector test environment
+        working-directory: connector
+        run: |
+          uv venv --python 3.13
+          uv pip install --python .venv/bin/python -e ".[test]"
+      - name: Run unchanged three-repository acceptance script
+        working-directory: app
+        env:
+          PROP_RESEARCH_ROOT: ${{ github.workspace }}/research
+          PROP_CONNECTOR_ROOT: ${{ github.workspace }}/connector
+          GATE_OFFLINE_BUILDS: "0"
+        run: bash scripts/verify-local.sh all
