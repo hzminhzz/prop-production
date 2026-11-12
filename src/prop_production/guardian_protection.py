@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .checkpoint_accounting import add, split
+from .checkpoint_risk import effective_policy
 from .checkpoint_source import fields, integer
 from .evidence import decimal, digest, load_json, require_sha, verify
 from .gateway import execution_capability
@@ -82,7 +83,7 @@ def derive(state: dict[str, Any], record: dict[str, Any]) -> tuple[dict[str, Any
 
     body, proof, at_ms = record["body"], record["account_proof"], record["at_ms"]
     policy, markets, quotes = record["policy"], record["markets"], record["quotes"]
-    cfg = policy["checkpoint_execution"]
+    cfg = effective_policy(state, policy, markets)["checkpoint_execution"]
     market = body["market"]
     _validate(markets, policy, {market}, at_ms)
     from .checkpoint_account_proof import validate
@@ -211,7 +212,7 @@ def protect(
         raise ValueError("PROTECTIVE_RELEASE_OR_PREDECESSOR")
     if state["reservations"] or any(i["status"] not in TERMINAL for i in state["intents"].values()):
         raise ValueError("PROTECTIVE_UNRESOLVED_OBLIGATIONS")
-    cfg = execution_policy(guardian)
+    cfg = execution_policy(guardian, state)
     reasons, proof = _prerequisites(
         guardian,
         state,

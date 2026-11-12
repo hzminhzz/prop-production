@@ -28,7 +28,7 @@ TERMINAL = {Phase.COMMITTED_ONCE, Phase.MISSED}
 POLICY = "CWSA_CHECKPOINT_V3"
 
 
-def execution_policy(guardian: Guardian) -> dict[str, Any]:
+def execution_policy(guardian: Guardian, state: dict[str, Any]) -> dict[str, Any]:
     cfg = guardian.policy.get("checkpoint_execution")
     if not isinstance(cfg, dict) or not {
         "quote_max_age_ms",
@@ -41,7 +41,7 @@ def execution_policy(guardian: Guardian) -> dict[str, Any]:
         or decimal(cfg["max_gross_notional"]) <= 0
     ):
         raise ValueError("CHECKPOINT_EXECUTION_POLICY_INVALID")
-    return cfg
+    return dict(effective_policy(state, guardian.policy, guardian.markets)["checkpoint_execution"])
 
 
 def account_anchor(state: dict[str, Any]) -> str:
@@ -233,10 +233,10 @@ def review(
     _authority(guardian)
     _source(guardian, receiver)
     integer(now_ms)
-    cfg = execution_policy(guardian)
     if not isinstance(requests, dict) or not requests:
         raise ValueError("CHECKPOINT_REQUESTS")
     state = guardian.journal.snapshot()
+    cfg = execution_policy(guardian, state)
     p = guardian.release.payload
     source_rows = {
         r["outcome"]["outcome_id"]: r for r in receiver.checkpoint_outcomes(now_ms=now_ms)
@@ -550,7 +550,7 @@ def reserve(
     if now_ms >= record["result"]["deadline_ms"]:
         review(guardian, receiver, record["requests"], quotes=attempt["quotes"], now_ms=now_ms)
         raise ValueError("CHECKPOINT_RESERVATION_NOT_PERMITTED")
-    cfg = execution_policy(guardian)
+    cfg = execution_policy(guardian, state)
     if (
         record["result"]["status"] != "REVIEWABLE"
         or guardian._scope(now_ms)
