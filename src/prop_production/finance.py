@@ -33,6 +33,36 @@ class Rulebook:
         return cls(SYNTHETIC_ACCOUNT, "SYNTHETIC", valid_until_ms=10**15,
                    evidence_sha=digest("invented rulebook; not provider terms"))
 
+    @classmethod
+    def from_challenge(
+        cls,
+        key: str,
+        *,
+        account_binding: str = SYNTHETIC_ACCOUNT,
+        status: str = "SYNTHETIC",
+        internal_daily_stop: str | None = None,
+        valid_until_ms: int = 10**15,
+        scale: str | int = 1,
+    ) -> Rulebook:
+        """Build an exact Rulebook from a canonical challenge firm spec."""
+        from .prop_firms import get_challenge_spec
+
+        fields = get_challenge_spec(key).to_rulebook_fields(
+            account_binding=account_binding,
+            status=status,
+            internal_daily_stop=internal_daily_stop,
+            valid_until_ms=valid_until_ms,
+            scale=scale,
+        )
+        return cls(**fields)
+
+    @classmethod
+    def list_challenges(cls, firm_slug: str | None = None) -> tuple[str, ...]:
+        """List canonical challenge rulebook keys, optionally filtered by firm_slug."""
+        from .prop_firms import list_challenge_keys
+
+        return list_challenge_keys(firm_slug=firm_slug)
+
     @property
     def sha(self) -> str:
         return digest(asdict(self))
@@ -48,13 +78,16 @@ class Rulebook:
         return rules
 
     def validate(self, now_ms: int) -> None:
-        if (self.timezone != "UTC" or self.daily_basis not in {"EQUITY", "MAX_BALANCE_EQUITY"}
-                or self.trailing_basis not in {"INTRADAY_EQUITY", "EOD_EQUITY"}
+        if (self.timezone != "UTC"
+                or self.daily_basis not in {"EQUITY", "BALANCE", "MAX_BALANCE_EQUITY"}
+                or self.trailing_basis not in {"INTRADAY_EQUITY", "EOD_EQUITY", "STATIC"}
                 or type(self.valid_until_ms) is not int or now_ms >= self.valid_until_ms
                 or not self.evidence_sha):
             raise ValueError("RULEBOOK_UNSUPPORTED_OR_EXPIRED")
-        if any(decimal(value) <= 0 for value in
-               (self.initial, self.target, self.daily_loss, self.trailing_loss, self.internal_daily_stop)):
+        if decimal(self.target) < 0 or any(
+            decimal(value) <= 0
+            for value in (self.initial, self.daily_loss, self.trailing_loss, self.internal_daily_stop)
+        ):
             raise ValueError("RULEBOOK_AMOUNTS")
         if decimal(self.internal_daily_stop) > decimal(self.daily_loss):
             raise ValueError("RULEBOOK_INTERNAL_STOP")
@@ -81,15 +114,21 @@ def account_step(previous: dict[str, Any], snapshot: BrokerSnapshot, rules: Rule
         return state, reasons + ["RULEBOOK_CHANGED_REQUIRES_REVIEW"]
     if state and snapshot.observed_at_ms < state["observed_at_ms"]:
         return state, reasons + ["BROKER_CLOCK_REGRESSION"]
-    baseline = equity if rules.daily_basis == "EQUITY" else max(cash, equity)
+    if rules.daily_basis == "EQUITY":
+        baseline = equity
+    elif rules.daily_basis == "BALANCE":
+        baseline = cash
+    else:
+        baseline = max(cash, equity)
     initial = decimal(rules.initial)
     if not state:
         # Bootstrapping a real account needs its authenticated beginning-of-day baseline.
         # Synthetic fixtures define inception at this first observation.
         if rules.status != "SYNTHETIC" and snapshot.observed_at_ms % DAY_MS != 0:
             return {}, reasons + ["MIDNIGHT_BASELINE_UNKNOWN"]
+        initial_hwm = initial if rules.trailing_basis == "STATIC" else max(initial, equity)
         state = {"day": day, "daily_baseline": str(baseline),
-                 "high_water": str(max(initial, equity)), "day_high_water": str(equity),
+                 "high_water": str(initial_hwm), "day_high_water": str(equity),
                  "realized_made": "0", "rulebook_sha": rules.sha}
     elif day != state["day"]:
         if day != state["day"] + 1 or snapshot.observed_at_ms % DAY_MS != 0:
@@ -103,14 +142,20 @@ def account_step(previous: dict[str, Any], snapshot: BrokerSnapshot, rules: Rule
         state["high_water"] = str(max(decimal(state["high_water"]), equity))
     state["day_high_water"] = str(max(decimal(state["day_high_water"]), equity))
     made = max(decimal(state["realized_made"]), decimal(state["day_high_water"]) - equity)
+    if rules.trailing_basis == "STATIC":
+        trailing_floor = initial - decimal(rules.trailing_loss)
+    else:
+        trailing_floor = max(
+            initial - decimal(rules.trailing_loss),
+            decimal(state["high_water"]) - decimal(rules.trailing_loss),
+        )
     state.update(
         cash=str(cash), equity=str(equity), unrealized=str(snapshot.unrealized),
         initial_margin=str(snapshot.initial_margin), maintenance_margin=str(snapshot.maintenance_margin),
         realized_made=str(made), observed_at_ms=snapshot.observed_at_ms,
         daily_floor=str(decimal(state["daily_baseline"]) - decimal(rules.daily_loss)),
         internal_floor=str(decimal(state["daily_baseline"]) - decimal(rules.internal_daily_stop)),
-        trailing_floor=str(max(initial - decimal(rules.trailing_loss),
-                               decimal(state["high_water"]) - decimal(rules.trailing_loss))),
+        trailing_floor=str(trailing_floor),
     )
     for field, reason in (("daily_floor", "CONTRACT_DAILY_FLOOR"),
                           ("internal_floor", "INTERNAL_DAILY_STOP"),

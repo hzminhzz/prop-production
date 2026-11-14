@@ -157,6 +157,32 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             raise ValueError("PINNED_RESEARCH_RUNTIME_REQUIRED")
         result = economics(args.research_root, args.research_python)
         return result, 2 if result["verdict"] == "BLOCKED_ECONOMICS" else 0
+    if args.command == "rulebooks":
+        from dataclasses import asdict
+
+        from .prop_firms import get_challenge_spec, list_challenge_specs
+
+        if args.rulebook_key:
+            from .finance import Rulebook
+
+            challenge_spec = get_challenge_spec(args.rulebook_key)
+            rb = Rulebook.from_challenge(args.rulebook_key, scale=args.scale)
+            return {
+                "schema": "challenge_rulebook_detail_v1",
+                "key": challenge_spec.key,
+                "spec": asdict(challenge_spec),
+                "rulebook": asdict(rb),
+                "rulebook_sha": rb.sha,
+                "trading_authorized": False,
+            }, 0
+        challenge_specs = list_challenge_specs(firm_slug=args.firm)
+        return {
+            "schema": "challenge_rulebooks_v1",
+            "count": len(challenge_specs),
+            "firms": sorted({item.firm_slug for item in challenge_specs}),
+            "rulebooks": [item.to_summary_dict() for item in challenge_specs],
+            "trading_authorized": False,
+        }, 0
     if args.command == "demo":
         from .evidence import load_json
         from .qualification import demo_report
@@ -251,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "economics",
             "fixture",
             "recover",
+            "rulebooks",
         ],
     )
     parser.add_argument("action", nargs="?", default="report")
@@ -275,6 +302,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--interval", type=int, default=30)
     parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument("--firm", help="filter challenge rulebooks by firm_slug")
+    parser.add_argument("--rulebook-key", help="inspect one challenge rulebook key (firm:program:phase)")
+    parser.add_argument("--scale", default="1", help="optional multiplier from $5,000 base account")
     args = parser.parse_args(argv)
     if args.mode != "SHADOW":
         print(json.dumps({"error": "MODE_NOT_PERMITTED", "trading_authorized": False}))
