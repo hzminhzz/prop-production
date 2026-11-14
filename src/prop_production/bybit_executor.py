@@ -354,8 +354,10 @@ def _build_markets(exchange: Any) -> dict[str, MarketSpec]:
         if not (m.get("swap") and m.get("linear") and m.get("quote") == "USDT" and m.get("active")):
             continue
         base = str(m.get("base") or "")
-        min_amt = decimal(m.get("limits", {}).get("amount", {}).get("min") or "0")
-        step = decimal(m.get("precision", {}).get("amount") or "0")
+        min_raw = m.get("limits", {}).get("amount", {}).get("min")
+        step_raw = m.get("precision", {}).get("amount")
+        min_amt = decimal(str(min_raw) if min_raw is not None else "0")
+        step = decimal(str(step_raw) if step_raw is not None else "0")
         if base:
             out[base] = MarketSpec(symbol=sym, min_amount=min_amt, amount_step=step)
     return out
