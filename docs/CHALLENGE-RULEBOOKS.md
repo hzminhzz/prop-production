@@ -19,6 +19,16 @@ rules_10k = Rulebook.from_challenge("hyrotrader:two_step:phase_1", scale=2)
 
 # Inspect extra non-Guardian constraints (consistency, prohibited venues/pairs, ambiguities)
 spec = get_challenge_spec("hyrotrader:two_step:phase_1")
+
+# Overlay HyroTrader non-financial policy guards onto a risk_policy_v1 dict
+from prop_production.prop_firms import consistency_progress, hyrotrader_policy
+from prop_production.risk import fixture_policy
+
+policy = hyrotrader_policy(fixture_policy(), initial="5000")
+# Enforces in risk.validate_market_inputs / size_book:
+# - allowed_instrument_types=["usdt_perp"] -> CHALLENGE_INSTRUMENT_PROHIBITED
+# - blocked_symbols=["EUR/USD", ...] -> CHALLENGE_SYMBOL_PROHIBITED
+# - low_cap_mcap_threshold_usd="100000000", low_cap_max_notional="250" -> LOW_CAP_EXPOSURE_CAP
 ```
 
 ### CLI Discovery (Read-Only JSON)

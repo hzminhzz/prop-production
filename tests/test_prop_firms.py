@@ -11,7 +11,13 @@ import pytest
 from prop_production.cli import main
 from prop_production.finance import DAY_MS, Rulebook, account_step
 from prop_production.gateway import fixture_snapshot
-from prop_production.prop_firms import CHALLENGE_RULEBOOKS, get_challenge_spec
+from prop_production.prop_firms import (
+    CHALLENGE_RULEBOOKS,
+    consistency_progress,
+    get_challenge_spec,
+    hyrotrader_policy,
+)
+from prop_production.risk import fixture_markets, fixture_policy, size_book
 
 
 def test_all_challenge_rulebooks_validate_and_step() -> None:
@@ -130,3 +136,76 @@ def test_cli_rulebooks_discovery(capsys: pytest.CaptureFixture[str]) -> None:
     assert detail["rulebook"]["initial"] == "10000"
     assert detail["rulebook"]["trailing_basis"] == "STATIC"
     assert detail["trading_authorized"] is False
+
+
+def test_hyrotrader_policy_guards_instrument_symbol_and_low_cap() -> None:
+    policy = hyrotrader_policy(fixture_policy(), initial="5000")
+    assert policy["low_cap_max_notional"] == "250"
+
+    markets = fixture_markets()
+    markets["BTC"]["instrument_type"] = "usdt_perp"
+    markets["ETH"]["instrument_type"] = "spot"
+    quotes = {
+        "BTC": {"bid": "50000", "ask": "50000", "known_at_ms": 1000},
+        "ETH": {"bid": "2000", "ask": "2000", "known_at_ms": 1000},
+    }
+    finance, _ = account_step(
+        {},
+        replace(
+            fixture_snapshot(1000),
+            cash=Decimal("5000"),
+            equity=Decimal("5000"),
+            unrealized=Decimal("0"),
+        ),
+        Rulebook.from_challenge("hyrotrader:two_step:phase_1"),
+        1000,
+    )
+    pods = [{"pod_id": "p1", "requested_notionals": {"ETH": "100"}, "max_notional": "1000"}]
+    blocked_inst = size_book(pods, quotes, markets, policy, finance, {}, {}, [], now_ms=1000)
+    assert blocked_inst["status"] == "BLOCKED"
+    assert blocked_inst["reasons"] == ["CHALLENGE_INSTRUMENT_PROHIBITED"]
+
+    markets["EUR/USD"] = dict(markets["BTC"], symbol="EUR/USD")
+    policy["scenarios"] = [dict(s, **{"EUR/USD": "-0.05"}) for s in policy["scenarios"]]
+    quotes["EUR/USD"] = {"bid": "1.1", "ask": "1.1", "known_at_ms": 1000}
+    pods_eur = [{"pod_id": "p1", "requested_notionals": {"EUR/USD": "100"}, "max_notional": "1000"}]
+    blocked_eur = size_book(pods_eur, quotes, markets, policy, finance, {}, {}, [], now_ms=1000)
+    assert blocked_eur["status"] == "BLOCKED"
+    assert blocked_eur["reasons"] == ["CHALLENGE_SYMBOL_PROHIBITED"]
+
+    # Low-cap (< $100M mcap) is capped at 5% of $5,000 = $250 notional.
+    markets["TINY"] = dict(markets["BTC"], market_cap_usd="50000000", qty_step="1", min_qty="1")
+    policy["scenarios"] = [dict(s, TINY="-0.1") for s in policy["scenarios"]]
+    quotes["TINY"] = {"bid": "1", "ask": "1", "known_at_ms": 1000}
+    pods_tiny = [{"pod_id": "p1", "requested_notionals": {"TINY": "400"}, "max_notional": "1000"}]
+    sized_tiny = size_book(pods_tiny, quotes, markets, policy, finance, {}, {}, [], now_ms=1000)
+    assert sized_tiny["status"] == "ACCEPTED"
+    assert Decimal(sized_tiny["targets"]["TINY"]) <= Decimal("250")
+
+    blocked_tiny = size_book(
+        [{"pod_id": "p1", "requested_notionals": {"TINY": "250"}, "max_notional": "1000"}],
+        quotes,
+        markets,
+        policy,
+        finance,
+        {"TINY": "300"},
+        {"p1": {"TINY": "300"}},
+        [],
+        now_ms=1000,
+    )
+    assert blocked_tiny["status"] == "NO_TRADE"
+    assert "LOW_CAP_EXPOSURE_CAP" in blocked_tiny["reasons"]
+
+
+def test_consistency_progress_40pct_hyrotrader_rule() -> None:
+    res = consistency_progress(
+        {"2026-11-10": "350", "2026-11-11": "200", "2026-11-12": "-50"},
+        target="500",
+        max_single_day_pct=40,
+    )
+    # 40% of 500 = 200 cap per day -> 200 + 200 - 50 = 350 eligible (< 500 target)
+    assert res["total_profit"] == "500"
+    assert res["eligible_profit"] == "350"
+    assert res["cap_per_day"] == "200"
+    assert res["capped_days"] == ["2026-11-10"]
+    assert res["target_met"] is False

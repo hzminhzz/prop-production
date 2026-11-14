@@ -117,8 +117,36 @@ def validate_market_inputs(
         raise ValueError("SHORTFALL_BELOW_30_BPS")
     if decimal(policy["hedge_tolerance"]) > Decimal("0.1"):
         raise ValueError("HEDGE_TOLERANCE")
+    allowed_instruments: set[str] | None = None
+    if "allowed_instrument_types" in policy:
+        raw_instruments = policy["allowed_instrument_types"]
+        if not isinstance(raw_instruments, (list, tuple)) or not raw_instruments or not all(
+            isinstance(item, str) and item.strip() for item in raw_instruments
+        ):
+            raise ValueError("RISK_POLICY_UNKNOWN")
+        allowed_instruments = {item.strip() for item in raw_instruments}
+    blocked_symbols: set[str] = set()
+    if "blocked_symbols" in policy:
+        raw_blocked = policy["blocked_symbols"]
+        if not isinstance(raw_blocked, (list, tuple)) or not all(
+            isinstance(item, str) and item.strip() for item in raw_blocked
+        ):
+            raise ValueError("RISK_POLICY_UNKNOWN")
+        blocked_symbols = {item.strip().upper() for item in raw_blocked}
+    if ("low_cap_mcap_threshold_usd" in policy) != ("low_cap_max_notional" in policy):
+        raise ValueError("RISK_POLICY_UNKNOWN")
+    if "low_cap_mcap_threshold_usd" in policy:
+        if (
+            decimal(policy["low_cap_mcap_threshold_usd"]) <= 0
+            or decimal(policy["low_cap_max_notional"]) <= 0
+        ):
+            raise ValueError("RISK_POLICY_AMOUNTS")
     for m in needed:
         spec = markets[m]
+        if m.strip().upper() in blocked_symbols or str(spec.get("symbol", "")).strip().upper() in blocked_symbols:
+            raise ValueError("CHALLENGE_SYMBOL_PROHIBITED")
+        if allowed_instruments is not None and spec.get("instrument_type") not in allowed_instruments:
+            raise ValueError("CHALLENGE_INSTRUMENT_PROHIBITED")
         if (
             spec["verified"] is not True
             or spec["source_mode"] != policy["source_mode"]
@@ -309,9 +337,26 @@ def _size(
         cost = ZERO
         costs_by_market: dict[str, Decimal] = {}
         margin = ZERO
+        low_cap_threshold = (
+            decimal(policy["low_cap_mcap_threshold_usd"])
+            if "low_cap_mcap_threshold_usd" in policy
+            else None
+        )
+        low_cap_max = (
+            decimal(policy["low_cap_max_notional"]) if "low_cap_max_notional" in policy else None
+        )
         for m, (lo, hi) in bounds.items():
             spec = markets[m]
             max_qty = gross_by_market[m] if checkpoint else max(abs(lo), abs(hi))
+            if low_cap_threshold is not None and low_cap_max is not None:
+                is_low_cap = spec.get("is_low_cap") is True or (
+                    spec.get("market_cap_usd") is not None
+                    and decimal(spec["market_cap_usd"]) < low_cap_threshold
+                )
+                if is_low_cap and max_qty * prices[m] > low_cap_max:
+                    valid = False
+                    reasons.add("LOW_CAP_EXPOSURE_CAP")
+                    break
             max_shock = max(abs(decimal(s[m])) for s in policy["scenarios"])
             stressed_notional = max_qty * prices[m] * (ONE + max_shock)
             tier = next((t for t in spec["tiers"] if stressed_notional <= decimal(t["cap"])), None)

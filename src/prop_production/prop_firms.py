@@ -979,3 +979,56 @@ def list_challenge_specs(firm_slug: str | None = None) -> tuple[ChallengeRuleboo
         return tuple(CHALLENGE_RULEBOOKS.values())
     slug = firm_slug.strip().lower()
     return tuple(spec for spec in CHALLENGE_RULEBOOKS.values() if spec.firm_slug == slug)
+
+
+def hyrotrader_policy(
+    base_policy: dict[str, Any],
+    *,
+    initial: str | Decimal = "5000",
+) -> dict[str, Any]:
+    """Overlay HyroTrader non-financial policy guards onto a risk_policy_v1 dict."""
+    initial_dec = decimal(initial)
+    if initial_dec <= 0:
+        raise ValueError("RULEBOOK_AMOUNTS")
+    policy = dict(base_policy)
+    policy["allowed_instrument_types"] = ["usdt_perp"]
+    policy["blocked_symbols"] = ["EUR/USD", "EURUSD", "EUR/USD:USDT", "EUR/USDT:USDT"]
+    policy["low_cap_mcap_threshold_usd"] = "100000000"
+    policy["low_cap_max_notional"] = _fmt_decimal(initial_dec * Decimal("0.05"))
+    return policy
+
+
+def consistency_progress(
+    day_profits: dict[str, str | Decimal],
+    *,
+    target: str | Decimal,
+    max_single_day_pct: int | None,
+) -> dict[str, Any]:
+    """Evaluate single-day profit distribution cap (e.g. HyroTrader 40% eval rule)."""
+    target_dec = decimal(target)
+    if target_dec < 0:
+        raise ValueError("RULEBOOK_AMOUNTS")
+    cap_per_day = (
+        target_dec * Decimal(max_single_day_pct) / Decimal("100")
+        if max_single_day_pct is not None and target_dec > 0
+        else None
+    )
+    total_profit = Decimal("0")
+    eligible_profit = Decimal("0")
+    capped_days: list[str] = []
+    for day in sorted(day_profits):
+        pnl = decimal(day_profits[day])
+        total_profit += pnl
+        if cap_per_day is not None and pnl > cap_per_day:
+            eligible_profit += cap_per_day
+            capped_days.append(day)
+        else:
+            eligible_profit += pnl
+    return {
+        "total_profit": _fmt_decimal(total_profit),
+        "eligible_profit": _fmt_decimal(eligible_profit),
+        "target": _fmt_decimal(target_dec),
+        "cap_per_day": _fmt_decimal(cap_per_day) if cap_per_day is not None else None,
+        "capped_days": capped_days,
+        "target_met": target_dec > 0 and eligible_profit >= target_dec,
+    }
