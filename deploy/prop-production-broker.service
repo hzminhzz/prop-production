@@ -8,7 +8,7 @@ Type=simple
 User=prop-runtime
 Group=prop
 UMask=0077
-ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.worker broker /var/lib/prop-production
+ExecStart=/opt/prop-production/current/venv/bin/python -m prop_production.judge.broker /var/lib/prop-production
 # A SIGKILLed predecessor leaves a stale socket; the unit is single-instance,
 # so removing it at start cannot race a live server.
 ExecStartPre=-/usr/bin/rm -f /var/lib/prop-production/broker/b.sock

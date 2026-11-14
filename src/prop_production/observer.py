@@ -13,6 +13,7 @@ import asyncio
 import os
 import signal
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -75,8 +76,6 @@ def observation_record(result: Any, *, now_ms: int) -> dict[str, Any]:
 
 async def observe_once() -> dict[str, Any]:
     """One native-evidence observation via the pinned connector's v1 contract."""
-    from dataclasses import asdict
-
     from connectors.propr.account import ReadOnlyAccount, discover_account
     from connectors.propr.config import Environment, ProprConfig
     from connectors.propr.native_evidence import inspect_native_evidence
@@ -94,7 +93,7 @@ async def observe_once() -> dict[str, Any]:
             known_at_ms=int(time.time() * 1000), stream_connected=False)
         return asdict(native)
     finally:
-        await reader.close()  # connection cleanup on every path
+        await reader.close()
 
 
 async def observe_loop(state_dir: Path, *, poll_seconds: int = POLL_SECONDS) -> None:

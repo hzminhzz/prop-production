@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .contracts import is_synthetic_scope
+
 FACTS = {"net_order", "reduce_only", "cross_zero"}
 FIELDS = {
     "schema",
@@ -59,10 +61,7 @@ def permits(
             or not fact["provenance"].strip()
         ):
             raise ValueError("CAPABILITY_EVIDENCE_REQUIRED")
-        if status == "SYNTHETIC" and (raw["account"], raw["endpoint"]) != (
-            "fixture-account",
-            "fake://broker",
-        ):
+        if status == "SYNTHETIC" and not is_synthetic_scope(raw["account"], raw["endpoint"]):
             raise ValueError("SYNTHETIC_CAPABILITY_SCOPE")
         if status == "VERIFIED" and not raw["endpoint"].startswith("https://"):
             raise ValueError("NATIVE_CAPABILITY_ENDPOINT")

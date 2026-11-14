@@ -6,15 +6,18 @@ import copy
 import fcntl
 import hashlib
 import os
+import re
 import sqlite3
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .evidence import canonical, digest, load_json
+from .contracts import is_synthetic_account
+from .evidence import canonical, digest, load_json, verify
 from .financial_semantics import CONTRACT as SEMANTIC_V2
 from .financial_semantics import validate_transition
+from .recovery import require_real_remediation
 
 ZERO = "0" * 64
 State = dict[str, Any]
@@ -287,7 +290,7 @@ class Journal:
         discarded (audited here) and the next boundary-aligned reconcile
         bootstraps fresh from provider evidence.
         """
-        if self.snapshot()["account_binding"] != "fixture-account":
+        if not is_synthetic_account(self.snapshot()["account_binding"]):
             # SHA-shaped text is not remediation of a protected financial HALT.
             raise ValueError("PROTECTED_RECOVERY_REQUIRES_SIGNED_CAUSE_SPECIFIC_PROOF")
         if reason not in self.snapshot()["halts"]:
@@ -343,23 +346,17 @@ class Journal:
         never substitutes for verified provider history, conservation or scope.
         Production keys/trust pins are injected externally; none are provisioned.
         """
-        import re
-
-        from .evidence import digest as evidence_digest
-        from .evidence import verify as verify_evidence
-        from .recovery import require_real_remediation
-
         if not hasattr(recovery_key, "public_bytes_raw"):
             raise ValueError("RECOVERY_PROTECTED_SIGNER_REQUIRED")
         key_sha = hashlib.sha256(recovery_key.public_bytes_raw()).hexdigest()
         prior = self.snapshot()
-        if prior["account_binding"] != "fixture-account" and (
+        if not is_synthetic_account(prior["account_binding"]) and (
             expected_recovery_key_sha != key_sha or not forbidden_key_shas
         ):
             raise ValueError("RECOVERY_PROTECTED_KEY_TRUST_FLOOR_MISSING")
         if key_sha in (revoked_key_shas or set()) or key_sha in (forbidden_key_shas or set()):
             raise ValueError("RECOVERY_SIGNER_REVOKED_OR_WRONG_AUTHORITY")
-        request = verify_evidence(signed_request, recovery_key, "guardian-recovery-operator")
+        request = verify(signed_request, recovery_key, "guardian-recovery-operator")
         runtime = prior["runtime"]
         nonce = request.get("nonce")
         reason = request.get("reason")
@@ -409,7 +406,7 @@ class Journal:
         new_runtime["boot_epoch"] += 1
         new_runtime["broker_epoch"] += 1
         next_state.setdefault("recovery_nonces", {})[nonce] = {
-            "request_sha": evidence_digest(request),
+            "request_sha": digest(request),
             "head_at_request": self._head,
             "remediation_sha": proof_sha,
         }
@@ -419,7 +416,7 @@ class Journal:
             "reason": reason,
             "operator": request["operator"],
             "incident_id": request["incident_id"],
-            "request_sha": evidence_digest(request),
+            "request_sha": digest(request),
             "remediation_sha": proof_sha,
             "recovery_key_sha": key_sha,
             "at_ms": now_ms,
@@ -428,7 +425,7 @@ class Journal:
         recovery_kind = "RECOVER_AUTH_" + reason
         self._verified_recovery_commit = (
             recovery_kind,
-            evidence_digest(request),
+            digest(request),
             proof_sha,
             self._seq,
         )
@@ -455,8 +452,6 @@ class Journal:
         records new forward assurance, NOT a restatement of old financial data
         or permission for protected trading.
         """
-        from .recovery import require_real_remediation
-
         previous = self.snapshot()
         if previous.get("_semantic_contract") == SEMANTIC_V2:
             raise ValueError("GUARDIAN_SEMANTIC_CHECKPOINT_ALREADY_ESTABLISHED")

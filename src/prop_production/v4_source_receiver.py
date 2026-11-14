@@ -11,6 +11,7 @@ financial admission. It records source continuity and T+300 eligibility.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -23,8 +24,37 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .evidence import digest, load_json, verify
-from .release import ReleaseFloor, ReleaseVerifier, VerifiedRelease
+from .checkpoint_source import (
+    AUTHORITY as CHECKPOINT_AUTHORITY,
+)
+from .checkpoint_source import (
+    GRID_MS,
+    fields,
+    integer,
+    validate_pins,
+    verify_transition,
+)
+from .checkpoint_source import (
+    ZERO as CHECKPOINT_ZERO,
+)
+from .compatibility import load_manifest
+from .contracts import (
+    CHECKPOINT_SCHEMA_V3,
+    PORTFOLIO_RELEASE_V2,
+    V4_BINDING_V1,
+    V4_BINDING_V2,
+    V4_EXPORT_V1,
+    V4_EXPORT_V2,
+)
+from .evidence import canonical, digest, load_json, require_sha, verify
+from .release import (
+    ReleaseFloor,
+    ReleaseVerifier,
+    VerifiedRelease,
+    binding_sha,
+    replay_release_binding,
+    transition_release_binding,
+)
 from .v4_timing import V4ShadowProjection
 
 MAX_PACKET_BYTES = 16_000_000
@@ -49,7 +79,7 @@ def _read_pinned(path: Path, *, allow_group_read: bool = False) -> bytes:
     return data
 
 
-def _validated_batch(
+def validated_batch(
     raw: bytes,
     key: Ed25519PublicKey,
     members: set[str],
@@ -57,14 +87,11 @@ def _validated_batch(
     body = load_json(raw)
     if not isinstance(body, dict) or body.get("trading_authorized") is not False:
         raise ValueError("V4_BATCH_SCHEMA")
-    v2 = body.get("schema") == "v4_signed_source_export_v2"
+    v2 = body.get("schema") == V4_EXPORT_V2
     expected_keys = {"schema", "head_cursors", "events", "trading_authorized", "batch_envelope"} | (
         {"anchor"} if v2 else set()
     )
-    if set(body) != expected_keys or body["schema"] not in (
-        "v4_signed_source_export_v1",
-        "v4_signed_source_export_v2",
-    ):
+    if set(body) != expected_keys or body["schema"] not in (V4_EXPORT_V1, V4_EXPORT_V2):
         raise ValueError("V4_BATCH_SCHEMA")
     binding = verify(body["batch_envelope"], key, "source-observer-v4-batch")
     expected_binding_keys = {
@@ -76,8 +103,7 @@ def _validated_batch(
     } | ({"anchor_sha", "wire_epoch"} if v2 else set())
     if (
         set(binding) != expected_binding_keys
-        or binding["schema"]
-        != ("v4_source_batch_binding_v2" if v2 else "v4_source_batch_binding_v1")
+        or binding["schema"] != (V4_BINDING_V2 if v2 else V4_BINDING_V1)
         or binding["trading_authorized"] is not False
         or binding["head_cursors"] != body["head_cursors"]
         or binding["events_sha"] != digest(body["events"])
@@ -154,6 +180,366 @@ def _validated_batch(
     return body, selected, heads
 
 
+def validate_source_packet(raw: bytes, source_key: Ed25519PublicKey) -> None:
+    """Authenticate an incoming packet before root handoff regardless of wire version."""
+    packet = load_json(raw)
+    if packet.get("authority") == CHECKPOINT_SCHEMA_V3:
+        proof = verify(packet, source_key, CHECKPOINT_SCHEMA_V3)
+        if proof["schema"] != "cwsa_checkpoint_packet_v3" or proof["trading_authorized"] is not False:
+            raise ValueError("CWSA_HANDOFF_SCHEMA")
+        validate_pins(
+            {"policy": proof["policy"], "scopes": {proof["scope"]["source_id"]: proof["scope"]}}
+        )
+        for raw_sha, original in proof["originals"].items():
+            if sha256(original.encode()).hexdigest() != raw_sha:
+                raise ValueError("CWSA_HANDOFF_ORIGINAL_HASH")
+        for event in proof["transitions"]:
+            verify_transition(
+                proof["scope"],
+                proof["policy"],
+                event,
+                proof["originals"],
+                issued_ms=proof["issued_ms"],
+            )
+        return
+    proof = verify(packet["batch_envelope"], source_key, "source-observer-v4-batch")
+    validated_batch(raw, source_key, set(proof["selected"].values()))
+
+
+class CheckpointProjection:
+    """Private source evidence only. No Guardian journal, permit or broker access."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        release_sha: str,
+        source_key: Ed25519PublicKey,
+        pins: dict[str, Any],
+        release: VerifiedRelease | None = None,
+    ) -> None:
+        fields(pins, {"policy", "scopes"})
+        validate_pins(pins)
+        self.pins = dict(load_json(canonical(pins)))
+        self.key = source_key
+        self.release = release
+        self.path = path
+        self.lock: int | None = None
+        self.con: sqlite3.Connection | None = None
+        if path.is_symlink() or not path.parent.is_dir() or path.parent.stat().st_mode & 0o077:
+            raise ValueError("CWSA_PRIVATE_RECEIVER_PATH")
+        if not pins["scopes"]:
+            raise ValueError("CWSA_PINNED_SCOPES_REQUIRED")
+        self.lock = os.open(
+            path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.con = sqlite3.connect(path, isolation_level=None, timeout=0.1)
+            tables = {
+                r[0] for r in self.con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if tables and "cwsa_receiver_meta" not in tables:
+                raise ValueError("CWSA_LEGACY_DATABASE_MIX")
+            self.con.execute("PRAGMA journal_mode=WAL")
+            self.con.execute("PRAGMA synchronous=FULL")
+            self.con.executescript(
+                "CREATE TABLE IF NOT EXISTS cwsa_receiver_meta(id INTEGER PRIMARY KEY, binding TEXT);"
+                "CREATE TABLE IF NOT EXISTS cwsa_receiver_heads(source_id TEXT PRIMARY KEY,"
+                " seq INTEGER NOT NULL,state TEXT NOT NULL,sha TEXT NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS cwsa_receiver_events(source_id TEXT,seq INTEGER,"
+                " payload TEXT NOT NULL,sha TEXT NOT NULL,PRIMARY KEY(source_id,seq));"
+                "CREATE TABLE IF NOT EXISTS cwsa_receiver_packets(sha TEXT PRIMARY KEY,"
+                " payload TEXT NOT NULL,received_ms INTEGER NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS cwsa_release_transitions(seq INTEGER PRIMARY KEY,payload TEXT NOT NULL);"
+            )
+            binding = digest(
+                {
+                    "release_sha": release_sha,
+                    "pins": pins,
+                    "source_key": sha256(source_key.public_bytes_raw()).hexdigest(),
+                }
+            )
+            row = self.con.execute("SELECT binding FROM cwsa_receiver_meta WHERE id=1").fetchone()
+            if row is None:
+                self.con.execute("INSERT INTO cwsa_receiver_meta VALUES(1,?)", (binding,))
+            else:
+                self._verify_release_bindings(row[0], binding)
+            os.chmod(path, 0o600)
+            if self.con.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                raise ValueError("CWSA_RECEIVER_CORRUPT")
+            self._verify_heads()
+        except BaseException:
+            self.close()
+            raise
+
+    def _verify_release_bindings(self, genesis: str, expected: str) -> None:
+        assert self.con is not None
+        previous, state, count = genesis, None, 0
+        for sequence, raw in self.con.execute(
+            "SELECT seq,payload FROM cwsa_release_transitions ORDER BY seq"
+        ):
+            if self.release is None or self.release.payload["schema"] != PORTFOLIO_RELEASE_V2:
+                raise ValueError("CWSA_RELEASE_REBIND_CONTEXT")
+            record = replay_release_binding(
+                load_json(raw),
+                authority_sha=self.release.payload["mandate_authority_sha"],
+                source_key=self.key,
+            )
+            if (
+                sequence != count + 1
+                or record["predecessor"]["binding_sha"] != previous
+                or (state is not None and record["predecessor"] != state)
+            ):
+                raise ValueError("CWSA_RELEASE_REBIND_CHAIN")
+            state = record["successor"]
+            previous, count = state["binding_sha"], sequence
+        if previous != expected:
+            raise ValueError("CWSA_RECEIVER_TRUST_DRIFT")
+
+    def rebind(self, release: VerifiedRelease, key: Ed25519PublicKey, *, now_ms: int) -> None:
+        assert self.con is not None
+        if self.release is None:
+            raise ValueError("CWSA_RELEASE_REBIND_CONTEXT")
+        if release.release_sha == self.release.release_sha:
+            return
+        record = transition_release_binding(self.release, release, key, self.key, at_ms=now_ms).data
+        expected = binding_sha(self.release.release_sha, self.pins, self.key)
+        self.con.execute("BEGIN IMMEDIATE")
+        try:
+            genesis = self.con.execute(
+                "SELECT binding FROM cwsa_receiver_meta WHERE id=1"
+            ).fetchone()[0]
+            self._verify_release_bindings(genesis, expected)
+            count = self.con.execute("SELECT COUNT(*) FROM cwsa_release_transitions").fetchone()[0]
+            self.con.execute(
+                "INSERT INTO cwsa_release_transitions VALUES(?,?)",
+                (count + 1, canonical(record).decode()),
+            )
+            self.con.execute("COMMIT")
+        except BaseException:
+            self.con.execute("ROLLBACK")
+            raise
+        self.release = release
+
+    def _verify_heads(self) -> None:
+        assert self.con is not None
+        proofs: dict[tuple[str, int], str] = {}
+        for packet_sha, raw, received_ms in self.con.execute("SELECT * FROM cwsa_receiver_packets"):
+            if sha256(raw.encode()).hexdigest() != packet_sha:
+                raise ValueError("CWSA_RESTART_PACKET_HASH")
+            body = self._packet(raw.encode(), now_ms=received_ms)
+            for event in body["transitions"]:
+                verify_transition(
+                    body["scope"],
+                    body["policy"],
+                    event,
+                    body["originals"],
+                    issued_ms=body["issued_ms"],
+                )
+                key = (body["scope"]["source_id"], event["sequence"])
+                event_sha = digest(event)
+                if key in proofs and proofs[key] != event_sha:
+                    raise ValueError("CWSA_RESTART_EQUIVOCATION")
+                proofs[key] = event_sha
+        seen = set()
+        for source, seq, state, head in self.con.execute("SELECT * FROM cwsa_receiver_heads"):
+            previous = CHECKPOINT_ZERO
+            current = None
+            count = 0
+            for number, payload, event_sha in self.con.execute(
+                "SELECT seq,payload,sha FROM cwsa_receiver_events WHERE source_id=? ORDER BY seq",
+                (source,),
+            ):
+                event = load_json(payload)
+                if (
+                    number != count + 1
+                    or digest(event) != event_sha
+                    or proofs.get((source, number)) != event_sha
+                    or event["prior_sha"] != previous
+                    or (current is not None and event["predecessor"] != current)
+                ):
+                    raise ValueError("CWSA_RECEIVER_CHAIN")
+                seen.add((source, number))
+                current, previous, count = event["successor"], event_sha, number
+            if count != seq or current != load_json(state) or previous != head:
+                raise ValueError("CWSA_RECEIVER_HEAD")
+        if seen != set(proofs):
+            raise ValueError("CWSA_RESTART_PROOF_COVERAGE")
+
+    def _packet(self, raw: bytes, *, now_ms: int) -> dict[str, Any]:
+        integer(now_ms)
+        if len(raw) > 16 * 1024 * 1024:
+            raise ValueError("CWSA_PACKET_LIMIT")
+        body = verify(load_json(raw), self.key, CHECKPOINT_AUTHORITY)
+        fields(
+            body,
+            {
+                "schema",
+                "scope",
+                "policy",
+                "transitions",
+                "originals",
+                "issued_ms",
+                "trading_authorized",
+            },
+        )
+        if body["schema"] != "cwsa_checkpoint_packet_v3" or body["trading_authorized"] is not False:
+            raise ValueError("CWSA_PACKET_VERSION")
+        scope, policy = body["scope"], body["policy"]
+        if scope != self.pins["scopes"].get(scope["source_id"]) or policy != self.pins["policy"]:
+            raise ValueError("CWSA_PACKET_SCOPE_OR_POLICY")
+        if integer(body["issued_ms"]) > now_ms:
+            raise ValueError("CWSA_PACKET_FUTURE")
+        transitions = body["transitions"]
+        if not isinstance(transitions, list) or not 1 <= len(transitions) <= 256:
+            raise ValueError("CWSA_PACKET_TRANSITION_LIMIT")
+        if not isinstance(body["originals"], dict):
+            raise ValueError("CWSA_ORIGINALS")
+        for raw_sha, original in body["originals"].items():
+            if not isinstance(original, str) or sha256(original.encode()).hexdigest() != raw_sha:
+                raise ValueError("CWSA_ORIGINAL_HASH")
+        return body
+
+    def ingest(self, raw: bytes, *, now_ms: int) -> dict[str, Any]:
+        assert self.con is not None
+        body = self._packet(raw, now_ms=now_ms)
+        scope, policy, transitions = body["scope"], body["policy"], body["transitions"]
+        packet_sha = sha256(raw).hexdigest()
+        if self.con.execute(
+            "SELECT 1 FROM cwsa_receiver_packets WHERE sha=?", (packet_sha,)
+        ).fetchone():
+            return {
+                "schema": "cwsa_protected_receiver_v3",
+                "state": "DUPLICATE",
+                "events": 0,
+                "trading_authorized": False,
+            }
+        source = scope["source_id"]
+        row = self.con.execute(
+            "SELECT seq,state,sha FROM cwsa_receiver_heads WHERE source_id=?", (source,)
+        ).fetchone()
+        sequence, current, prior = (
+            (0, None, CHECKPOINT_ZERO) if row is None else (row[0], load_json(row[1]), row[2])
+        )
+        validated = []
+        for event in transitions:
+            if integer(event["sequence"]) <= sequence:
+                seen = self.con.execute(
+                    "SELECT sha FROM cwsa_receiver_events WHERE source_id=? AND seq=?",
+                    (source, event["sequence"]),
+                ).fetchone()
+                if seen != (digest(event),):
+                    raise ValueError("CWSA_SOURCE_EQUIVOCATION")
+                continue
+            if event["sequence"] != sequence + 1 or event["prior_sha"] != prior:
+                raise ValueError("CWSA_SOURCE_PREDECESSOR")
+            if current is not None and event["predecessor"] != current:
+                raise ValueError("CWSA_SOURCE_STATE")
+            verify_transition(scope, policy, event, body["originals"], issued_ms=body["issued_ms"])
+            sequence, current, prior = event["sequence"], event["successor"], digest(event)
+            validated.append(event)
+        self.con.execute("BEGIN IMMEDIATE")
+        try:
+            for event in validated:
+                self.con.execute(
+                    "INSERT INTO cwsa_receiver_events VALUES (?,?,?,?)",
+                    (source, event["sequence"], canonical(event).decode(), digest(event)),
+                )
+            if current is not None:
+                self.con.execute(
+                    "INSERT INTO cwsa_receiver_heads VALUES (?,?,?,?) ON CONFLICT(source_id)"
+                    " DO UPDATE SET seq=excluded.seq,state=excluded.state,sha=excluded.sha",
+                    (source, sequence, canonical(current).decode(), prior),
+                )
+            self.con.execute(
+                "INSERT INTO cwsa_receiver_packets VALUES (?,?,?)",
+                (packet_sha, raw.decode(), now_ms),
+            )
+            self.con.execute("COMMIT")
+        except BaseException:
+            self.con.execute("ROLLBACK")
+            raise
+        return {
+            "schema": "cwsa_protected_receiver_v3",
+            "state": "EVIDENCE_COLLECTED",
+            "events": len(validated),
+            "trading_authorized": False,
+        }
+
+    def status(self) -> dict[str, Any]:
+        assert self.con is not None
+        heads = {
+            r[0]: {"cursor": r[1], "phase": load_json(r[2])["phase"], "head": r[3]}
+            for r in self.con.execute("SELECT * FROM cwsa_receiver_heads")
+        }
+        return {
+            "schema": "cwsa_protected_receiver_v3",
+            "source_count": len(heads),
+            "sources": heads,
+            "order_route": "NONE",
+            "trading_authorized": False,
+        }
+
+    def outcomes(self, *, now_ms: int) -> list[dict[str, Any]]:
+        assert self.con is not None
+        integer(now_ms)
+        result = []
+        phases = {
+            r[0]: load_json(r[1])["phase"]
+            for r in self.con.execute("SELECT source_id,state FROM cwsa_receiver_heads")
+        }
+        for (payload,) in self.con.execute(
+            "SELECT payload FROM cwsa_receiver_events ORDER BY source_id,seq"
+        ):
+            event = load_json(payload)
+            outcome = event["effect"]
+            if outcome is None:
+                continue
+            sample = outcome["sample"]
+            deadline = outcome["checkpoint_ms"] + GRID_MS
+            if sample is not None and sample["kind"] == "COMPLETE":
+                deadline = min(
+                    deadline,
+                    min(r["state_ms"] for r in sample["receipts"])
+                    + self.pins["policy"]["limits"]["max_state_age_ms"],
+                )
+            result.append(
+                {
+                    "outcome": outcome,
+                    "source_cursor": event["sequence"],
+                    "source_chain_sha": digest(event),
+                    "deadline_ms": deadline,
+                    "opening_candidate": phases[event["source_id"]] == "CONTINUOUS"
+                    and outcome["kind"] == "CHANGED"
+                    and outcome["published_ms"] <= now_ms < deadline,
+                    "trading_authorized": False,
+                }
+            )
+        return result
+
+    def packet_for(self, outcome_id: str) -> dict[str, Any]:
+        """Return the original signed envelope proving a committed source outcome."""
+        assert self.con is not None
+        require_sha(outcome_id)
+        for (raw,) in self.con.execute("SELECT payload FROM cwsa_receiver_packets ORDER BY rowid"):
+            envelope = load_json(raw)
+            if any(
+                t["effect"] is not None and t["effect"]["outcome_id"] == outcome_id
+                for t in envelope["payload"]["transitions"]
+            ):
+                return dict(envelope)
+        raise ValueError("CWSA_OUTCOME_PROOF_MISSING")
+
+    def close(self) -> None:
+        if self.con is not None:
+            self.con.close()
+            self.con = None
+        if self.lock is not None:
+            os.close(self.lock)
+            self.lock = None
+
+
 class SourcePacketReceiver:
     """One private SQLite writer: signed source events + read-only eligibility."""
 
@@ -175,8 +561,6 @@ class SourcePacketReceiver:
         self.quarantine_key = quarantine_key
         if wire_version not in (1, 2, 3):
             raise ValueError("V4_RECEIVER_WIRE_VERSION_INVALID")
-        from .compatibility import load_manifest
-
         supported = load_manifest()["contracts"].get("source_wire_versions", [1])
         if wire_version not in supported:
             raise ValueError("V4_WIRE_NOT_PINNED_BY_COMPATIBILITY")
@@ -185,11 +569,9 @@ class SourcePacketReceiver:
         self.source_key = source_key
         self.wire_version = wire_version
         self.projector: V4ShadowProjection | None = None
-        from .checkpoint_source import CheckpointProjection
-
         self.checkpoint: CheckpointProjection | None = None
         if wire_version == 3:
-            if release.payload["schema"] == "portfolio_release_v2":
+            if release.payload["schema"] == PORTFOLIO_RELEASE_V2:
                 signed_pins = {
                     "policy": release.payload["checkpoint_policy"],
                     "scopes": release.payload["checkpoint_scopes"],
@@ -360,8 +742,8 @@ class SourcePacketReceiver:
         if self.checkpoint is not None:
             return self.checkpoint.ingest(raw, now_ms=now_ms)
         members = {m["source_identity"] for m in self.release.payload["members"]}
-        packet, selected, heads = _validated_batch(raw, self.source_key, members)
-        incoming_wire = 2 if packet["schema"] == "v4_signed_source_export_v2" else 1
+        packet, selected, heads = validated_batch(raw, self.source_key, members)
+        incoming_wire = 2 if packet["schema"] == V4_EXPORT_V2 else 1
         if incoming_wire != self.wire_version:
             raise ValueError("V4_SOURCE_WIRE_DOWNGRADE_OR_MIXED_VERSION")
         anchor = (

@@ -2,24 +2,38 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from .checkpoint_account_proof import validate as validate_account_proof
 from .checkpoint_accounting import add, split
-from .checkpoint_risk import effective_policy
+from .checkpoint_risk import (
+    account_anchor,
+    check_prerequisites,
+    effective_policy,
+    execution_policy,
+)
 from .checkpoint_source import fields, integer
+from .contracts import (
+    CHECKPOINT_POLICY_V3,
+    PORTFOLIO_RELEASE_V2,
+    SYNTHETIC_ENDPOINT,
+    TERMINAL_INTENT_STATUSES,
+    is_synthetic_account,
+    is_synthetic_scope,
+    require_synthetic_execution,
+)
+from .copy_mandates import mandate_authority
 from .evidence import decimal, digest, load_json, require_sha, verify
-from .gateway import execution_capability
-from .guardian_checkpoints import _authority
+from .gateway import BrokerGateway, execution_capability
+from .risk import validate_market_inputs
 
-if TYPE_CHECKING:
-    from .guardian import Guardian
-
-TERMINAL = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "NOT_ACCEPTED", "REVOKED"}
+TERMINAL = TERMINAL_INTENT_STATUSES
 
 
 @dataclass(frozen=True)
@@ -78,20 +92,15 @@ def command_body(envelope: dict[str, Any], key: Ed25519PublicKey) -> dict[str, A
 
 
 def derive(state: dict[str, Any], record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    from .checkpoint_admission import account_anchor
-    from .risk import _validate
-
     body, proof, at_ms = record["body"], record["account_proof"], record["at_ms"]
     policy, markets, quotes = record["policy"], record["markets"], record["quotes"]
     cfg = effective_policy(state, policy, markets)["checkpoint_execution"]
     market = body["market"]
-    _validate(markets, policy, {market}, at_ms)
-    from .checkpoint_account_proof import validate
-
-    validate(
+    validate_market_inputs(markets, policy, {market}, at_ms)
+    validate_account_proof(
         state, proof, quotes, cfg, {market}, now_ms=at_ms, synthetic=True, feature="reduce_only"
     )
-    if state["account_binding"] != "fixture-account" or proof["endpoint"] != "fake://broker":
+    if not is_synthetic_scope(state["account_binding"], proof["endpoint"]):
         raise ValueError("PROTECTIVE_SYNTHETIC_SCOPE")
     old, quantity = decimal(state["positions"].get(market, "0")), decimal(body["quantity"])
     if not old or old * quantity >= 0 or abs(quantity) > abs(old):
@@ -161,7 +170,7 @@ def derive(state: dict[str, Any], record: dict[str, Any]) -> tuple[dict[str, Any
     intent = {
         "intent_id": identity,
         "account_binding": body["account_binding"],
-        "endpoint": "fake://broker",
+        "endpoint": SYNTHETIC_ENDPOINT,
         "decision_id": request_id,
         "release_sha": body["release_sha"],
         "market": market,
@@ -178,7 +187,7 @@ def derive(state: dict[str, Any], record: dict[str, Any]) -> tuple[dict[str, Any
         "pod_changes": {p: str(q) for p, q in changes.items()},
         "proof_sha": digest(record),
         "reservation_id": request_id,
-        "checkpoint_policy": "CWSA_CHECKPOINT_V3",
+        "checkpoint_policy": CHECKPOINT_POLICY_V3,
         "opportunity_ids": [],
         "account_max_age_ms": cfg["account_max_age_ms"],
         "protection_id": request_id,
@@ -187,34 +196,45 @@ def derive(state: dict[str, Any], record: dict[str, Any]) -> tuple[dict[str, Any
     return intent, {"loss": str(cost), "margin": "0", "cost": str(cost), "intent_ids": [identity]}
 
 
-def protect(
-    guardian: Guardian, envelope: dict[str, Any], *, quotes: dict[str, Any], now_ms: int
-) -> str:
-    from .checkpoint_admission import _prerequisites, account_anchor, execution_policy
-
-    key = _authority(guardian)
+def prepare_protective_reduction(
+    state: dict[str, Any],
+    *,
+    head_sha: str,
+    release_payload: dict[str, Any],
+    release_authority: str,
+    signed_release: bytes | None,
+    mandate_key: Ed25519PublicKey | None,
+    rules_status: str,
+    policy: dict[str, Any],
+    markets: dict[str, Any],
+    gateway: BrokerGateway,
+    scope_reasons: list[str],
+    envelope: dict[str, Any],
+    quotes: dict[str, Any],
+    now_ms: int,
+) -> tuple[str, dict[str, Any] | None]:
+    key = mandate_authority(mandate_key, release_payload, signed=signed_release is not None)
     body = command_body(envelope, key)
-    state = guardian.journal.snapshot()
     identity = digest(["guardian_protection_v1", body["account_binding"], body["nonce"]])
     prior = state.get("protective_reductions", {}).get(identity)
     if prior is not None:
         if prior["record"]["envelope"] != envelope:
             raise ValueError("PROTECTIVE_NONCE_REUSE")
-        return str(prior["transition"]["successor"]["intent_id"])
-    if (
-        guardian.gateway.synthetic is not True
-        or guardian.release.payload["source_mode"] != "SYNTHETIC"
-        or guardian.rules.status != "SYNTHETIC"
-        or state["account_binding"] != "fixture-account"
-    ):
-        raise PermissionError("REMOTE_MUTATION_UNAVAILABLE")
-    if guardian._scope(now_ms) or body["predecessor_sha"] != guardian.journal.head:
+        return str(prior["transition"]["successor"]["intent_id"]), None
+    require_synthetic_execution(
+        gateway_synthetic=gateway.synthetic,
+        gateway_endpoint=getattr(gateway, "endpoint", None),
+        source_mode=release_payload["source_mode"],
+        rules_status=rules_status,
+        account_binding=state["account_binding"],
+    )
+    if scope_reasons or body["predecessor_sha"] != head_sha:
         raise ValueError("PROTECTIVE_RELEASE_OR_PREDECESSOR")
     if state["reservations"] or any(i["status"] not in TERMINAL for i in state["intents"].values()):
         raise ValueError("PROTECTIVE_UNRESOLVED_OBLIGATIONS")
-    cfg = execution_policy(guardian, state)
-    reasons, proof = _prerequisites(
-        guardian,
+    cfg = execution_policy(state, policy, markets)
+    reasons, proof = check_prerequisites(
+        gateway,
         state,
         quotes,
         cfg,
@@ -224,21 +244,22 @@ def protect(
     )
     if reasons:
         raise ValueError("PROTECTIVE_PREREQUISITES:" + ",".join(reasons))
-    assert guardian.release.signed_envelope is not None
+    assert signed_release is not None
+    next_state = copy.deepcopy(state)
     record = {
         "body": body,
         "envelope": envelope,
         "at_ms": now_ms,
         "authority_public": key.public_bytes_raw().hex(),
-        "release_envelope": load_json(guardian.release.signed_envelope),
-        "release_authority": guardian.release.authority,
+        "release_envelope": load_json(signed_release),
+        "release_authority": release_authority,
         "account_proof": proof,
-        "account_sha": account_anchor(state),
-        "policy": guardian.policy,
-        "markets": guardian.markets,
+        "account_sha": account_anchor(next_state),
+        "policy": policy,
+        "markets": markets,
         "quotes": quotes,
     }
-    intent, reservation = derive(state, record)
+    intent, reservation = derive(next_state, record)
     transition = ProtectionTransition(
         ProtectionState(identity, "UNCOMMITTED", None),
         "AUTHORIZE_REDUCTION",
@@ -249,29 +270,24 @@ def protect(
         ProtectionState(identity, "COMMITTED", intent["intent_id"]),
         "RESERVE_ONE_REDUCE_ONLY_INTENT",
     )
-    state.setdefault("protective_reductions", {})[identity] = {
+    next_state.setdefault("protective_reductions", {})[identity] = {
         "record": record,
         "transition": transition.data,
     }
-    state["intents"][intent["intent_id"]] = intent
-    state["reservations"][identity] = reservation
-    state["runtime"].update(
-        state="HALTED" if state["halts"] else "SHADOW_READY",
+    next_state["intents"][intent["intent_id"]] = intent
+    next_state["reservations"][identity] = reservation
+    next_state["runtime"].update(
+        state="HALTED" if next_state["halts"] else "SHADOW_READY",
         flat_confirmed=False,
         permit={
             "decision_id": identity,
-            "boot_epoch": state["runtime"]["boot_epoch"],
-            "broker_epoch": state["runtime"]["broker_epoch"],
+            "boot_epoch": next_state["runtime"]["boot_epoch"],
+            "broker_epoch": next_state["runtime"]["broker_epoch"],
             "expires_at_ms": intent["expires_at_ms"],
             "reduce_only": True,
         },
     )
-    guardian._boundary("before_protective_reservation")
-    guardian.journal.commit(
-        "PROTECTIVE_RESERVE", now_ms, state, expected_sequence=guardian.journal.sequence
-    )
-    guardian._boundary("after_protective_reservation")
-    return str(intent["intent_id"])
+    return str(intent["intent_id"]), next_state
 
 
 def valid_protective_permit(state: dict[str, Any]) -> bool:
@@ -287,7 +303,7 @@ def valid_protective_permit(state: dict[str, Any]) -> bool:
         return False
     return bool(
         intent["reduce_only"] is True
-        and state["account_binding"] == "fixture-account"
+        and is_synthetic_account(state["account_binding"])
         and intent["boot_epoch"] == state["runtime"]["boot_epoch"] == permit.get("boot_epoch")
         and intent["broker_epoch"] == state["runtime"]["broker_epoch"] == permit.get("broker_epoch")
         and intent["expires_at_ms"] == permit.get("expires_at_ms")
@@ -315,7 +331,7 @@ def validate_protection(
             or body["predecessor_sha"] != previous_head
             or digest(release) != previous["active_release_sha"]
             or digest(release) != body["release_sha"]
-            or release["schema"] != "portfolio_release_v2"
+            or release["schema"] != PORTFOLIO_RELEASE_V2
             or release["source_mode"] != "SYNTHETIC"
             or release["mandate_authority_sha"] != sha256(key.public_bytes_raw()).hexdigest()
             or digest({"policy": record["policy"], "markets": record["markets"]})

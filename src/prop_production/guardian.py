@@ -2,27 +2,48 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import TYPE_CHECKING, Any
+from hashlib import sha256
+from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .contracts import DecisionReceipt, TargetBatchProposal
-from .copy_mandates import MandateState
-
-if TYPE_CHECKING:
-    from .v4_source_receiver import SourcePacketReceiver
+from .checkpoint_accounting import add, apply_fill
+from .checkpoint_admission import prepare_reserve, prepare_review
+from .checkpoint_risk import loss_limit
+from .contracts import (
+    ALLOWED_BROKER_ORDER_STATUSES,
+    CHECKPOINT_POLICY_V3,
+    PORTFOLIO_RELEASE_V1,
+    PORTFOLIO_RELEASE_V2,
+    SYNTHETIC_ENDPOINT,
+    TERMINAL_INTENT_STATUSES,
+    DecisionReceipt,
+    TargetBatchProposal,
+    is_synthetic_account,
+    require_synthetic_execution,
+)
+from .copy_mandates import (
+    MandateState,
+    prepare_activate_mandate,
+    prepare_baseline_mandate,
+    prepare_control_mandate,
+)
 from .evidence import canonical, decimal, digest, load_json
 from .finance import Rulebook, account_step
 from .gateway import BrokerGateway, BrokerOrder, BrokerSnapshot
+from .guardian_protection import prepare_protective_reduction
 from .journal import Journal, State, StorageUnavailable
-from .planner import compile_pods
+from .planner import compile_pods, validate_quotes
 from .release import ReleaseFloor, VerifiedRelease
 from .risk import size_book
+from .v4_market_identity import validate_independent_quotes
+from .v4_source_receiver import SourcePacketReceiver
 from .v4_timing import V4ShadowProjection
 
-TERMINAL = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "NOT_ACCEPTED", "REVOKED"}
+TERMINAL = TERMINAL_INTENT_STATUSES
 ZERO = Decimal("0")
 
 
@@ -65,12 +86,9 @@ class Guardian:
             and recovery_key.public_bytes_raw() == source_key.public_bytes_raw()
         ):
             raise ValueError("GUARDIAN_RECOVERY_SIGNER_MUST_BE_DISTINCT")
-        import re
-        from hashlib import sha256
-
         self.recovery_key = recovery_key
         self.expected_recovery_key_sha = expected_recovery_key_sha
-        if journal.snapshot()["account_binding"] != "fixture-account" and recovery_key is not None:
+        if not is_synthetic_account(journal.snapshot()["account_binding"]) and recovery_key is not None:
             current_sha = sha256(recovery_key.public_bytes_raw()).hexdigest()
             if (
                 not isinstance(expected_recovery_key_sha, str)
@@ -90,7 +108,7 @@ class Guardian:
             raise ValueError("POLICY_BINDING")
         floor.require_active(release)
         source_public = source_key.public_bytes_raw().hex()
-        if release.payload["schema"] == "portfolio_release_v2":
+        if release.payload["schema"] == PORTFOLIO_RELEASE_V2:
             if (
                 mandate_key is None
                 or release.signed_envelope is None
@@ -108,7 +126,7 @@ class Guardian:
                 if active is not None:
                     _halt(s, "RELEASE_CHANGED_REQUIRES_REVIEW")
                 s["active_release_sha"] = release.release_sha
-                if release.payload["schema"] == "portfolio_release_v2":
+                if release.payload["schema"] == PORTFOLIO_RELEASE_V2:
                     s["checkpoint_source_public"] = source_public
                     assert mandate_key is not None and release.signed_envelope is not None
                     s["checkpoint_release"] = {
@@ -119,22 +137,88 @@ class Guardian:
 
             journal.update("BIND_RELEASE_DISARMED", 0, bind)
 
-    def activate_copy_mandate(self, envelope: dict[str, Any], *, now_ms: int) -> MandateState:
-        from .guardian_checkpoints import activate_mandate
+    def _verify_checkpoint_source(self, receiver: SourcePacketReceiver) -> None:
+        p = self.release.payload
+        if (
+            receiver.wire_version != 3
+            or receiver.checkpoint is None
+            or receiver.source_key.public_bytes_raw() != self.source_key.public_bytes_raw()
+            or receiver.release.release_sha != self.release.release_sha
+            or receiver.checkpoint.pins
+            != {"policy": p["checkpoint_policy"], "scopes": p["checkpoint_scopes"]}
+        ):
+            raise ValueError("CHECKPOINT_SOURCE_AUTHORITY")
 
-        return activate_mandate(self, envelope, now_ms=now_ms)
+    def activate_copy_mandate(self, envelope: dict[str, Any], *, now_ms: int) -> MandateState:
+        state_obj, owner, record = prepare_activate_mandate(
+            self.journal.snapshot(),
+            mandate_key=self.mandate_key,
+            source_key=self.source_key,
+            release_payload=self.release.payload,
+            signed_release=self.release.signed_envelope,
+            release_sha=self.release.release_sha,
+            policy=self.policy,
+            markets=self.markets,
+            envelope=envelope,
+            scope_reasons=self._scope(now_ms),
+            now_ms=now_ms,
+        )
+        if owner is not None and record is not None:
+            self.journal.update(
+                "COPY_MANDATE_ACTIVATE",
+                now_ms,
+                lambda s: s.setdefault("copy_mandates", {}).update({owner: record}),
+            )
+        return state_obj
 
     def control_copy_mandate(self, envelope: dict[str, Any], *, now_ms: int) -> MandateState:
-        from .guardian_checkpoints import control_mandate
+        state_obj, update = prepare_control_mandate(
+            self.journal.snapshot(),
+            mandate_key=self.mandate_key,
+            release_payload=self.release.payload,
+            has_signed_release=self.release.signed_envelope is not None,
+            envelope=envelope,
+            now_ms=now_ms,
+        )
+        if update is not None:
 
-        return control_mandate(self, envelope, now_ms=now_ms)
+            def commit(s: State) -> None:
+                row = s["copy_mandates"][update["owner"]]
+                row["state"] = update["state"]
+                row["history"].append(update["transition"])
+                row["control_envelopes"][update["command_sha"]] = envelope
+                s.setdefault("mandate_control_nonces", {})[update["nonce"]] = {
+                    "command_sha": update["command_sha"],
+                    "result": update["state"],
+                }
+                s["runtime"]["permit"] = None
+
+            self.journal.update("COPY_MANDATE_CONTROL", now_ms, commit)
+        return state_obj
 
     def baseline_copy_mandate(
         self, owner: str, receiver: SourcePacketReceiver, *, now_ms: int
     ) -> MandateState:
-        from .guardian_checkpoints import baseline_mandate
+        self._verify_checkpoint_source(receiver)
+        assert receiver.checkpoint is not None
+        entry = self.journal.snapshot()["copy_mandates"][owner]
+        state_obj, update = prepare_baseline_mandate(
+            entry,
+            outcomes=receiver.checkpoint_outcomes(now_ms=now_ms),
+            packet_for=receiver.checkpoint.packet_for,
+            now_ms=now_ms,
+        )
+        if update is not None:
 
-        return baseline_mandate(self, owner, receiver, now_ms=now_ms)
+            def commit(s: State) -> None:
+                row = s["copy_mandates"][owner]
+                row["state"] = update["state"]
+                row["history"].append(update["transition"])
+                row["baseline_proof"] = update["baseline_proof"]
+                row["baseline_envelope"] = update["baseline_envelope"]
+
+            self.journal.update("COPY_MANDATE_BASELINE", now_ms, commit)
+        return state_obj
 
     def review_checkpoints(
         self,
@@ -146,38 +230,99 @@ class Guardian:
         quote_envelope: dict[str, Any] | None = None,
         quote_key: Ed25519PublicKey | None = None,
     ) -> dict[str, Any]:
-        from .checkpoint_admission import review
-
-        return review(
-            self,
-            receiver,
-            requests,
+        self._verify_checkpoint_source(receiver)
+        assert receiver.checkpoint is not None
+        result, next_state = prepare_review(
+            self.journal.snapshot(),
+            journal_sequence=self.journal.sequence,
+            release=self.release,
+            source_key=self.source_key,
+            mandate_key=self.mandate_key,
+            policy=self.policy,
+            markets=self.markets,
+            gateway=self.gateway,
+            scope_reasons=self._scope(now_ms),
+            source_outcomes=receiver.checkpoint_outcomes(now_ms=now_ms),
+            packet_for=receiver.checkpoint.packet_for,
+            requests=requests,
             quotes=quotes,
             now_ms=now_ms,
             quote_envelope=quote_envelope,
             quote_key=quote_key,
         )
+        if next_state is not None:
+            self.journal.commit(
+                "CHECKPOINT_REVIEW", now_ms, next_state, expected_sequence=self.journal.sequence
+            )
+        return result
 
     def reserve_checkpoint(
         self, decision_id: str, *, receiver: SourcePacketReceiver, now_ms: int
     ) -> list[str]:
-        from .checkpoint_admission import reserve
-
-        return reserve(self, decision_id, receiver=receiver, now_ms=now_ms)
+        self._verify_checkpoint_source(receiver)
+        assert receiver.checkpoint is not None
+        ids, commit_kind, next_state = prepare_reserve(
+            self.journal.snapshot(),
+            journal_sequence=self.journal.sequence,
+            release=self.release,
+            source_key=self.source_key,
+            mandate_key=self.mandate_key,
+            rules_status=self.rules.status,
+            policy=self.policy,
+            markets=self.markets,
+            gateway=self.gateway,
+            scope_reasons=self._scope(now_ms),
+            source_outcomes=receiver.checkpoint_outcomes(now_ms=now_ms),
+            packet_for=receiver.checkpoint.packet_for,
+            decision_id=decision_id,
+            now_ms=now_ms,
+        )
+        if commit_kind == "CHECKPOINT_REVIEW":
+            if next_state is not None:
+                self.journal.commit(
+                    "CHECKPOINT_REVIEW", now_ms, next_state, expected_sequence=self.journal.sequence
+                )
+            raise ValueError("CHECKPOINT_RESERVATION_NOT_PERMITTED")
+        if commit_kind == "CHECKPOINT_RESERVE":
+            assert next_state is not None
+            self._boundary("before_checkpoint_reservation")
+            self.journal.commit(
+                "CHECKPOINT_RESERVE", now_ms, next_state, expected_sequence=self.journal.sequence
+            )
+            self._boundary("after_checkpoint_reservation")
+        return ids
 
     def protective_reduce(
         self, envelope: dict[str, Any], *, quotes: dict[str, Any], now_ms: int
     ) -> str:
-        from .guardian_protection import protect
-
-        return protect(self, envelope, quotes=quotes, now_ms=now_ms)
+        intent_id, next_state = prepare_protective_reduction(
+            self.journal.snapshot(),
+            head_sha=self.journal.head,
+            release_payload=self.release.payload,
+            release_authority=self.release.authority,
+            signed_release=self.release.signed_envelope,
+            mandate_key=self.mandate_key,
+            rules_status=self.rules.status,
+            policy=self.policy,
+            markets=self.markets,
+            gateway=self.gateway,
+            scope_reasons=self._scope(now_ms),
+            envelope=envelope,
+            quotes=quotes,
+            now_ms=now_ms,
+        )
+        if next_state is not None:
+            self._boundary("before_protective_reservation")
+            self.journal.commit(
+                "PROTECTIVE_RESERVE", now_ms, next_state, expected_sequence=self.journal.sequence
+            )
+            self._boundary("after_protective_reservation")
+        return intent_id
 
     def recover_authenticated(self, signed_request: dict[str, Any], now_ms: int) -> int:
         """Trusted protected signer + independently fetched coherent broker state."""
         if self.recovery_key is None:
             raise PermissionError("GUARDIAN_RECOVERY_AUTHORITY_NOT_PINNED")
-        from hashlib import sha256
-
         return self.journal.recover_authenticated(
             signed_request,
             recovery_key=self.recovery_key,
@@ -206,7 +351,7 @@ class Guardian:
     def decide(
         self, proposal: TargetBatchProposal, quotes: dict[str, Any], now_ms: int
     ) -> DecisionReceipt:
-        if self.release.payload["schema"] != "portfolio_release_v1":
+        if self.release.payload["schema"] != PORTFOLIO_RELEASE_V1:
             raise ValueError("CHECKPOINT_RELEASE_REQUIRES_CHECKPOINT_ADMISSION")
         proposal = TargetBatchProposal.from_dict(proposal.data)
         p = proposal.data
@@ -367,8 +512,6 @@ class Guardian:
         ):
             reasons.append("PENDING_RESERVATION")
         try:
-            from .planner import validate_quotes
-
             validate_quotes(quotes, now_ms)
             for market, quote in quotes.items():
                 mark = decimal(state.get("last_marks", {})[market])
@@ -453,8 +596,6 @@ class Guardian:
         Missing provider quote provenance fails before any financial journal
         change; the source-observer signer is not an independent quote key.
         """
-        from .v4_market_identity import validate_independent_quotes
-
         quotes = validate_independent_quotes(
             quote_envelope,
             quote_key=quote_key,
@@ -491,13 +632,13 @@ class Guardian:
         ):
             raise ValueError("RESERVATION_NOT_PERMITTED")
         # This binary has no live authorizer. Authenticated remote gateways are read-only.
-        if (
-            self.gateway.synthetic is not True
-            or self.release.payload["source_mode"] != "SYNTHETIC"
-            or self.rules.status != "SYNTHETIC"
-            or state["account_binding"] != "fixture-account"
-        ):
-            raise PermissionError("REMOTE_MUTATION_UNAVAILABLE")
+        require_synthetic_execution(
+            gateway_synthetic=self.gateway.synthetic,
+            gateway_endpoint=getattr(self.gateway, "endpoint", None),
+            source_mode=self.release.payload["source_mode"],
+            rules_status=self.rules.status,
+            account_binding=state["account_binding"],
+        )
         risk = receipt["risk"]
         intents = []
         for market in sorted(set(risk["targets"]) | set(state["positions"])):
@@ -536,7 +677,7 @@ class Guardian:
                 {
                     "intent_id": intent_id,
                     "account_binding": state["account_binding"],
-                    "endpoint": "fake://broker",
+                    "endpoint": SYNTHETIC_ENDPOINT,
                     "decision_id": decision_id,
                     "release_sha": self.release.release_sha,
                     "market": market,
@@ -645,12 +786,14 @@ class Guardian:
             or intent["status"] != "QUEUED"
             or not permit
             or self.gateway.synthetic is not True
+            or getattr(self.gateway, "endpoint", None) != SYNTHETIC_ENDPOINT
+            or intent["endpoint"] != SYNTHETIC_ENDPOINT
             or intent["boot_epoch"] != state["runtime"]["boot_epoch"]
             or intent["broker_epoch"] != state["runtime"]["broker_epoch"]
             or permit["decision_id"] != intent["decision_id"]
             or (
                 now_ms >= intent["expires_at_ms"]
-                if intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3"
+                if intent.get("checkpoint_policy") == CHECKPOINT_POLICY_V3
                 else now_ms > intent["expires_at_ms"]
             )
             or state["runtime"]["certainty"] != "COHERENT"
@@ -695,7 +838,11 @@ class Guardian:
 
     def cancel(self, intent_id: str, now_ms: int) -> None:
         state = self.journal.snapshot()
-        if self.gateway.synthetic is not True or intent_id not in state["intents"]:
+        if (
+            self.gateway.synthetic is not True
+            or getattr(self.gateway, "endpoint", None) != SYNTHETIC_ENDPOINT
+            or intent_id not in state["intents"]
+        ):
             raise PermissionError("CANCEL_NOT_PERMITTED")
         if state["intents"][intent_id]["status"] in TERMINAL:
             return
@@ -812,7 +959,7 @@ class Guardian:
             before_quantity = decimal(state["positions"].get(fill.market, "0"))
             if (
                 before_quantity * fill.quantity < 0
-                and intent.get("checkpoint_policy") != "CWSA_CHECKPOINT_V3"
+                and intent.get("checkpoint_policy") != CHECKPOINT_POLICY_V3
             ):
                 # Realized PnL needs independently confirmed pod entry basis.
                 errors.append("POD_REALIZED_ATTRIBUTION_UNVERIFIED")
@@ -822,9 +969,7 @@ class Guardian:
             state["positions"][fill.market] = str(
                 decimal(state["positions"].get(fill.market, "0")) + fill.quantity
             )
-            if intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3":
-                from .checkpoint_accounting import add, apply_fill
-
+            if intent.get("checkpoint_policy") == CHECKPOINT_POLICY_V3:
                 effects = apply_fill(
                     state, body, previous_filled=previous_filled, before_quantity=before_quantity
                 )
@@ -879,18 +1024,7 @@ class Guardian:
             if order.status in {"REJECTED", "NOT_ACCEPTED"} and order.filled != ZERO:
                 errors.append("BROKER_TERMINAL_EXECUTION_CONFLICT")
                 continue
-            if order.status not in {
-                "QUEUED",
-                "ACCEPTED",
-                "PARTIAL",
-                "FILLED",
-                "CANCELLED",
-                "EXPIRED",
-                "REJECTED",
-                "NOT_ACCEPTED",
-                "UNKNOWN",
-                "DISPATCHING",
-            }:
+            if order.status not in ALLOWED_BROKER_ORDER_STATUSES:
                 errors.append("BROKER_STATUS_UNKNOWN")
                 continue
             if order.status == "UNKNOWN":
@@ -904,7 +1038,7 @@ class Guardian:
                     if intent["boot_epoch"] != state["runtime"]["boot_epoch"]:
                         intent["status"] = "REVOKED"
                     elif (
-                        intent.get("checkpoint_policy") == "CWSA_CHECKPOINT_V3"
+                        intent.get("checkpoint_policy") == CHECKPOINT_POLICY_V3
                         and now_ms >= intent["expires_at_ms"]
                     ):
                         intent["status"] = "EXPIRED"
@@ -937,11 +1071,9 @@ class Guardian:
         state["finance"] = finance
         errors.extend(finance_errors)
         try:
-            from .checkpoint_risk import loss_limit
-
             limits = {
                 owner: loss_limit(state, owner, self.policy)
-                if self.release.payload["schema"] == "portfolio_release_v2"
+                if self.release.payload["schema"] == PORTFOLIO_RELEASE_V2
                 else decimal(self.policy["pod_loss_budget"])
                 for owner in used
             }
@@ -968,7 +1100,7 @@ class Guardian:
         flat = (
             not observed
             and (
-                self.release.payload["schema"] != "portfolio_release_v2"
+                self.release.payload["schema"] != PORTFOLIO_RELEASE_V2
                 or not any(
                     decimal(q) for book in state["pod_positions"].values() for q in book.values()
                 )

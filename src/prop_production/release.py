@@ -5,12 +5,15 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from .contracts import PORTFOLIO_RELEASE_V1, PORTFOLIO_RELEASE_V2, SYNTHETIC_ACCOUNT
+from .copy_mandates import verify_release_contract
 from .evidence import canonical, decimal, digest, load_json, require_sha, verify
 
 
@@ -123,9 +126,7 @@ class ReleaseVerifier:
     ) -> VerifiedRelease:
         original = verify(envelope, self.key, self.authority)
         p = original
-        if p.get("schema") == "portfolio_release_v2":
-            from .copy_mandates import verify_release_contract
-
+        if p.get("schema") == PORTFOLIO_RELEASE_V2:
             p = verify_release_contract(p, self.key.public_bytes_raw())
         required = {
             "schema",
@@ -145,7 +146,7 @@ class ReleaseVerifier:
             "batch_seconds",
             "source_mode",
         }
-        if set(p) != required or p["schema"] != "portfolio_release_v1":
+        if set(p) != required or p["schema"] != PORTFOLIO_RELEASE_V1:
             raise ValueError("UNSUPPORTED_RELEASE_SCHEMA")
         if type(p["generation"]) is not int or p["generation"] < 1:
             raise ValueError("INVALID_GENERATION")
@@ -261,9 +262,9 @@ def fixture_release() -> dict[str, Any]:
         }
     ]
     p: dict[str, Any] = {
-        "schema": "portfolio_release_v1",
+        "schema": PORTFOLIO_RELEASE_V1,
         "generation": 1,
-        "account_binding": "fixture-account",
+        "account_binding": SYNTHETIC_ACCOUNT,
         "created_at_ms": 10,
         "expires_at_ms": 1000000,
         "selection_known_at_ms": 5,
@@ -290,3 +291,161 @@ def fixture_release() -> dict[str, Any]:
         }
     )
     return p
+
+
+@dataclass(frozen=True)
+class ReleaseBinding:
+    release_sha: str
+    generation: int
+    binding_sha: str
+
+
+@dataclass(frozen=True)
+class ReleaseBindingTransition:
+    predecessor: ReleaseBinding
+    event: Literal["ADOPT_SIGNED_RELEASE"]
+    evidence_sha: str
+    at_ms: int
+    actor: Literal["RELEASE_AUTHORITY"]
+    guard: Literal["FORWARD_SAME_CWSA_ACCOUNT_TRUST"]
+    successor: ReleaseBinding
+    effect: Literal["REBIND_CONSUMER_PRESERVE_SOURCE"]
+    proofs: dict[str, Any]
+
+    @property
+    def data(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def binding_sha(release_sha: str, pins: dict[str, Any], source_key: Ed25519PublicKey) -> str:
+    return digest(
+        {
+            "release_sha": release_sha,
+            "pins": pins,
+            "source_key": sha256(source_key.public_bytes_raw()).hexdigest(),
+        }
+    )
+
+
+def _verify_signed_release(
+    envelope: dict[str, Any], key: Ed25519PublicKey, at_ms: int
+) -> VerifiedRelease:
+    p = envelope["payload"]
+    return ReleaseVerifier(
+        key,
+        envelope["authority"],
+        p["account_binding"],
+        p["risk_policy_sha"],
+        p["rulebook_sha"],
+    ).verify(envelope, now_ms=at_ms)
+
+
+def transition_release_binding(
+    old: VerifiedRelease,
+    new: VerifiedRelease,
+    key: Ed25519PublicKey,
+    source_key: Ed25519PublicKey,
+    *,
+    at_ms: int,
+) -> ReleaseBindingTransition:
+    if old.signed_envelope is None or new.signed_envelope is None:
+        raise ValueError("CWSA_RELEASE_ORIGINAL_REQUIRED")
+    old_envelope, new_envelope = load_json(old.signed_envelope), load_json(new.signed_envelope)
+    old = _verify_signed_release(old_envelope, key, old.payload["created_at_ms"])
+    new = _verify_signed_release(new_envelope, key, at_ms)
+    before, after = old.payload, new.payload
+    if (
+        before["schema"] != PORTFOLIO_RELEASE_V2
+        or after["schema"] != PORTFOLIO_RELEASE_V2
+        or after["generation"] <= before["generation"]
+        or after["created_at_ms"] < before["created_at_ms"]
+        or after["account_binding"] != before["account_binding"]
+        or old.authority != new.authority
+        or after["checkpoint_policy"] != before["checkpoint_policy"]
+        or after["checkpoint_scopes"] != before["checkpoint_scopes"]
+        or after["mandate_authority_sha"] != before["mandate_authority_sha"]
+    ):
+        raise ValueError("CWSA_RELEASE_FORWARD_SAME_AUTHORITY_REQUIRED")
+    pins = {"policy": before["checkpoint_policy"], "scopes": before["checkpoint_scopes"]}
+    proofs = {
+        "old_release": old_envelope,
+        "new_release": new_envelope,
+        "authority_public": key.public_bytes_raw().hex(),
+    }
+    return ReleaseBindingTransition(
+        ReleaseBinding(
+            old.release_sha, before["generation"], binding_sha(old.release_sha, pins, source_key)
+        ),
+        "ADOPT_SIGNED_RELEASE",
+        digest(proofs),
+        at_ms,
+        "RELEASE_AUTHORITY",
+        "FORWARD_SAME_CWSA_ACCOUNT_TRUST",
+        ReleaseBinding(
+            new.release_sha, after["generation"], binding_sha(new.release_sha, pins, source_key)
+        ),
+        "REBIND_CONSUMER_PRESERVE_SOURCE",
+        proofs,
+    )
+
+
+def replay_release_binding(
+    record: dict[str, Any], *, authority_sha: str, source_key: Ed25519PublicKey
+) -> dict[str, Any]:
+    proofs = record["proofs"]
+    key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(proofs["authority_public"]))
+    if sha256(key.public_bytes_raw()).hexdigest() != authority_sha:
+        raise ValueError("CWSA_RELEASE_REBIND_SIGNER")
+    old_raw, new_raw = proofs["old_release"], proofs["new_release"]
+    old = _verify_signed_release(old_raw, key, old_raw["payload"]["created_at_ms"])
+    new = _verify_signed_release(new_raw, key, record["at_ms"])
+    expected = transition_release_binding(old, new, key, source_key, at_ms=record["at_ms"]).data
+    if record != expected:
+        raise ValueError("CWSA_RELEASE_REBIND_REPLAY")
+    return expected
+
+
+def validate_release_binding(previous: dict[str, Any], current: dict[str, Any], kind: str) -> None:
+    old, new = previous.get("checkpoint_release"), current.get("checkpoint_release")
+    if old is not None and new is None:
+        raise ValueError("MANDATE_RELEASE_BINDING_REMOVED")
+    if new is None:
+        return
+    key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(new["authority_public"]))
+    body = verify(new["envelope"], key, new["envelope"]["authority"])
+    if (
+        body["schema"] != PORTFOLIO_RELEASE_V2
+        or body["account_binding"] != current["account_binding"]
+        or digest(body) != current.get("active_release_sha")
+        or body["mandate_authority_sha"] != sha256(key.public_bytes_raw()).hexdigest()
+    ):
+        raise ValueError("MANDATE_RELEASE_BINDING_PROOF")
+    if new != old:
+        if kind != "BIND_RELEASE_DISARMED" or current["runtime"]["permit"] is not None:
+            raise ValueError("MANDATE_RELEASE_BINDING_TRANSITION")
+        if old is not None:
+            before = verify(old["envelope"], key, old["envelope"]["authority"])
+            if (
+                old["authority_public"] != new["authority_public"]
+                or body["generation"] <= before["generation"]
+                or body["checkpoint_policy"] != before["checkpoint_policy"]
+                or body["checkpoint_scopes"] != before["checkpoint_scopes"]
+                or "RELEASE_CHANGED_REQUIRES_REVIEW" not in current["halts"]
+            ):
+                raise ValueError("MANDATE_RELEASE_FORWARD_TRUST")
+        if any(
+            previous.get(k) != current.get(k)
+            for k in (
+                "finance",
+                "positions",
+                "pod_positions",
+                "fills",
+                "intents",
+                "reservations",
+                "pod_fees_paid",
+                "pod_realized",
+                "pod_loss_used",
+                "checkpoint_basis",
+            )
+        ):
+            raise ValueError("MANDATE_RELEASE_MUTATED_OBLIGATIONS")

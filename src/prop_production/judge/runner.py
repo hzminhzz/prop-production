@@ -17,8 +17,13 @@ from .reference import ReferenceAccount, check_guardian_projection, check_model,
 
 class Worker:
     def __init__(self, role: str, root: Path):
+        command = (
+            [sys.executable, "-m", "prop_production.judge.broker", str(root)]
+            if role == "broker"
+            else [sys.executable, "-m", "prop_production.worker", role, str(root)]
+        )
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "prop_production.worker", role, str(root)],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             close_fds=True, env={"PATH": os.defpath, "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"},
         )

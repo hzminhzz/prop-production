@@ -2,73 +2,57 @@
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Callable
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import TYPE_CHECKING, Any
+from hashlib import sha256
+from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .checkpoint_opportunity import OpportunityEvent as Event
-from .checkpoint_opportunity import OpportunityPhase as Phase
-from .checkpoint_opportunity import OpportunityState, advance
-from .checkpoint_risk import effective_policy
+from .checkpoint_account_proof import validate as validate_account_proof
+from .checkpoint_accounting import apply_internal, validate_attribution
+from .checkpoint_execution import (
+    TERMINAL_OPPORTUNITY_PHASES,
+    OpportunityState,
+    advance,
+    claims,
+    conflicts,
+    opening_missed,
+    project,
+    validate_claims,
+)
+from .checkpoint_execution import (
+    OpportunityEvent as Event,
+)
+from .checkpoint_execution import (
+    OpportunityPhase as Phase,
+)
+from .checkpoint_risk import (
+    account_anchor,
+    check_prerequisites,
+    effective_policy,
+    execution_policy,
+)
 from .checkpoint_source import integer, verify_transition
-from .copy_mandates import CopyMandate
+from .contracts import (
+    CHECKPOINT_POLICY_V3,
+    CHECKPOINT_SCHEMA_V3,
+    SYNTHETIC_ENDPOINT,
+    is_synthetic_account,
+    require_synthetic_execution,
+)
+from .copy_mandates import CopyMandate, mandate_authority
 from .evidence import decimal, digest, load_json, verify
-from .gateway import execution_capability
-from .guardian_checkpoints import _authority, _source
-from .planner import validate_quotes
+from .gateway import BrokerGateway
+from .guardian_protection import validate_protection
+from .release import VerifiedRelease
 from .risk import size_book
-
-if TYPE_CHECKING:
-    from .guardian import Guardian
-    from .v4_source_receiver import SourcePacketReceiver
+from .v4_market_identity import validate_independent_quotes
 
 ZERO = Decimal(0)
-TERMINAL = {Phase.COMMITTED_ONCE, Phase.MISSED}
-POLICY = "CWSA_CHECKPOINT_V3"
-
-
-def execution_policy(guardian: Guardian, state: dict[str, Any]) -> dict[str, Any]:
-    cfg = guardian.policy.get("checkpoint_execution")
-    if not isinstance(cfg, dict) or not {
-        "quote_max_age_ms",
-        "account_max_age_ms",
-        "max_gross_notional",
-    } <= set(cfg):
-        raise ValueError("CHECKPOINT_EXECUTION_POLICY_UNQUALIFIED")
-    if (
-        any(not 0 < integer(cfg[k]) <= 5000 for k in ("quote_max_age_ms", "account_max_age_ms"))
-        or decimal(cfg["max_gross_notional"]) <= 0
-    ):
-        raise ValueError("CHECKPOINT_EXECUTION_POLICY_INVALID")
-    return dict(effective_policy(state, guardian.policy, guardian.markets)["checkpoint_execution"])
-
-
-def account_anchor(state: dict[str, Any]) -> str:
-    return digest(
-        {
-            k: state[k]
-            for k in (
-                "account_binding",
-                "active_release_sha",
-                "finance",
-                "positions",
-                "pod_positions",
-                "reservations",
-                "halts",
-            )
-        }
-        | {
-            k: state.get(k, {})
-            for k in ("pod_loss_used", "pod_fees_paid", "pod_realized", "checkpoint_basis")
-        }
-        | {
-            "runtime": {
-                k: state["runtime"].get(k)
-                for k in ("boot_epoch", "broker_epoch", "last_snapshot_ms", "certainty")
-            }
-        }
-    )
+TERMINAL = TERMINAL_OPPORTUNITY_PHASES
+POLICY = CHECKPOINT_POLICY_V3
 
 
 def source_proof(
@@ -79,7 +63,7 @@ def source_proof(
     policy: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, str]]:
     key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public))
-    body = verify(envelope, key, "cwsa-checkpoint-v3")
+    body = verify(envelope, key, CHECKPOINT_SCHEMA_V3)
     if (
         body["scope"] != scope
         or body["policy"] != policy
@@ -87,8 +71,6 @@ def source_proof(
         or body["trading_authorized"] is not False
     ):
         raise ValueError("CHECKPOINT_SOURCE_POLICY_BINDING")
-    from hashlib import sha256
-
     if any(
         sha256(raw.encode()).hexdigest() != raw_sha for raw_sha, raw in body["originals"].items()
     ):
@@ -140,110 +122,38 @@ def _move(
     record["state"] = transition.successor.data
 
 
-def _prerequisites(
-    guardian: Guardian,
+def prepare_review(
     state: dict[str, Any],
-    quotes: dict[str, Any],
-    cfg: dict[str, Any],
-    now_ms: int,
-    needed: set[str],
     *,
-    capability_feature: str = "net_order",
-) -> tuple[list[str], dict[str, Any]]:
-    reasons = []
-    evidence: dict[str, Any] = {}
-    if state["runtime"]["certainty"] != "COHERENT" or not state["finance"]:
-        reasons.append("RECONCILIATION_REQUIRED")
-    if not 0 <= now_ms - state["runtime"].get("last_snapshot_ms", 0) <= cfg["account_max_age_ms"]:
-        reasons.append("ACCOUNT_FACTS_STALE")
-    try:
-        validate_quotes(quotes, now_ms)
-        if not needed.issubset(quotes):
-            raise ValueError("INDEPENDENT_QUOTE_MISSING")
-        if any(now_ms - q["known_at_ms"] > cfg["quote_max_age_ms"] for q in quotes.values()):
-            raise ValueError("INDEPENDENT_QUOTE_STALE")
-        snapshot = guardian.gateway.observe(now_ms)
-        if snapshot.account_binding != state["account_binding"]:
-            raise ValueError("INDEPENDENT_ACCOUNT_BINDING")
-        if not snapshot.ready(now_ms, cfg["account_max_age_ms"]):
-            raise ValueError("INDEPENDENT_ACCOUNT_UNAVAILABLE")
-        observed = {p.market: str(p.quantity) for p in snapshot.positions if p.quantity}
-        expected = {m: q for m, q in state["positions"].items() if decimal(q)}
-        if {m: decimal(q) for m, q in observed.items()} != {
-            m: decimal(q) for m, q in expected.items()
-        }:
-            raise ValueError("INDEPENDENT_POSITION_RECONCILIATION")
-        if state["finance"] and (
-            str(snapshot.cash) != state["finance"]["cash"]
-            or str(snapshot.equity) != state["finance"]["equity"]
-        ):
-            raise ValueError("INDEPENDENT_FINANCE_RECONCILIATION")
-        capabilities = {raw["instrument"]: raw for raw in snapshot.execution_capabilities}
-        if len(capabilities) != len(snapshot.execution_capabilities):
-            raise ValueError("EXECUTION_CAPABILITY_AMBIGUOUS")
-        for market in needed:
-            if market not in capabilities or not execution_capability(
-                capabilities[market],
-                capability_feature,
-                account=state["account_binding"],
-                endpoint=snapshot.endpoint,
-                instrument=market,
-                now_ms=now_ms,
-                synthetic=guardian.gateway.synthetic,
-            ):
-                raise ValueError("EXECUTION_CAPABILITY_UNQUALIFIED")
-        marks = {m: (price, known) for m, price, known in snapshot.market_marks}
-        for market in needed:
-            price, known = marks[market]
-            q = quotes[market]
-            if not 0 <= now_ms - known <= cfg["account_max_age_ms"] or not decimal(
-                q["bid"]
-            ) <= price <= decimal(q["ask"]):
-                raise ValueError("INDEPENDENT_QUOTE_MARK_MISMATCH")
-            if (decimal(q["ask"]) - decimal(q["bid"])) / decimal(q["bid"]) > Decimal("0.01"):
-                raise ValueError("INDEPENDENT_QUOTE_SPREAD")
-        from .checkpoint_account_proof import capture, validate
-
-        evidence = capture(snapshot)
-        validate(
-            state,
-            evidence,
-            quotes,
-            cfg,
-            needed,
-            now_ms=now_ms,
-            synthetic=guardian.gateway.synthetic,
-            feature=capability_feature,
-        )
-    except (ValueError, KeyError, TimeoutError, ConnectionError, OSError) as exc:
-        reasons.append(str(exc))
-    return reasons, evidence
-
-
-def review(
-    guardian: Guardian,
-    receiver: SourcePacketReceiver,
+    journal_sequence: int,
+    release: VerifiedRelease,
+    source_key: Ed25519PublicKey,
+    mandate_key: Ed25519PublicKey | None,
+    policy: dict[str, Any],
+    markets: dict[str, Any],
+    gateway: BrokerGateway,
+    scope_reasons: list[str],
+    source_outcomes: list[dict[str, Any]],
+    packet_for: Callable[[str], dict[str, Any]],
     requests: dict[str, str],
-    *,
     quotes: dict[str, Any],
     now_ms: int,
     quote_envelope: dict[str, Any] | None = None,
     quote_key: Ed25519PublicKey | None = None,
-) -> dict[str, Any]:
-    _authority(guardian)
-    _source(guardian, receiver)
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    mandate_authority(
+        mandate_key, release.payload, signed=release.signed_envelope is not None
+    )
     integer(now_ms)
     if not isinstance(requests, dict) or not requests:
         raise ValueError("CHECKPOINT_REQUESTS")
-    state = guardian.journal.snapshot()
-    cfg = execution_policy(guardian, state)
-    p = guardian.release.payload
-    source_rows = {
-        r["outcome"]["outcome_id"]: r for r in receiver.checkpoint_outcomes(now_ms=now_ms)
-    }
-    opportunities = state.setdefault("checkpoint_opportunities", {})
-    selected, dispositions = {}, {}
-    assert receiver.checkpoint is not None
+    cfg = execution_policy(state, policy, markets)
+    p = release.payload
+    source_rows = {r["outcome"]["outcome_id"]: r for r in source_outcomes}
+    new_opportunities: dict[str, dict[str, Any]] = {}
+    selected: dict[str, tuple[CopyMandate, dict[str, Any], dict[str, Any]]] = {}
+    dispositions: dict[str, str] = {}
+    existing_opportunities = state.get("checkpoint_opportunities", {})
     for owner, outcome_id in sorted(requests.items()):
         entry = state.get("copy_mandates", {}).get(owner)
         row = source_rows.get(outcome_id)
@@ -274,22 +184,20 @@ def review(
             continue
         identity = digest(["checkpoint_opportunity_v3", owner, outcome["signal_id"]])
         deadline = min(row["deadline_ms"], m.data["effective_until_ms"])
-        proof = receiver.checkpoint.packet_for(outcome_id)
+        proof = packet_for(outcome_id)
         selected[identity] = (m, row, entry)
-        opportunities.setdefault(
-            identity,
-            {
+        if identity not in existing_opportunities:
+            new_opportunities[identity] = {
                 "state": OpportunityState(identity, owner, outcome["signal_id"], deadline).data,
                 "history": [],
                 "proof": proof,
-                "source_public": guardian.source_key.public_bytes_raw().hex(),
+                "source_public": source_key.public_bytes_raw().hex(),
                 "scope": p["checkpoint_scopes"][outcome["source_id"]],
                 "policy": p["checkpoint_policy"],
                 "outcome_id": outcome_id,
                 "mandate_sha": m.sha,
                 "commitment": None,
-            },
-        )
+            }
     if not selected:
         return {
             "status": "SOURCE_ONLY",
@@ -297,7 +205,7 @@ def review(
             "intent_ids": [],
             "order_route": "NONE",
             "trading_authorized": False,
-        }
+        }, None
     boundaries = {row["outcome"]["checkpoint_ms"] for _, row, _ in selected.values()}
     if len(boundaries) != 1:
         raise ValueError("INCOMPATIBLE_CHECKPOINT_BATCH")
@@ -306,14 +214,17 @@ def review(
         [
             "checkpoint_batch_v3",
             state["account_binding"],
-            guardian.release.release_sha,
+            release.release_sha,
             sorted(selected),
         ]
     )
-    decisions = state.setdefault("checkpoint_decisions", {})
-    previous = decisions.get(decision_id)
+    previous = state.get("checkpoint_decisions", {}).get(decision_id)
     if previous and previous["result"]["status"] in TERMINAL:
-        return dict(previous["result"])
+        return dict(previous["result"]), None
+    next_state = copy.deepcopy(state)
+    opportunities = next_state.setdefault("checkpoint_opportunities", {})
+    opportunities.update(new_opportunities)
+    decisions = next_state.setdefault("checkpoint_decisions", {})
     deadline = min(opportunities[key]["state"]["deadline_ms"] for key in selected)
     result: dict[str, Any] = {
         "decision_id": decision_id,
@@ -328,12 +239,12 @@ def review(
         "source_signal_ids": sorted({opportunities[k]["state"]["signal_id"] for k in selected}),
         "trading_authorized": False,
     }
-    terminal_reasons = list(guardian._scope(now_ms))
-    if state["halts"]:
+    terminal_reasons = list(scope_reasons)
+    if next_state["halts"]:
         terminal_reasons.append("PERSISTENT_HALT")
-    if state["reservations"] or any(
+    if next_state["reservations"] or any(
         i["status"] in ("UNKNOWN", "DISPATCHING", "CANCEL_PENDING")
-        for i in state["intents"].values()
+        for i in next_state["intents"].values()
     ):
         terminal_reasons.append("UNRESOLVED_FINANCIAL_OBLIGATIONS")
     if now_ms >= deadline:
@@ -343,7 +254,7 @@ def review(
         for _, row, entry in selected.values()
     ):
         terminal_reasons.append("INACTIVE_OR_SOURCE_NOT_ACTIONABLE")
-    evidence_sha = digest([requests, quotes, now_ms, account_anchor(state), terminal_reasons])
+    evidence_sha = digest([requests, quotes, now_ms, account_anchor(next_state), terminal_reasons])
     for identity in selected:
         record = opportunities[identity]
         if record["state"]["phase"] in TERMINAL:
@@ -372,7 +283,7 @@ def review(
     active_owners = {m.owner for m, _, _ in selected.values()}
     frozen = {
         owner: dict(book)
-        for owner, book in state["pod_positions"].items()
+        for owner, book in next_state["pod_positions"].items()
         if owner not in active_owners
     }
     account_proof: dict[str, Any] = {}
@@ -380,10 +291,10 @@ def review(
         try:
             mapping = {
                 spec["source_instrument"]: market
-                for market, spec in guardian.markets.items()
+                for market, spec in markets.items()
                 if "source_instrument" in spec
             }
-            if len(mapping) != len(guardian.markets):
+            if len(mapping) != len(markets):
                 raise ValueError("CHECKPOINT_NATIVE_MARKET_MAPPING")
             for identity, (m, _, _) in selected.items():
                 record = opportunities[identity]
@@ -408,14 +319,10 @@ def review(
             for owner in frozen:
                 pods.append({"pod_id": owner, "requested_notionals": {}})
             pods.sort(key=lambda pod: pod["pod_id"])
-            needed = set(state["positions"]) | {
+            needed = set(next_state["positions"]) | {
                 m for pod in pods for m in pod["requested_notionals"]
             }
             if p["source_mode"] != "SYNTHETIC":
-                from hashlib import sha256
-
-                from .v4_market_identity import validate_independent_quotes
-
                 if (
                     quote_key is None
                     or quote_envelope is None
@@ -426,26 +333,30 @@ def review(
                 proved = validate_independent_quotes(
                     quote_envelope,
                     quote_key=quote_key,
-                    source_key=guardian.source_key,
-                    release=guardian.release,
+                    source_key=source_key,
+                    release=release,
                     catalog=frozenset(mapping),
                     now_ms=now_ms,
                 )
                 if quotes != {mapping[k]: value for k, value in proved.items()}:
                     raise ValueError("INDEPENDENT_NATIVE_QUOTE_BINDING")
-            temporary, account_proof = _prerequisites(guardian, state, quotes, cfg, now_ms, needed)
+            temporary, account_proof = check_prerequisites(
+                gateway, next_state, quotes, cfg, now_ms, needed
+            )
             if temporary:
                 result.update(status="PRE_DISPATCH_BLOCKED", reasons=temporary)
             else:
-                finance = dict(state["finance"], pod_loss_used=state.get("pod_loss_used", {}))
+                finance = dict(
+                    next_state["finance"], pod_loss_used=next_state.get("pod_loss_used", {})
+                )
                 risk = size_book(
                     pods,
                     quotes,
-                    guardian.markets,
-                    effective_policy(state, guardian.policy, guardian.markets),
+                    markets,
+                    effective_policy(next_state, policy, markets),
                     finance,
-                    state["positions"],
-                    state["pod_positions"],
+                    next_state["positions"],
+                    next_state["pod_positions"],
                     [],
                     now_ms=now_ms,
                     quantity_price_policy="EXECUTABLE_SIDE_V3",
@@ -455,20 +366,17 @@ def review(
                 if risk["status"] != "ACCEPTED":
                     terminal_reasons.extend(risk["reasons"])
                 else:
-                    from .checkpoint_execution import project
-                    from .checkpoint_netting import conflicts
-
                     result["execution_plan"] = project(
-                        state,
+                        next_state,
                         risk,
                         account_proof,
-                        guardian.markets,
+                        markets,
                         quotes,
                         frozen,
                         now_ms=now_ms,
-                        synthetic=guardian.gateway.synthetic,
+                        synthetic=gateway.synthetic,
                     )
-                    if conflicts(state, result["execution_plan"], checkpoint_ms):
+                    if conflicts(next_state, result["execution_plan"], checkpoint_ms):
                         terminal_reasons.append("MARKET_CHECKPOINT_ALREADY_COMMITTED")
         except (ValueError, KeyError) as exc:
             terminal_reasons.append(str(exc))
@@ -499,70 +407,96 @@ def review(
     attempt = {
         "at_ms": now_ms,
         "projection_version": "checkpoint_execution_projection_v2",
-        "account_sha": account_anchor(state),
+        "account_sha": account_anchor(next_state),
         "quotes": quotes,
-        "policy": guardian.policy,
-        "markets": guardian.markets,
+        "policy": policy,
+        "markets": markets,
         "account_proof": account_proof,
         "pods": pods,
         "frozen_pods": frozen,
         "risk": result["risk"],
         "execution_plan": result["execution_plan"],
         "result": result,
-        "journal_sequence": guardian.journal.sequence + 1,
+        "journal_sequence": journal_sequence + 1,
     }
-    record = decisions.setdefault(
+    decision_record = decisions.setdefault(
         decision_id,
         {
             "requests": dict(requests),
             "opportunity_ids": sorted(selected),
-            "release_sha": guardian.release.release_sha,
+            "release_sha": release.release_sha,
             "attempts": [],
             "intent_ids": [],
         },
     )
-    record["attempts"].append(attempt)
-    record["result"] = result
-    guardian.journal.commit(
-        "CHECKPOINT_REVIEW", now_ms, state, expected_sequence=guardian.journal.sequence
+    decision_record["attempts"].append(attempt)
+    decision_record["result"] = result
+    return dict(result), next_state
+
+
+def prepare_reserve(
+    state: dict[str, Any],
+    *,
+    journal_sequence: int,
+    release: VerifiedRelease,
+    source_key: Ed25519PublicKey,
+    mandate_key: Ed25519PublicKey | None,
+    rules_status: str,
+    policy: dict[str, Any],
+    markets: dict[str, Any],
+    gateway: BrokerGateway,
+    scope_reasons: list[str],
+    source_outcomes: list[dict[str, Any]],
+    packet_for: Callable[[str], dict[str, Any]],
+    decision_id: str,
+    now_ms: int,
+) -> tuple[list[str], str | None, dict[str, Any] | None]:
+    mandate_authority(
+        mandate_key, release.payload, signed=release.signed_envelope is not None
     )
-    return dict(result)
-
-
-def reserve(
-    guardian: Guardian, decision_id: str, *, receiver: SourcePacketReceiver, now_ms: int
-) -> list[str]:
-    _authority(guardian)
-    _source(guardian, receiver)
-    state = guardian.journal.snapshot()
     record = state.get("checkpoint_decisions", {}).get(decision_id)
     if record is None:
         raise ValueError("CHECKPOINT_DECISION_UNKNOWN")
     if record["result"]["status"] == "COMMITTED_ONCE":
-        return list(record["intent_ids"])
-    if (
-        guardian.gateway.synthetic is not True
-        or guardian.release.payload["source_mode"] != "SYNTHETIC"
-        or guardian.rules.status != "SYNTHETIC"
-        or state["account_binding"] != "fixture-account"
-    ):
-        raise PermissionError("REMOTE_MUTATION_UNAVAILABLE")
+        return list(record["intent_ids"]), None, None
+    require_synthetic_execution(
+        gateway_synthetic=gateway.synthetic,
+        gateway_endpoint=getattr(gateway, "endpoint", None),
+        source_mode=release.payload["source_mode"],
+        rules_status=rules_status,
+        account_binding=state["account_binding"],
+    )
     attempt = record["attempts"][-1]
     if now_ms >= record["result"]["deadline_ms"]:
-        review(guardian, receiver, record["requests"], quotes=attempt["quotes"], now_ms=now_ms)
-        raise ValueError("CHECKPOINT_RESERVATION_NOT_PERMITTED")
-    cfg = execution_policy(guardian, state)
+        _, reviewed_state = prepare_review(
+            state,
+            journal_sequence=journal_sequence,
+            release=release,
+            source_key=source_key,
+            mandate_key=mandate_key,
+            policy=policy,
+            markets=markets,
+            gateway=gateway,
+            scope_reasons=scope_reasons,
+            source_outcomes=source_outcomes,
+            packet_for=packet_for,
+            requests=record["requests"],
+            quotes=attempt["quotes"],
+            now_ms=now_ms,
+        )
+        return [], "CHECKPOINT_REVIEW", reviewed_state
+    cfg = execution_policy(state, policy, markets)
     if (
         record["result"]["status"] != "REVIEWABLE"
-        or guardian._scope(now_ms)
+        or scope_reasons
         or state["halts"]
         or state["reservations"]
         or account_anchor(state) != attempt["account_sha"]
-        or guardian.journal.sequence != attempt["journal_sequence"]
+        or journal_sequence != attempt["journal_sequence"]
         or now_ms >= record["result"]["deadline_ms"]
     ):
         raise ValueError("CHECKPOINT_RESERVATION_NOT_PERMITTED")
-    current = {r["outcome"]["outcome_id"]: r for r in receiver.checkpoint_outcomes(now_ms=now_ms)}
+    current = {r["outcome"]["outcome_id"]: r for r in source_outcomes}
     if any(
         not current.get(state["checkpoint_opportunities"][identity]["outcome_id"], {}).get(
             "opening_candidate"
@@ -576,8 +510,8 @@ def reserve(
         raise ValueError("CHECKPOINT_RESERVATION_SOURCE_OR_MANDATE")
     risk = attempt["risk"]
     plan = attempt["execution_plan"]
-    reasons, fresh_proof = _prerequisites(
-        guardian,
+    reasons, fresh_proof = check_prerequisites(
+        gateway,
         state,
         attempt["quotes"],
         cfg,
@@ -586,44 +520,44 @@ def reserve(
     )
     if reasons:
         raise ValueError("CHECKPOINT_RESERVATION_PREREQUISITES:" + ",".join(reasons))
-    from .checkpoint_execution import project
-
     fresh_plan = project(
         state,
         risk,
         fresh_proof,
-        guardian.markets,
+        markets,
         attempt["quotes"],
         attempt["frozen_pods"],
         now_ms=now_ms,
-        synthetic=guardian.gateway.synthetic,
+        synthetic=gateway.synthetic,
         version=plan["schema"],
     )
     if fresh_plan != plan:
         raise ValueError("CHECKPOINT_EXECUTION_PROOF_CHANGED")
+    next_state = copy.deepcopy(state)
+    endpoint = SYNTHETIC_ENDPOINT
     intents = []
-    for market in sorted(set(plan["targets"]) | set(state["positions"])):
+    for market in sorted(set(plan["targets"]) | set(next_state["positions"])):
         old, target = (
-            decimal(state["positions"].get(market, "0")),
+            decimal(next_state["positions"].get(market, "0")),
             decimal(plan["targets"].get(market, "0")),
         )
         quantity = target - old
         if not quantity:
             continue
         quote = attempt["quotes"][market]
-        slip = decimal(guardian.policy["shortfall_bps"]) / 10000
+        slip = decimal(policy["shortfall_bps"]) / 10000
         price = (
             decimal(quote["ask"]) * (1 + slip)
             if quantity > 0
             else decimal(quote["bid"]) * (1 - slip)
         )
-        tick = decimal(guardian.markets[market]["price_tick"])
+        tick = decimal(markets[market]["price_tick"])
         price = (price / tick).to_integral_value(
             rounding=ROUND_FLOOR if quantity > 0 else ROUND_CEILING
         ) * tick
         identity = digest(
             {
-                "account": state["account_binding"],
+                "account": next_state["account_binding"],
                 "decision": decision_id,
                 "market": market,
                 "quantity": str(quantity),
@@ -632,17 +566,17 @@ def reserve(
         changes = {
             owner: str(
                 decimal(book.get(market, "0"))
-                - decimal(state["pod_positions"].get(owner, {}).get(market, "0"))
+                - decimal(next_state["pod_positions"].get(owner, {}).get(market, "0"))
             )
             for owner, book in plan["pod_targets"].items()
         }
         intents.append(
             {
                 "intent_id": identity,
-                "account_binding": state["account_binding"],
-                "endpoint": "fake://broker",
+                "account_binding": next_state["account_binding"],
+                "endpoint": endpoint,
                 "decision_id": decision_id,
-                "release_sha": guardian.release.release_sha,
+                "release_sha": release.release_sha,
                 "market": market,
                 "quantity": str(quantity),
                 "limit_price": str(price),
@@ -650,8 +584,8 @@ def reserve(
                 "status": "QUEUED",
                 "filled": "0",
                 "broker_id": None,
-                "broker_epoch": state["runtime"]["broker_epoch"],
-                "boot_epoch": state["runtime"]["boot_epoch"],
+                "broker_epoch": next_state["runtime"]["broker_epoch"],
+                "boot_epoch": next_state["runtime"]["boot_epoch"],
                 "expires_at_ms": record["result"]["deadline_ms"],
                 "created_at_ms": now_ms,
                 "pod_changes": changes,
@@ -663,17 +597,13 @@ def reserve(
             }
         )
     ids = [intent["intent_id"] for intent in intents]
-    from .checkpoint_accounting import apply_internal
-    from .checkpoint_netting import claims
-
-    state.setdefault("checkpoint_market_claims", {}).update(
-        claims(state, record, decision_id, now_ms)
+    decision_record = next_state["checkpoint_decisions"][decision_id]
+    next_state.setdefault("checkpoint_market_claims", {}).update(
+        claims(next_state, decision_record, decision_id, now_ms)
     )
-    apply_internal(state, record, decision_id, now_ms)
-    from .checkpoint_execution import opening_missed
-
-    for identity in record["opportunity_ids"]:
-        opportunity = state["checkpoint_opportunities"][identity]
+    apply_internal(next_state, decision_record, decision_id, now_ms)
+    for identity in decision_record["opportunity_ids"]:
+        opportunity = next_state["checkpoint_opportunities"][identity]
         missed = opening_missed(plan, opportunity["state"]["owner"])
         _move(
             opportunity,
@@ -684,47 +614,42 @@ def reserve(
         )
         opportunity["commitment"] = None if missed else decision_id
     if ids:
-        state["reservations"][decision_id] = {
+        next_state["reservations"][decision_id] = {
             "loss": risk["worst_loss"],
             "margin": risk["stressed_margin"],
             "cost": risk["cost_reserve"],
             "intent_ids": ids,
         }
     for intent in intents:
-        state["intents"][intent["intent_id"]] = intent
-    record["intent_ids"] = ids
-    record["result"] = dict(
-        record["result"],
+        next_state["intents"][intent["intent_id"]] = intent
+    decision_record["intent_ids"] = ids
+    decision_record["result"] = dict(
+        decision_record["result"],
         status="COMMITTED_ONCE",
         intent_ids=ids,
         opening_status=plan["opening_status"],
     )
-    state["runtime"].update(
+    next_state["runtime"].update(
         state="SHADOW_READY" if ids else "DISARMED",
         flat_confirmed=(
             not ids
-            and state["runtime"].get("flat_confirmed", False)
+            and next_state["runtime"].get("flat_confirmed", False)
             and not any(
-                decimal(q) for book in state["pod_positions"].values() for q in book.values()
+                decimal(q) for book in next_state["pod_positions"].values() for q in book.values()
             )
         ),
         permit=(
             {
                 "decision_id": decision_id,
-                "boot_epoch": state["runtime"]["boot_epoch"],
-                "broker_epoch": state["runtime"]["broker_epoch"],
-                "expires_at_ms": record["result"]["deadline_ms"],
+                "boot_epoch": next_state["runtime"]["boot_epoch"],
+                "broker_epoch": next_state["runtime"]["broker_epoch"],
+                "expires_at_ms": decision_record["result"]["deadline_ms"],
             }
             if ids
             else None
         ),
     )
-    guardian._boundary("before_checkpoint_reservation")
-    guardian.journal.commit(
-        "CHECKPOINT_RESERVE", now_ms, state, expected_sequence=guardian.journal.sequence
-    )
-    guardian._boundary("after_checkpoint_reservation")
-    return ids
+    return ids, "CHECKPOINT_RESERVE", next_state
 
 
 def validate_history(
@@ -734,12 +659,7 @@ def validate_history(
     *,
     previous_head: str | None = None,
 ) -> None:
-    from .guardian_protection import validate_protection
-
     validate_protection(previous, current, kind, previous_head)
-    from .checkpoint_accounting import validate_attribution
-    from .checkpoint_netting import validate_claims
-
     validate_attribution(previous, current, kind)
     validate_claims(previous, current, kind)
     old = previous.get("checkpoint_opportunities", {})
@@ -850,8 +770,6 @@ def validate_history(
                 raise ValueError("CHECKPOINT_DECISION_ACCOUNT_PREDECESSOR")
             _verify_attempt(previous, current, record)
         if record["result"]["status"] == "COMMITTED_ONCE":
-            from .checkpoint_execution import opening_missed
-
             plan = record["attempts"][-1]["execution_plan"]
             for opportunity_id in record["opportunity_ids"]:
                 opportunity = rows[opportunity_id]
@@ -924,12 +842,10 @@ def _verify_attempt(
     if attempt["risk"] is None:
         return
     policy, markets = attempt["policy"], attempt["markets"]
-    from .checkpoint_account_proof import validate
-
     needed = set(previous["positions"]) | {
         market for pod in attempt["pods"] for market in pod["requested_notionals"]
     }
-    validate(
+    validate_account_proof(
         previous,
         attempt["account_proof"],
         attempt["quotes"],
@@ -990,8 +906,6 @@ def _verify_attempt(
     if computed != attempt["risk"]:
         raise ValueError("CHECKPOINT_RISK_REPLAY")
     if computed["status"] == "ACCEPTED":
-        from .checkpoint_execution import project
-
         try:
             expected_plan = project(
                 previous,
@@ -1053,8 +967,6 @@ def _verify_intent(
             "quantity": str(expected),
         }
     )
-    from .checkpoint_execution import opening_missed
-
     if any(
         current["checkpoint_opportunities"][key]["state"]["phase"]
         != (
@@ -1083,8 +995,8 @@ def _verify_intent(
         or intent["broker_epoch"] != previous["runtime"]["broker_epoch"]
         or intent["account_max_age_ms"]
         != attempt["policy"]["checkpoint_execution"]["account_max_age_ms"]
-        or intent["endpoint"] != "fake://broker"
-        or current["account_binding"] != "fixture-account"
+        or intent["endpoint"] != SYNTHETIC_ENDPOINT
+        or not is_synthetic_account(current["account_binding"])
     ):
         raise ValueError("CHECKPOINT_INTENT_DERIVATION")
     reservation = current["reservations"][intent["decision_id"]]

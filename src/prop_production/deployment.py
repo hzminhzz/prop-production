@@ -270,7 +270,7 @@ def activate_release(
 
 
 @contextmanager
-def _release_lock(opt: Path, inherited_fd: int | None = None) -> Iterator[None]:
+def release_lock(opt: Path, inherited_fd: int | None = None) -> Iterator[None]:
     """Serialize manual recovery and activation with the installer's stage lock."""
     lock = opt / ".deployment.lock"
     descriptor = inherited_fd
@@ -287,7 +287,7 @@ def _release_lock(opt: Path, inherited_fd: int | None = None) -> Iterator[None]:
             os.close(descriptor)
 
 
-def _fresh_heartbeats(state: Path, started: float) -> None:
+def fresh_heartbeats(state: Path, started: float) -> None:
     paths = [state / "health" / role / "heartbeat.json"
              for role in ("guardian", "observer", "bybit")]
     paths.append(state / "watchdog" / "heartbeat.json")
@@ -330,7 +330,7 @@ def main() -> None:
         if os.geteuid() != 0:
             raise PermissionError("ROOT_RELEASE_AUTHORITY_REQUIRED")
         opt, unit_dir = Path("/opt/prop-production"), Path("/etc/systemd/system")
-        with _release_lock(opt, args.lock_fd):
+        with release_lock(opt, args.lock_fd):
             if args.action == "recover":
                 if args.path.resolve() != opt:
                     raise ValueError("RECOVERY_ROOT")
@@ -344,7 +344,7 @@ def main() -> None:
                 ).returncode == 0]
                 started = time.time()
                 activate_release(opt, unit_dir, args.path, previous_active=active,
-                                 health_check=lambda: _fresh_heartbeats(
+                                 health_check=lambda: fresh_heartbeats(
                                      Path("/var/lib/prop-production"), started))
         print("RELEASE_OPERATION_VERIFIED; SHADOW / NO_TRADE")
 

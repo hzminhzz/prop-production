@@ -93,7 +93,7 @@ def _loss(
     )
 
 
-def _validate(
+def validate_market_inputs(
     markets: dict[str, Any], policy: dict[str, Any], needed: set[str], now_ms: int
 ) -> None:
     if (
@@ -176,7 +176,7 @@ def size_book(
             | {m for p in pods for m in p["requested_notionals"]}
             | {m for book in pod_positions.values() for m in book}
         )
-        _validate(markets, policy, needed, now_ms)
+        validate_market_inputs(markets, policy, needed, now_ms)
         if not needed.issubset(quotes):
             raise ValueError("QUOTE_MISSING")
         if len({p["pod_id"] for p in pods}) != len(pods) or not pods:

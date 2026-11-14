@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import time
 from collections.abc import Sequence
@@ -78,7 +80,6 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     or not isinstance(progress, int)
                     or not 0 <= now_ms - progress <= 120_000):
                 raise ValueError("RECOVERY_BROKER_STILL_UNREACHABLE")
-            import hashlib
             evidence_sha = hashlib.sha256(json.dumps(heartbeat, sort_keys=True).encode()).hexdigest()
         else:
             evidence_sha = args.evidence_sha
@@ -198,8 +199,6 @@ def _command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
         return result, 2 if result["phase_c"] == "BLOCKED" else 0
     if args.command == "release" and args.action == "verify":
-        import base64
-
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         from .evidence import digest, load_json

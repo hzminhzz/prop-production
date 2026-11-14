@@ -19,8 +19,7 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .evidence import load_json, verify
-from .v4_source_receiver import MAX_PACKET_BYTES, PACKET_NAME, _validated_batch
+from .v4_source_receiver import MAX_PACKET_BYTES, PACKET_NAME, validate_source_packet
 
 
 def _private_dir(path: Path, owner: int) -> None:
@@ -85,33 +84,7 @@ def transfer_once(
         raw = _owned_source(source, source_uid)
         if sha256(raw).hexdigest()[:16] != source.name[-21:-5]:
             raise ValueError("V4_TRANSFER_DIGEST_MISMATCH")
-        packet = load_json(raw)
-        if packet.get("authority") == "cwsa-checkpoint-v3":
-            from .checkpoint_source import validate_pins, verify_transition
-
-            proof = verify(packet, source_key, "cwsa-checkpoint-v3")
-            if (
-                proof["schema"] != "cwsa_checkpoint_packet_v3"
-                or proof["trading_authorized"] is not False
-            ):
-                raise ValueError("CWSA_HANDOFF_SCHEMA")
-            validate_pins(
-                {"policy": proof["policy"], "scopes": {proof["scope"]["source_id"]: proof["scope"]}}
-            )
-            for raw_sha, original in proof["originals"].items():
-                if sha256(original.encode()).hexdigest() != raw_sha:
-                    raise ValueError("CWSA_HANDOFF_ORIGINAL_HASH")
-            for event in proof["transitions"]:
-                verify_transition(
-                    proof["scope"],
-                    proof["policy"],
-                    event,
-                    proof["originals"],
-                    issued_ms=proof["issued_ms"],
-                )
-        else:
-            proof = verify(packet["batch_envelope"], source_key, "source-observer-v4-batch")
-            _validated_batch(raw, source_key, set(proof["selected"].values()))
+        validate_source_packet(raw, source_key)
         destination = protected_inbox / source.name
         if destination.exists() or destination.is_symlink():
             if _owned_source(destination, destination_uid) != raw:

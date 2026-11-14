@@ -1,6 +1,9 @@
 """Release receipts, partial failures, SIGKILL recovery and WAL-safe backups."""
+import ast
 import hashlib
+import importlib
 import json
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -13,11 +16,11 @@ import pytest
 from prop_production.compatibility import MANIFEST, check_dependency_constraints
 from prop_production.deployment import (
     UNITS,
-    _fresh_heartbeats,
-    _release_lock,
     activate_release,
     backup_database,
+    fresh_heartbeats,
     recover_activation,
+    release_lock,
     seal_bundle,
     verify_bundle,
 )
@@ -170,11 +173,11 @@ def test_online_backup_includes_committed_wal_not_uncommitted_rows(tmp_path):
 
 
 def test_activation_and_recovery_share_an_exclusive_lock(tmp_path):
-    with _release_lock(tmp_path):
+    with release_lock(tmp_path):
         with pytest.raises(BlockingIOError):
-            with _release_lock(tmp_path):
+            with release_lock(tmp_path):
                 pytest.fail("a competing activation acquired the lock")
-    with _release_lock(tmp_path):
+    with release_lock(tmp_path):
         pass
 
 
@@ -192,11 +195,11 @@ def test_heartbeat_gate_waits_for_in_place_observer_write(tmp_path, monkeypatch)
         waits.append(seconds)
         observer.write_text('{"trading_authorized":false}')
     monkeypatch.setattr("prop_production.deployment.time.sleep", finish_write)
-    _fresh_heartbeats(tmp_path, 0)
+    fresh_heartbeats(tmp_path, 0)
     assert len(waits) == 1
     observer.write_text('{"trading_authorized":true}')
     with pytest.raises(ValueError, match="UNEXPECTED_TRADING_AUTHORITY"):
-        _fresh_heartbeats(tmp_path, 0)
+        fresh_heartbeats(tmp_path, 0)
 
 
 def test_package_constraints_must_match_single_compatibility_manifest(tmp_path):
@@ -206,3 +209,78 @@ def test_package_constraints_must_match_single_compatibility_manifest(tmp_path):
     changed.write_text(project.read_text().replace("ccxt==4.5.74", "ccxt==0.0.0"))
     with pytest.raises(ValueError, match="DEPENDENCY_DRIFT"):
         check_dependency_constraints(changed)
+
+
+def test_packaged_systemd_units_and_acyclic_module_graph(tmp_path):
+    from prop_production.driver import PERIODIC
+
+    root = Path(__file__).parents[1]
+    for unit in UNITS:
+        text = (root / "deploy" / unit).read_text()
+        exec_line = next(
+            line.split("=", 1)[1].strip()
+            for line in text.splitlines()
+            if line.startswith("ExecStart=")
+        )
+        argv = shlex.split(exec_line)
+        assert argv[:2] == ["/opt/prop-production/current/venv/bin/python", "-m"]
+        module = importlib.import_module(argv[2])
+        assert callable(getattr(module, "main", None))
+        if unit == "prop-production-broker.service":
+            assert argv[2:] == ["prop_production.judge.broker", "/var/lib/prop-production"]
+        elif unit in {"prop-production-guardian.service", "prop-production-planner.service"}:
+            role = argv[3]
+            assert argv[2] == "prop_production.driver"
+            assert role in PERIODIC and PERIODIC[role] is not None
+            assert role in {"planner", "guardian"}
+
+    rejected = subprocess.run(
+        [sys.executable, "-m", "prop_production.worker", "broker", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    assert rejected.returncode != 0
+
+    src_dir = root / "src" / "prop_production"
+    graph: dict[str, set[str]] = {}
+    judge_importers: set[str] = set()
+    for path in sorted(src_dir.glob("*.py")):
+        mod = path.stem
+        deps: set[str] = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.level == 1:
+                    top = node.module.split(".")[0]
+                    deps.add(top)
+                    if top == "judge":
+                        judge_importers.add(mod)
+                elif node.module.startswith("prop_production."):
+                    top = node.module.split(".")[1]
+                    deps.add(top)
+                    if top == "judge":
+                        judge_importers.add(mod)
+        deps.discard(mod)
+        graph[mod] = deps
+
+    visited: dict[str, int] = {}
+    cycles: list[list[str]] = []
+
+    def dfs(node: str, stack: list[str]) -> None:
+        visited[node] = 1
+        for dep in sorted(graph.get(node, ())):
+            if dep not in graph:
+                continue
+            if visited.get(dep) == 1:
+                cycles.append([*stack[stack.index(dep) :], dep])
+            elif visited.get(dep, 0) == 0:
+                dfs(dep, [*stack, dep])
+        visited[node] = 2
+
+    for mod in sorted(graph):
+        if visited.get(mod, 0) == 0:
+            dfs(mod, [mod])
+
+    assert cycles == []
+    assert judge_importers <= {"cli"}

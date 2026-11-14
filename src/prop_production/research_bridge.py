@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -66,8 +67,6 @@ def economics(root: Path, python: Path, tapes: dict[str, Path] | None = None) ->
             raise ValueError("ECONOMIC_POLICY")
         arguments += ["--" + policy, str(path)]
     # Economics output may contain finite numeric statistics; it is not a financial authority input.
-    import json
-
     verify_checkout(root)
     result = subprocess.run(
         [str(python), *arguments],

@@ -1,13 +1,17 @@
 """Independent broker proof, scoped recovery signatures and no auto-arm."""
 
+from dataclasses import replace
+from decimal import Decimal
 from hashlib import sha256
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_guardian import setup_system
+from test_planner import quote
 
 from prop_production.evidence import digest, sign
-from prop_production.recovery import snapshot_receipt
+from prop_production.gateway import BrokerOrder
+from prop_production.recovery import require_real_remediation, snapshot_receipt
 
 
 def request_for(journal, key, proof_sha, *, now=301010, **changes):
@@ -174,3 +178,55 @@ def test_legacy_digest_only_recovery_cannot_clear_real_account(tmp_path):
                 evidence_sha="f" * 64,
             )
         assert journal.snapshot()["halts"] == ["BROKER_UNREACHABLE"]
+
+
+def test_recovery_rejects_revoked_non_broker_order_status(tmp_path):
+    guardian, broker, journal, proposal, floor = setup_system(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    try:
+        now = 301000
+        decision = guardian.decide(proposal, quote(), now)
+        ids = guardian.reserve(decision.data["decision_id"], now)
+        intent_id = ids[0]
+        journal.halt("BROKER_UNREACHABLE", now + 1)
+        state = journal.snapshot()
+        intent = state["intents"][intent_id]
+        revoked_order = BrokerOrder(
+            intent_id=intent_id,
+            broker_id="fake-revoked",
+            market=intent["market"],
+            quantity=Decimal(intent["quantity"]),
+            filled=Decimal(0),
+            status="REVOKED",
+            reduce_only=intent["reduce_only"],
+        )
+        snapshot = replace(broker.observe(now + 2), orders=(revoked_order,))
+        assert snapshot.ready(now + 2, 5000) is True
+        with pytest.raises(ValueError, match="RECOVERY_TERMINALITY_NOT_CONSERVED"):
+            require_real_remediation(
+                reason="BROKER_UNREACHABLE",
+                state=state,
+                snapshot=snapshot,
+                now_ms=now + 2,
+            )
+
+        class RevokedSnapshotGateway:
+            synthetic = True
+            endpoint = snapshot.endpoint
+
+            def observe(self, observe_ms: int):
+                return snapshot
+
+        request = request_for(journal, key, digest(snapshot_receipt(snapshot)), now=now + 2)
+        with pytest.raises(ValueError, match="RECOVERY_TERMINALITY_NOT_CONSERVED"):
+            journal.recover_authenticated(
+                request,
+                recovery_key=key.public_key(),
+                gateway=RevokedSnapshotGateway(),
+                now_ms=now + 2,
+            )
+        assert "BROKER_UNREACHABLE" in journal.snapshot()["halts"]
+    finally:
+        journal.close()
+        broker.close()
+        floor.close()

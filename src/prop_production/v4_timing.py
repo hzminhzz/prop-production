@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from decimal import Decimal
@@ -94,8 +95,6 @@ class V4ShadowProjection:
         existed = path.exists()
         self.con = sqlite3.connect(path, timeout=0.1, isolation_level=None)
         if not existed:
-            import os
-
             os.chmod(path, 0o600)
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.execute("PRAGMA synchronous=FULL")

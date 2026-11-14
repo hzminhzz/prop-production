@@ -77,7 +77,7 @@ def _decimal(value: object) -> Decimal | None:
         return None
 
 
-def _exposure(state: dict[str, Any]) -> dict[str, Any]:
+def exposure(state: dict[str, Any]) -> dict[str, Any]:
     """Diagnostic mark exposure only when the broker-owned reconciliation is coherent."""
     runtime = state.get("runtime", {})
     # A newer failed reconciliation can leave the last successful snapshot's
@@ -212,7 +212,7 @@ def project_state(state: dict[str, Any], command: str, now_ms: int,
         result.update(finance=state["finance"],
                       reservations=state["reservations"],
                       pod_loss_used=state.get("pod_loss_used", {}),
-                      exposure=_exposure(state))
+                      exposure=exposure(state))
     else:
         keep = {"intent_id", "decision_id", "release_sha", "market", "quantity", "filled", "status",
                 "reduce_only", "broker_epoch", "boot_epoch", "created_at_ms", "expires_at_ms",

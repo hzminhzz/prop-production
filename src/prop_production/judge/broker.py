@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
+import sys
+from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from ..contracts import SYNTHETIC_ACCOUNT, SYNTHETIC_ENDPOINT
 from ..evidence import canonical, decimal, digest
 from ..gateway import BrokerOrder, BrokerSnapshot, Execution, Outcome, Position
+from ..ipc import LocalServer
+from ..worker import sandbox
 
 ZERO = Decimal("0")
 
 
 class FakeBroker:
     synthetic = True
+    endpoint = SYNTHETIC_ENDPOINT
 
     def __init__(self, path: Path):
         self.con = sqlite3.connect(path, isolation_level=None, timeout=0.1)
@@ -64,7 +72,7 @@ class FakeBroker:
     def submit(self, intent: dict[str, Any]) -> Outcome:
         if not self.connected:
             raise TimeoutError("FAKE_PROVIDER_UNREACHABLE")
-        if intent["account_binding"] != "fixture-account" or intent["endpoint"] != "fake://broker":
+        if intent["account_binding"] != SYNTHETIC_ACCOUNT or intent["endpoint"] != SYNTHETIC_ENDPOINT:
             raise PermissionError("SYNTHETIC_ACCOUNT_ONLY")
         key = intent["intent_id"]
         wire_fields = (
@@ -262,8 +270,8 @@ class FakeBroker:
         capabilities = tuple(
             {
                 "schema": "native_execution_capabilities_v1",
-                "account": "fixture-account",
-                "endpoint": "fake://broker",
+                "account": SYNTHETIC_ACCOUNT,
+                "endpoint": SYNTHETIC_ENDPOINT,
                 "instrument": market,
                 "observed_at_ms": max(0, now_ms - self.stale_by_ms),
                 "known_at_ms": now_ms,
@@ -277,8 +285,8 @@ class FakeBroker:
             for market in self.__truth["marks"]
         )
         return BrokerSnapshot(
-            "fixture-account",
-            "fake://broker",
+            SYNTHETIC_ACCOUNT,
+            SYNTHETIC_ENDPOINT,
             max(0, now_ms - self.stale_by_ms),
             now_ms,
             self.__truth["epoch"],
@@ -305,3 +313,99 @@ class FakeBroker:
 
     def close(self) -> None:
         self.con.close()
+
+
+def _wire(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _wire(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_wire(v) for v in value]
+    return value
+
+
+def broker_worker(root: Path) -> None:
+    broker = FakeBroker(root / "broker" / "truth.sqlite")
+    roles = {
+        "guardian": (
+            os.getuid(),
+            (root / "broker" / "guardian.key").read_bytes(),
+            {"observe", "submit", "cancel"},
+        ),
+        "judge": (
+            os.getuid(),
+            (root / "broker" / "judge.key").read_bytes(),
+            {"observe", "fault", "mark", "funding", "ledger", "audit", "fill", "stop"},
+        ),
+    }
+    server = LocalServer(root / "broker" / "b.sock", roles)
+    running = True
+
+    def stop(*args: Any) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+
+    def handle(role: str, body: dict[str, Any]) -> dict[str, Any]:
+        command = body["command"]
+        try:
+            if command == "observe":
+                return {"snapshot": _wire(asdict(broker.observe(body["now_ms"])))}
+            if command == "submit":
+                return {"outcome": asdict(broker.submit(body["intent"]))}
+            if command == "cancel":
+                return {"outcome": asdict(broker.cancel(body["intent_id"]))}
+            if command == "fault":
+                allowed = {
+                    "fault_mode",
+                    "connected",
+                    "history_complete",
+                    "stale_by_ms",
+                    "fill_on_submit",
+                }
+                if set(body) - allowed - {"command"}:
+                    raise ValueError("FAULT_SCHEMA")
+                for k, v in body.items():
+                    if k != "command":
+                        setattr(broker, k, v)
+                return {"configured": True}
+            if command == "mark":
+                broker.mark(body["market"], body["price"], body["now_ms"])
+                return {"marked": True}
+            if command == "funding":
+                broker.funding(body["amount"], body["now_ms"])
+                return {"funding": True}
+            if command == "fill":
+                broker.fill(body["intent_id"], body["fraction"], body.get("price"))
+                return {"filled": True}
+            if command == "ledger":
+                return {"ledger": broker.ledger()}
+            if command == "audit":
+                return {"audit": broker.audit()}
+            if command == "stop":
+                stop()
+                return {"stopping": True}
+            raise ValueError("COMMAND")
+        except TimeoutError:
+            return {"unavailable": True}
+
+    sandbox(root, "broker")
+    print('{"ready":"SYNTHETIC_BROKER"}', flush=True)
+    try:
+        while running:
+            server.serve_once(handle)
+    finally:
+        server.close()
+        broker.close()
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: python -m prop_production.judge.broker STATE_ROOT")
+    broker_worker(Path(sys.argv[1]).resolve())
+
+
+if __name__ == "__main__":
+    main()

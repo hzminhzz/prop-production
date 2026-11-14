@@ -11,27 +11,14 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Any
 
+from .checkpoint_admission import validate_history
+from .contracts import ALLOWED_INTENT_STATUSES, is_synthetic_account
+from .copy_mandates import validate_mandate_history
 from .evidence import decimal
+from .guardian_protection import valid_protective_permit
+from .release import validate_release_binding
 
 CONTRACT = "guardian_finance_semantic_v2"
-_ALLOWED_INTENT_STATUSES = frozenset(
-    {
-        "QUEUED",
-        "DISPATCHING",
-        "ACKNOWLEDGED",
-        "REJECT_PENDING_PROOF",
-        "CANCEL_PENDING",
-        "UNKNOWN",
-        "ACCEPTED",
-        "PARTIAL",
-        "FILLED",
-        "CANCELLED",
-        "EXPIRED",
-        "REJECTED",
-        "NOT_ACCEPTED",
-        "REVOKED",
-    }
-)
 _ALLOWED_RUNTIME = frozenset(
     {
         "DISARMED",
@@ -53,11 +40,8 @@ def validate_transition(
     previous_head: str,
 ) -> None:
     """Reject impossible reservations, fill accounting or history rewrites."""
-    from .guardian_checkpoints import validate_mandate_history
-
+    validate_release_binding(previous, current, kind)
     validate_mandate_history(previous, current, kind)
-    from .checkpoint_admission import validate_history
-
     validate_history(previous, current, kind, previous_head=previous_head)
     if current.get("_semantic_contract") != CONTRACT:
         raise ValueError("GUARDIAN_SEMANTIC_CONTRACT_NOT_V2")
@@ -74,8 +58,6 @@ def validate_transition(
             raise ValueError("GUARDIAN_LEGACY_UPGRADE_WITHOUT_FORWARD_CHECKPOINT")
     if previous and current["account_binding"] != previous["account_binding"]:
         raise ValueError("GUARDIAN_SEMANTIC_ACCOUNT_CHANGED")
-    from .guardian_protection import valid_protective_permit
-
     halts = current.get("halts")
     runtime = current.get("runtime")
     if (
@@ -122,7 +104,7 @@ def validate_transition(
             not isinstance(intent, dict)
             or intent.get("intent_id") != intent_id
             or intent.get("account_binding") != current["account_binding"]
-            or intent.get("status") not in _ALLOWED_INTENT_STATUSES
+            or intent.get("status") not in ALLOWED_INTENT_STATUSES
             or not isinstance(intent.get("market"), str)
             or not intent["market"]
         ):
@@ -166,7 +148,7 @@ def validate_transition(
                     and runtime["last_recovery"].get("reason") == reason
                     and runtime["last_recovery"].get("remaining_halts") == halts
                 )
-                if kind == "RECOVER_" + reason and previous["account_binding"] == "fixture-account":
+                if kind == "RECOVER_" + reason and is_synthetic_account(previous["account_binding"]):
                     allowed = basic
                 elif kind == "RECOVER_AUTH_" + reason:
                     recovery = runtime["last_recovery"]

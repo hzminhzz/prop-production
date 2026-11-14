@@ -156,3 +156,46 @@ def test_checkpoint_release_cannot_use_legacy_admission(system):
     with pytest.raises(ValueError, match="CHECKPOINT_ADMISSION"):
         system.guardian.decide(None, {}, START)
     assert not system.journal.snapshot()["intents"]
+
+
+def test_synthetic_endpoint_mismatch_rejected_before_reservation(tmp_path, system):
+    from test_guardian import setup_system
+    from test_planner import quote
+
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    legacy_guardian, legacy_broker, legacy_journal, proposal, floor = setup_system(legacy_root)
+    try:
+        legacy_decision = legacy_guardian.decide(proposal, quote(), 301000)
+        legacy_broker.endpoint = "https://unexpected.example"
+        with pytest.raises(PermissionError, match="REMOTE_MUTATION_UNAVAILABLE"):
+            legacy_guardian.reserve(legacy_decision.data["decision_id"], 301000)
+        legacy_state = legacy_journal.snapshot()
+        assert not legacy_state["intents"]
+        assert not legacy_state["reservations"]
+        assert not legacy_state["halts"]
+        assert legacy_broker.audit() == []
+    finally:
+        legacy_journal.close()
+        legacy_broker.close()
+        floor.close()
+
+    m, now = prime(system)
+    outcome = json.loads(fixture_packet())["payload"]["transitions"][-1]["effect"]
+    system.guardian.reconcile(now)
+    decision = system.guardian.review_checkpoints(
+        system.receiver,
+        {m.owner: outcome["outcome_id"]},
+        quotes=quote(now),
+        now_ms=now,
+    )
+    system.broker.endpoint = "https://unexpected.example"
+    with pytest.raises(PermissionError, match="REMOTE_MUTATION_UNAVAILABLE"):
+        system.guardian.reserve_checkpoint(
+            decision["decision_id"], receiver=system.receiver, now_ms=now + 1
+        )
+    cp_state = system.journal.snapshot()
+    assert not cp_state["intents"]
+    assert not cp_state["reservations"]
+    assert not cp_state["halts"]
+    assert system.broker.audit() == []

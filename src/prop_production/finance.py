@@ -6,6 +6,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from .contracts import SYNTHETIC_ACCOUNT
 from .evidence import decimal, digest, verify
 from .gateway import BrokerSnapshot
 
@@ -29,7 +30,7 @@ class Rulebook:
 
     @classmethod
     def synthetic(cls) -> Rulebook:
-        return cls("fixture-account", "SYNTHETIC", valid_until_ms=10**15,
+        return cls(SYNTHETIC_ACCOUNT, "SYNTHETIC", valid_until_ms=10**15,
                    evidence_sha=digest("invented rulebook; not provider terms"))
 
     @property

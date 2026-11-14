@@ -47,25 +47,25 @@ def test_owner_projection_preserves_causal_proposal_and_fills(tmp_path):
 
 
 def test_owner_exposure_unknown_if_mark_or_broker_certainty_missing():
-    from prop_production.operator import _exposure
+    from prop_production.operator import exposure
 
     state = {
         "runtime": {"certainty": "COHERENT", "last_snapshot_ms": 1000},
         "positions": {"BTC": "2", "ETH": "-1"},
         "last_marks": {"BTC": "123.45", "ETH": "100"},
     }
-    output = _exposure(state)
+    output = exposure(state)
     assert output["status"] == "VERIFIED_OWNER_MARK_SNAPSHOT"
     assert Decimal(output["gross"]) == Decimal("346.90")
     assert Decimal(output["net"]) == Decimal("146.90")
     state["last_marks"].pop("ETH")
-    assert _exposure(state)["gross"] is None
+    assert exposure(state)["gross"] is None
     state["runtime"]["certainty"] = "UNKNOWN"
-    assert _exposure(state)["status"] == "UNKNOWN"
+    assert exposure(state)["status"] == "UNKNOWN"
     state["last_marks"]["ETH"] = "100"
     state["runtime"]["certainty"] = "COHERENT"
     state["halts"] = ["RECONCILIATION_UNCERTAIN"]
-    assert _exposure(state)["status"] == "UNKNOWN"
+    assert exposure(state)["status"] == "UNKNOWN"
 
 
 def test_export_single_journal_snapshot_bounded_and_no_financial_write(tmp_path):

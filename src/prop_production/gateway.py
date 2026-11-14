@@ -5,10 +5,14 @@ from __future__ import annotations
 import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
+from urllib.parse import quote
 
+from .contracts import SYNTHETIC_ACCOUNT, SYNTHETIC_ENDPOINT
 from .evidence import decimal, digest
+from .execution_capabilities import permits
 
 
 @dataclass(frozen=True)
@@ -261,8 +265,6 @@ def execution_capability(
     synthetic: bool,
 ) -> bool:
     """Validate the pinned connector evidence contract without granting a permit."""
-    from .execution_capabilities import permits
-
     return permits(
         raw, feature, account=account, endpoint=endpoint, instrument=instrument,
         now_ms=now_ms, synthetic=synthetic,
@@ -271,6 +273,7 @@ def execution_capability(
 
 class BrokerGateway(Protocol):
     synthetic: bool
+    endpoint: str
 
     def observe(self, now_ms: int) -> BrokerSnapshot: ...
     def submit(self, intent: dict[str, Any]) -> Outcome: ...
@@ -375,8 +378,8 @@ def snapshot_from_wire(raw: dict[str, Any]) -> BrokerSnapshot:
 
 def fixture_snapshot(now_ms: int = 1000) -> BrokerSnapshot:
     return BrokerSnapshot(
-        "fixture-account",
-        "fake://broker",
+        SYNTHETIC_ACCOUNT,
+        SYNTHETIC_ENDPOINT,
         now_ms,
         now_ms,
         1,
@@ -476,8 +479,6 @@ async def inspect_propr_readonly(
                 break
             # Provider execution timestamps are native strings; no assertion that
             # these give a coherent history or independently witnessed fill cutoff.
-            from datetime import datetime
-
             try:
                 parsed = datetime.fromisoformat(trade.timestamp.replace("Z", "+00:00"))
                 if parsed.tzinfo is None:
@@ -699,8 +700,6 @@ async def inspect_bybit_demo_readonly(client: Any, received_at_ms: int) -> Broke
 
 
 def rest_account_path(account_id: str) -> str:
-    from urllib.parse import quote
-
     if not account_id or "/" in account_id:
         raise ValueError("INVALID_ACCOUNT")
     return "/accounts/" + quote(account_id, safe="")

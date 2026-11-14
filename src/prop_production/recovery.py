@@ -10,10 +10,12 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from .contracts import TERMINAL_BROKER_STATUSES, ZERO_FILL_TERMINAL_STATUSES
+from .copy_mandates import CopyMandate
 from .evidence import decimal, digest
 from .gateway import BrokerSnapshot
+from .release import validate_release_binding
 
-_TERMINAL = frozenset({"FILLED", "CANCELLED", "EXPIRED", "REJECTED", "NOT_ACCEPTED"})
 _REMEDIABLE = frozenset(
     {
         "BROKER_UNREACHABLE",
@@ -92,9 +94,6 @@ def require_real_remediation(
     if reason not in _REMEDIABLE:
         raise ValueError("RECOVERY_REASON_HAS_NO_VERIFIED_REMEDIATION_POLICY")
     if reason == "RELEASE_CHANGED_REQUIRES_REVIEW":
-        from .copy_mandates import CopyMandate
-        from .guardian_checkpoints import validate_release_binding
-
         validate_release_binding(state, state, "RECOVERY_REVIEW")
         binding = state.get("checkpoint_release")
         if binding is None:
@@ -164,9 +163,9 @@ def require_real_remediation(
             or order.filled != actual
             or decimal(intent["filled"]) != actual
             or order.reduce_only is not intent["reduce_only"]
-            or order.status not in _TERMINAL
+            or order.status not in TERMINAL_BROKER_STATUSES
             or (order.status == "FILLED" and actual != order.quantity)
-            or (order.status in {"REJECTED", "NOT_ACCEPTED"} and actual != 0)
+            or (order.status in ZERO_FILL_TERMINAL_STATUSES and actual != 0)
         ):
             raise ValueError("RECOVERY_TERMINALITY_NOT_CONSERVED")
     if set(orders) - set(state["intents"]):

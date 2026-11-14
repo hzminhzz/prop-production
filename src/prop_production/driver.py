@@ -77,7 +77,7 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _heartbeat(root: Path, worker: subprocess.Popen[bytes], reader: BoundedReader) -> None:
+def write_heartbeat(root: Path, worker: subprocess.Popen[bytes], reader: BoundedReader) -> None:
     """Write guardian heartbeat evidence for the independent watchdog."""
     assert worker.stdin is not None
     worker.stdin.write((json.dumps({"command": "status", "now_ms": _now_ms()}) + "\n").encode())
@@ -156,7 +156,7 @@ def drive(role: str, root: Path, *, interval_s: int) -> None:
                               "response": response.decode(errors="replace").strip() or None}),
                   flush=True)
             if role == "guardian":
-                _heartbeat(root, worker, reader)
+                write_heartbeat(root, worker, reader)
             for _ in range(interval_s * 10):
                 if worker.poll() is not None:
                     break

@@ -1,7 +1,7 @@
 """Unit tests for the deployed observer, watchdog and driver modules."""
 import json
 
-from prop_production.driver import _heartbeat
+from prop_production.driver import write_heartbeat
 from prop_production.observer import observation_record
 from prop_production.watchdog import assess
 
@@ -75,7 +75,7 @@ def test_driver_heartbeat_writes_evidence(tmp_path):
 
     worker = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     try:
-        _heartbeat(tmp_path, worker, BoundedReader(worker.stdout.fileno()))
+        write_heartbeat(tmp_path, worker, BoundedReader(worker.stdout.fileno()))
     finally:
         worker.stdin.close()
         worker.stdout.close()
