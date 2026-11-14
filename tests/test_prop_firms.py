@@ -18,6 +18,7 @@ from prop_production.prop_firms import (
     consistency_progress,
     get_challenge_spec,
     hyrotrader_policy,
+    propr_policy,
 )
 from prop_production.risk import fixture_markets, fixture_policy, size_book
 
@@ -262,3 +263,33 @@ def test_cft_policy_blocks_usdc_perp_and_spot() -> None:
         now_ms=1000,
     )
     assert accepted_usdt["status"] == "ACCEPTED"
+
+
+def test_propr_rulebook_variants_and_fail_closed_unverified_cash() -> None:
+    policy = challenge_policy("propr", fixture_policy())
+    assert policy == propr_policy(fixture_policy())
+
+    one_step = Rulebook.from_challenge("propr:classic_1step:phase_1")
+    assert one_step.initial == "5000"
+    assert one_step.target == "500"
+    assert one_step.daily_loss == "150"
+    assert one_step.trailing_loss == "300"
+    assert one_step.daily_basis == "BALANCE"
+    assert one_step.trailing_basis == "STATIC"
+
+    two_step = Rulebook.from_challenge("propr:classic_2step:phase_1")
+    assert two_step.trailing_basis == "INTRADAY_EQUITY"
+    assert two_step.trailing_loss == "400"
+
+    # Propr REST snapshots without verified cash/completeness fail closed in account_step.
+    unverified_propr_snap = replace(
+        fixture_snapshot(1000),
+        cash=None,
+        equity=Decimal("4999.225661"),
+        financial_complete=False,
+        connected=False,
+        uncertainty_reasons=("PROVIDER_CASH_UNVERIFIED", "RECONCILIATION_UNCERTAIN"),
+    )
+    state, reasons = account_step({}, unverified_propr_snap, one_step, 1000)
+    assert state == {}
+    assert "BROKER_FINANCE_UNKNOWN" in reasons

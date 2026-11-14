@@ -1005,6 +1005,11 @@ def cft_policy(base_policy: dict[str, Any]) -> dict[str, Any]:
     return policy
 
 
+def propr_policy(base_policy: dict[str, Any]) -> dict[str, Any]:
+    """Return risk_policy_v1 copy for Propr (multi-asset; no USDT-perp-only restriction)."""
+    return dict(base_policy)
+
+
 def challenge_policy(
     firm_slug: str,
     base_policy: dict[str, Any],
@@ -1017,6 +1022,8 @@ def challenge_policy(
         return hyrotrader_policy(base_policy, initial=initial)
     if slug == "crypto-fund-trader":
         return cft_policy(base_policy)
+    if slug == "propr":
+        return propr_policy(base_policy)
     return dict(base_policy)
 
 
