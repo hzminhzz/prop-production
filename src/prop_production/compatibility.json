@@ -8,7 +8,7 @@
     },
     "trading-connector": {
       "repository": "hzminhzz/trading-connector",
-      "commit": "ac32afffa2a0c548eb3f36eb513150a00db7c7f5"
+      "commit": "588ef56c9945f4d5d05877c62115d9eaa798362a"
     }
   },
   "contracts": {
