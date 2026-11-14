@@ -403,15 +403,22 @@ def main(argv: list[str] | None = None) -> int:
         member_k=TRIADA_HYDRO5K_K,
     )
 
-    with BybitDemoGateway(reconciler, expected_demo_uid=uid) as gateway:
-        markets = _build_markets(client.exchange)
-        while True:
-            now_ms = int(time.time() * 1000)
-            report = executor.step(gateway, markets, now_ms, execute=args.execute)
-            print(json.dumps(report, sort_keys=True), flush=True)
-            if args.once:
-                break
-            time.sleep(args.poll_seconds)
+    while True:
+        reconciler = BybitDemoReconciler(client)
+        with BybitDemoGateway(reconciler, expected_demo_uid=uid) as gateway:
+            markets = _build_markets(client.exchange)
+            while True:
+                now_ms = int(time.time() * 1000)
+                report = executor.step(gateway, markets, now_ms, execute=args.execute)
+                print(json.dumps(report, sort_keys=True), flush=True)
+                if args.once:
+                    return 0
+                if report.get("status") == "BLOCKED" and str(report.get("reason", "")).startswith(
+                    "BLOCKED_RECONCILIATION"
+                ):
+                    time.sleep(args.poll_seconds)
+                    break
+                time.sleep(args.poll_seconds)
     return 0
 
 
