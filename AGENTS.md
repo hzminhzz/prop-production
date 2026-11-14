@@ -1,78 +1,27 @@
 # prop-production execution contract
 
-## Start
+Default mode is **SHADOW / NO_TRADE**. Never commit credentials, wallet identities, private account responses, datasets, or signing secrets. Mode flags, passing tests, or service restarts never grant live trading authority; keep `IMPLEMENTED`, `ENGINEERING_VERIFIED`, `DEPLOYED`, `RUNNING_OBSERVED`, `SCIENTIFICALLY_QUALIFIED`, and `TRADING_AUTHORIZED` strictly separate.
 
-Inspect Git status, remotes, worktrees and the current GitHub ticket before edits.
-Read `README.md`, then the owning module and its public behavioral tests.
-ChatGPT executes directly; do not delegate unless the user explicitly asks.
-Complete the OptMem wake pagination; use memory for durable navigation, then verify
-live GitHub, SQLite and OS evidence. The actual default branch is currently
-`feat/account-guardian-program`; recheck before publication.
-Preserve other sessions' changes. Use isolated worktrees when upstream is dirty.
+## Orientation & scope
 
-## Capability-scoped gates (2026-11-07)
+- **Branch & worktrees:** Default branch is `feat/account-guardian-program` (recheck before pushing). Preserve concurrent sessions and use isolated worktrees when dirty. Read `README.md`, the owning module, and behavioral tests before editing.
+- **Capability-scoped gates:** Read [capability-scoped readiness](docs/CAPABILITY-SCOPED-READINESS-20261107.md). Source `OBSERVE` and read-only `PAPER` collection are decoupled from protected trading attestations (`read_only_collection=EVIDENCE_COLLECTED` preserves `BLOCKED_PAPER_ADMISSION` without executable follower economics). `DEMO`/`LIVE` require account-bound reconciliation, equity, signed release, risk checks, and explicit authorization.
+- **Durable navigation:** Use OptMem for cross-session context, then verify directly against Git, SQLite, and OS state. Execute directly unless delegation is explicitly requested.
 
-Read [capability-scoped readiness](docs/CAPABILITY-SCOPED-READINESS-20261107.md). Credential-free source OBSERVE and read-only PAPER receipt collection are independent of protected Guardian/financial attestations, historical positive alpha, unrelated regime proofs and optional 72-hour soak. `read_only_collection=EVIDENCE_COLLECTED` is **not** paper-follower admission: preserve `BLOCKED_PAPER_ADMISSION` absent executable follower economics. DEMO/LIVE still require account-bound reconciliation, actual equity, signed release, risk, broker permissions and explicit authorization.
+## Authority boundaries
 
-## Authority
+- **Domain owners:** Research metadata belongs to `copytrade-pm` SQLite; provider protocol belongs to `trading-connector`; Guardian account finance and committed intents belong to this app alone. Never place network I/O inside a SQL transaction or let a connector journal replace a Guardian intent.
+- **Propr & Planner:** Consume read-only Propr evidence strictly via `connectors/propr/native_evidence.py` and `BrokerGateway`, preserving native identity, timestamps, and `RECONCILIATION_UNCERTAIN`. Never derive cash as `equity - unrealized_pnl` or treat REST snapshots as coherent history. Planner never supplies equity, permits, or credentials.
+- **Bybit Demo:** Independently authenticated read-only observer (`BYBIT_MODE=read_only`, pinned `BybitClient`, explicit Demo UID/key/endpoint). Never fall back to `BYBIT_PROP_*` or mainnet/testnet credentials. See [Bybit Demo integration](docs/BYBIT-DEMO-INTEGRATION.md).
+- **Execution Session diagnostics:** `prop-production session --path` is a strictly read-only, unverified-claims diagnostic—never a broker permit, financial attestation, or HALT-clear signal. Native Propr order authority is currently unavailable. See [Execution Session v1](docs/EXECUTION-SESSION-20261111.md).
 
-Research metadata belongs to copytrade-pm SQLite. Provider protocol code belongs
-to trading-connector. Guardian account finance belongs to this application.
-Consume Propr read-only provider data exclusively through the versioned native
-evidence contract in connectors/propr/native_evidence.py via BrokerGateway. Never
-manufacture Guardian cash as equity minus unrealized PnL or treat matching REST
-snapshots as a coherent provider history cutoff. Preserve provider financial
-provenance, native identity, timestamps and RECONCILIATION_UNCERTAIN. No
-connector-owned journal may replace a Guardian-committed production intent.
-Bybit is a second, independently authenticated Demo-only read-only observer:
-use the pinned BybitClient, explicit Demo UID/key/endpoint verification, and
-BYBIT_MODE=read_only. Never fall back to BYBIT_PROP_* or mainnet/testnet
-credentials. Bybit equity and available buying power are not ledger cash;
-REST order/position reads are not coherent history. See docs/BYBIT-DEMO-INTEGRATION.md.
-Planner cannot supply trusted broker equity, grant permits or access credentials.
+## Checkpoint lifecycle & sizing
 
-## Checkpoint lifecycle: explicit transitions only
+- **Explicit transitions only:** Keep typed predecessor/trigger/guard/next-state/durable-effect contracts; never build implicit FSMs over `is_active`, `ready`, age, missing rows, or service health. Existing broker order journals remain the only protected financial truth: shared CWSA continuity does not reset on single-mandate change, and HALTs/unknown orders cannot clear from source health. See [CWSA/Guardian design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md), [adversarial acceptance map](docs/CANONICAL-5M-ACCEPTANCE-20261112.md), [integration evidence](docs/CHECKPOINT-INTEGRATION-325.md), and [nonactivating release/recovery contract](docs/CHECKPOINT-SHADOW-RELEASE-327.md).
+- **Default sizing (`FIXED_K_NATIVE_QUANTITY`):** Follower target notional is `k * leader native qty * source mark`, sized at an independent follower quote and Guardian risk-checked. `source nav=null` is valid and MUST NOT fail on `SOURCE_NAV` or trigger parent/subaccount/Vike NAV reconstruction. Reserve `SOURCE_NAV` checks strictly for explicit `ALLOCATION_OVER_LIVE_NAV` policies. Enforce signed releases, causal clocks, risk/drawdown/margin/HALT gates, and note gap/slippage around pod stops. See [sizing policy](docs/SIZING-POLICY.md).
 
-The [CWSA/Guardian design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Q1–Q24. For checkpoint admission, mandate succession or code recovery, read the [adversarial acceptance map](docs/CANONICAL-5M-ACCEPTANCE-20261112.md), [integration evidence](docs/CHECKPOINT-INTEGRATION-325.md) and [nonactivating release/recovery contract](docs/CHECKPOINT-SHADOW-RELEASE-327.md). The versioned source receiver, mandate/opportunity reducers, Guardian netting/reconciliation and isolated worker rehearsal exist. Actual native mutation authority and a trusted operational future candidate remain separately gated. Reuse existing Guardian-owned finance and durable journals. Never implement an implicit state machine using `is_active`, `ready`, age alone, missing rows, service statuses or mixed concern enums. Source continuity, signed mandate generations and new-risk opportunities must retain separately owned typed predecessor/trigger/guard/next-state/durable-effect contracts; the existing broker order journal remains the only protected financial truth. Shared CWSA continuity does not reset when one follower's copy mandate changes; unknown orders and HALTs cannot be cleared by source health. No third supervisor, second Guardian or global FSM.
+## Verification & deployment
 
-## Binding owner decision: source NAV is not a universal gate (2026-11-06)
-
-- **Default copy policy:** risk-budgeted, fixed-k mirroring of an explicitly selected leader account/perpetual position scope. `FIXED_K_NATIVE_QUANTITY` is the signed release member policy: follower target **notional** is `k * leader native position quantity * source mark`, then quantity is determined at the independent follower quote and checked by Guardian. Source `nav=null` is valid in this mode and MUST NOT cause a `SOURCE_NAV` rejection or a request to reconstruct parent/subaccount/whole-wallet equity.
-- **Legacy fidelity policy:** `ALLOCATION_OVER_LIVE_NAV` remains available *only when explicitly selected* to reproduce leader equity-relative exposures; that path still requires verifiable leader NAV. Do not apply its NAV requirement to fixed-k policies.
-- **Mandatory regardless of policy:** authentic signer/release, canonical source/account scope, full positions inside the selected scope (not unrelated subaccounts), causal first-known clocks, signed fixed k, follower account equity/headroom, provider account reconciliation, fresh follower quotes, risk-policy caps, independent pod loss stop, daily/trailing drawdown, volume/lot/margin, HALT and order authorization. A $200 pod loss threshold does not guarantee execution at exactly $200 under gap/slippage.
-- Do not promote source NAV from Vike wallet summary or sum per-DEX NAV for unified/portfolio-margin accounts. Missing NAV can be a diagnostic field but **not** a blocker for `FIXED_K_NATIVE_QUANTITY`. No source-NAV request should interrupt routine research, paper planning, or engineering on this mode. See `docs/SIZING-POLICY.md`.
-
-Default SHADOW / NO_TRADE. No real broker mutations, credentials, wallet identities,
-private account responses, datasets or signing secrets in Git.
-Production permission requires account-bound independent evidence and explicit
-owner authorization. A mode flag, test result or service restart never grants it.
-
-## Execution Session diagnostics (2026-11-11)
-
-Read [Execution Session v1](docs/EXECUTION-SESSION-20261111.md) before changing admission logic. `prop-production session --path` is a strictly read-only, account-scoped, *unverified-claims* diagnostic. It must not be consumed as a broker permit, financial attestation, or authority to clear HALT. Only the existing Guardian journal may authorize committed order intents. A healthy synthetic broker socket is not provider mutation readiness; current native Propr order authority is unavailable.
-
-## Verification
-
-For this private program, GitHub Actions is not required. Use the commit-bound
-local verification script and acceptance contract in docs/LOCAL-VERIFICATION.md;
-require a clean reviewed revision and both pinned companion suites before a merge.
-`src/prop_production/compatibility.json` is the only companion/schema pin authority;
-package constraints, runtime bridge, verifier and deployment must agree with it.
-Read `docs/DEPLOYMENT-RUNBOOK.md` before protected installation. Bundle the app,
-connector and units together; use named compatible rollback and never rewind journals
-or the trust floor. The current symlink alone does not prove running process code.
-Record exact commands, SHAs, counts, skips and reviewer. Never confuse a locally
-passing suite with an independent safety certificate or trading authorization.
-Test behavior through
-CLI, TargetBatchProposal -> DecisionReceipt -> durable intent -> BrokerGateway.
-Use exact decimal accounting; the Outside Judge must not import Guardian risk or
-finance functions as its oracle. Never do network I/O in a SQL transaction.
-Commit reservations and intent before dispatch. Unknown outcome is not failure.
-Keep HALT across restart and midnight. Missing evidence means BLOCKED.
-
-## Continue
-
-Diagnose -> repair -> verify -> resume unrelated unblocked tickets.
-Only close issues with evidence for every acceptance criterion. Record external
-blockers precisely and keep IMPLEMENTED, ENGINEERING_VERIFIED, DEPLOYED,
-RUNNING_OBSERVED, SCIENTIFICALLY_QUALIFIED, TRADING_AUTHORIZED separate.
+- **Pins & local gates:** `src/prop_production/compatibility.json` is the sole companion/schema pin authority. Before merge, run commit-bound local verification with both pinned companions per [local verification](docs/LOCAL-VERIFICATION.md).
+- **Invariants under test:** Exercise `CLI`, `TargetBatchProposal -> DecisionReceipt -> durable intent -> BrokerGateway` with exact decimal accounting. Commit reservations and intent before dispatch; unknown outcome is not failure; persist `HALT` across restart and midnight; missing evidence is `BLOCKED`. Outside Judge must never import Guardian risk or finance as its oracle.
+- **Protected installation:** Follow [deployment runbook](docs/DEPLOYMENT-RUNBOOK.md). Bundle app, connector, and units together, use named rollback without rewinding journals or the trust floor, and verify live process/release identity rather than symlink presence. Keep `IMPLEMENTED`, `ENGINEERING_VERIFIED`, `DEPLOYED`, `RUNNING_OBSERVED`, `SCIENTIFICALLY_QUALIFIED`, and `TRADING_AUTHORIZED` distinct when closing tickets.
