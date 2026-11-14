@@ -998,6 +998,28 @@ def hyrotrader_policy(
     return policy
 
 
+def cft_policy(base_policy: dict[str, Any]) -> dict[str, Any]:
+    """Overlay Crypto Fund Trader (Bybit) non-financial policy guards onto risk_policy_v1."""
+    policy = dict(base_policy)
+    policy["allowed_instrument_types"] = ["usdt_perp"]
+    return policy
+
+
+def challenge_policy(
+    firm_slug: str,
+    base_policy: dict[str, Any],
+    *,
+    initial: str | Decimal = "5000",
+) -> dict[str, Any]:
+    """Overlay firm-specific non-financial policy guards onto a risk_policy_v1 dict."""
+    slug = firm_slug.strip().lower()
+    if slug == "hyrotrader":
+        return hyrotrader_policy(base_policy, initial=initial)
+    if slug == "crypto-fund-trader":
+        return cft_policy(base_policy)
+    return dict(base_policy)
+
+
 def consistency_progress(
     day_profits: dict[str, str | Decimal],
     *,

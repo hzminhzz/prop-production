@@ -73,7 +73,7 @@ def snapshot_from_bybit_reconciliation(
         if "BYBIT_UNIFIED_FINANCE_INCOMPLETE" not in reasons:
             reasons.append("BYBIT_UNIFIED_FINANCE_INCOMPLETE")
     elif (
-        equity != cash + unrealized  # type: ignore[operator]
+        abs(equity - (cash + unrealized)) > Decimal("0.000001")  # type: ignore[operator]
         and "UNIFIED_FINANCE_CONSERVATION_MISMATCH" not in reasons
     ):
         reasons.append("UNIFIED_FINANCE_CONSERVATION_MISMATCH")

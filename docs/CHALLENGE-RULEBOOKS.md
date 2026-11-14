@@ -20,11 +20,12 @@ rules_10k = Rulebook.from_challenge("hyrotrader:two_step:phase_1", scale=2)
 # Inspect extra non-Guardian constraints (consistency, prohibited venues/pairs, ambiguities)
 spec = get_challenge_spec("hyrotrader:two_step:phase_1")
 
-# Overlay HyroTrader non-financial policy guards onto a risk_policy_v1 dict
-from prop_production.prop_firms import consistency_progress, hyrotrader_policy
+# Overlay firm-specific non-financial policy guards onto a risk_policy_v1 dict
+from prop_production.prop_firms import cft_policy, challenge_policy, consistency_progress, hyrotrader_policy
 from prop_production.risk import fixture_policy
 
-policy = hyrotrader_policy(fixture_policy(), initial="5000")
+policy = challenge_policy("hyrotrader", fixture_policy(), initial="5000")
+cft_pol = cft_policy(fixture_policy())  # enforces usdt_perp only (blocks spot & USDC pairs)
 # Enforces in risk.validate_market_inputs / size_book:
 # - allowed_instrument_types=["usdt_perp"] -> CHALLENGE_INSTRUMENT_PROHIBITED
 # - blocked_symbols=["EUR/USD", ...] -> CHALLENGE_SYMBOL_PROHIBITED

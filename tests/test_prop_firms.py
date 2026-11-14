@@ -13,6 +13,8 @@ from prop_production.finance import DAY_MS, Rulebook, account_step
 from prop_production.gateway import fixture_snapshot
 from prop_production.prop_firms import (
     CHALLENGE_RULEBOOKS,
+    cft_policy,
+    challenge_policy,
     consistency_progress,
     get_challenge_spec,
     hyrotrader_policy,
@@ -209,3 +211,54 @@ def test_consistency_progress_40pct_hyrotrader_rule() -> None:
     assert res["cap_per_day"] == "200"
     assert res["capped_days"] == ["2026-11-10"]
     assert res["target_met"] is False
+
+
+def test_cft_policy_blocks_usdc_perp_and_spot() -> None:
+    policy = challenge_policy("crypto-fund-trader", fixture_policy())
+    assert policy == cft_policy(fixture_policy())
+    assert policy["allowed_instrument_types"] == ["usdt_perp"]
+
+    markets = fixture_markets()
+    markets["BTC"]["instrument_type"] = "usdt_perp"
+    markets["ETH"]["instrument_type"] = "usdc_perp"
+    quotes = {
+        "BTC": {"bid": "50000", "ask": "50000", "known_at_ms": 1000},
+        "ETH": {"bid": "2000", "ask": "2000", "known_at_ms": 1000},
+    }
+    finance, _ = account_step(
+        {},
+        replace(
+            fixture_snapshot(1000),
+            cash=Decimal("5000"),
+            equity=Decimal("5000"),
+            unrealized=Decimal("0"),
+        ),
+        Rulebook.from_challenge("crypto-fund-trader:two_phase:phase_1"),
+        1000,
+    )
+    blocked_usdc = size_book(
+        [{"pod_id": "p1", "requested_notionals": {"ETH": "100"}, "max_notional": "1000"}],
+        quotes,
+        markets,
+        policy,
+        finance,
+        {},
+        {},
+        [],
+        now_ms=1000,
+    )
+    assert blocked_usdc["status"] == "BLOCKED"
+    assert blocked_usdc["reasons"] == ["CHALLENGE_INSTRUMENT_PROHIBITED"]
+
+    accepted_usdt = size_book(
+        [{"pod_id": "p1", "requested_notionals": {"BTC": "100"}, "max_notional": "1000"}],
+        quotes,
+        markets,
+        policy,
+        finance,
+        {},
+        {},
+        [],
+        now_ms=1000,
+    )
+    assert accepted_usdt["status"] == "ACCEPTED"
