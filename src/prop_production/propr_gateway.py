@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import threading
 import time
-from collections.abc import Coroutine
 from decimal import Decimal
-from typing import Any, TypeVar
+from typing import Any
 
 from .evidence import decimal, digest
-from .gateway import BrokerSnapshot, Outcome, inspect_propr_readonly
+from .gateway import AsyncLoopRunner, BrokerSnapshot, Outcome, inspect_propr_readonly
 
 PROPR_API_URL = "https://api.propr.xyz/v1"
 _ZERO = Decimal("0")
-_T = TypeVar("_T")
 
 
 def propr_account_binding(account_id: str, endpoint: str = PROPR_API_URL) -> str:
@@ -61,64 +58,17 @@ class ProprGateway:
         self.endpoint = clean_ep
         self._binding = propr_account_binding(clean_id, clean_ep)
         self._order_client = order_client
-        self._external_loop = loop
-        self._owned_loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
-        self._command_timeout_s = command_timeout_s
+        self._loop_runner = AsyncLoopRunner(
+            name="propr-gateway-loop", loop=loop, timeout_s=command_timeout_s
+        )
         self._submitted_lock = threading.Lock()
         self._submitted_targets: dict[str, str] = {}
 
-    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        if self._external_loop is not None:
-            return self._external_loop
-        if self._owned_loop is not None and not self._owned_loop.is_closed():
-            return self._owned_loop
-
-        ready = threading.Event()
-        holder: dict[str, asyncio.AbstractEventLoop] = {}
-
-        def _runner() -> None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            holder["loop"] = loop
-            ready.set()
-            loop.run_forever()
-            loop.close()
-
-        thread = threading.Thread(target=_runner, name="propr-gateway-loop", daemon=True)
-        thread.start()
-        ready.wait(timeout=5.0)
-        loop = holder.get("loop")
-        if loop is None:
-            raise RuntimeError("PROPR_EVENT_LOOP_START_FAILED")
-        self._owned_loop = loop
-        self._thread = thread
-        return loop
-
-    def _run_coro(self, coro: Coroutine[Any, Any, _T]) -> _T:
-        loop = self._ensure_loop()
-        future: concurrent.futures.Future[_T] = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result(timeout=self._command_timeout_s)
-
     def start(self) -> None:
-        self._ensure_loop()
+        self._loop_runner.ensure_loop()
 
     def close(self) -> None:
-        if self._external_loop is not None or (
-            self._owned_loop is not None and not self._owned_loop.is_closed()
-        ):
-            for client in (self._rest, self._order_client):
-                if client is not None and hasattr(client, "close"):
-                    try:
-                        self._run_coro(client.close())
-                    except Exception:
-                        pass
-        if self._owned_loop is not None and not self._owned_loop.is_closed():
-            self._owned_loop.call_soon_threadsafe(self._owned_loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
-        self._owned_loop = None
+        self._loop_runner.close(self._rest, self._order_client)
 
     def __enter__(self) -> ProprGateway:
         self.start()
@@ -129,7 +79,7 @@ class ProprGateway:
 
     def observe(self, now_ms: int) -> BrokerSnapshot:
         """Read normalized Propr native evidence snapshot via read-only REST."""
-        snap = self._run_coro(
+        snap = self._loop_runner.run(
             inspect_propr_readonly(self._rest, self._account_id, self.endpoint, now_ms)
         )
         if snap.account_binding != self._binding or snap.endpoint != self.endpoint:
@@ -162,7 +112,7 @@ class ProprGateway:
         position_side = "long" if (qty > _ZERO) != reduce_only else "short"
 
         try:
-            ack = self._run_coro(
+            ack = self._loop_runner.run(
                 order_client.submit_market_order(
                     intent_id=intent_id,
                     asset=asset,
@@ -217,7 +167,7 @@ class ProprGateway:
             return Outcome(status="UNKNOWN", reason="CANCEL_TARGET_UNKNOWN")
 
         try:
-            self._run_coro(order_client.cancel_order(broker_id))
+            self._loop_runner.run(order_client.cancel_order(broker_id))
         except Exception as exc:
             return Outcome(
                 status="UNKNOWN",

@@ -9,7 +9,6 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -17,7 +16,7 @@ from typing import Any
 
 from .bybit_gateway import BybitDemoGateway
 from .evidence import decimal, digest
-from .gateway import BrokerSnapshot
+from .gateway import BrokerSnapshot, MarketSpec
 from .prop_firms import ChallengeRulebookSpec, get_challenge_spec
 
 _ZERO = Decimal("0")
@@ -36,15 +35,6 @@ TRIADA_HYDRO5K_K: dict[str, Decimal] = {
     "ACT08": Decimal("0.00356"),
     "ACT09": Decimal("0.00099"),
 }
-
-
-@dataclass(frozen=True)
-class MarketSpec:
-    """Minimal Bybit linear USDT perp market constraints."""
-
-    symbol: str
-    min_amount: Decimal
-    amount_step: Decimal
 
 
 def _utc_day_key(now_ms: int, reset_time_hhmm: str = "00:00") -> str:
@@ -702,6 +692,24 @@ def _load_markets_json(path: Path) -> dict[str, MarketSpec]:
 CwsaExecutor = BybitCwsaExecutor
 
 
+def _run_rest_poll_loop(
+    executor: BybitCwsaExecutor,
+    gateway: Any,
+    markets: dict[str, MarketSpec],
+    *,
+    execute: bool,
+    once: bool,
+    poll_seconds: int,
+) -> int:
+    while True:
+        now_ms = int(time.time() * 1000)
+        report = executor.step(gateway, markets, now_ms, execute=execute)
+        print(json.dumps(report, sort_keys=True), flush=True)
+        if once:
+            return 0
+        time.sleep(poll_seconds)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -714,10 +722,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path("/var/lib/prop-production-hydro/executor.sqlite"),
     )
-    parser.add_argument("--venue", choices=("bybit", "propr"), default="bybit")
+    parser.add_argument("--venue", choices=("bybit", "propr", "vanta"), default="bybit")
     parser.add_argument("--rulebook-key", default="hyrotrader:two_step:phase_1")
     parser.add_argument("--env-prefix", default="BYBIT_HYDRO")
     parser.add_argument("--propr-account-id", default=None)
+    parser.add_argument("--vanta-account-id", default=None)
     parser.add_argument("--markets-json", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=int, default=15)
     parser.add_argument("--once", action="store_true")
@@ -757,14 +766,41 @@ def main(argv: list[str] | None = None) -> int:
             allow_rest_reconciliation=True,
         )
         with ProprGateway(rest, account_id=account_id, endpoint=endpoint, order_client=order_client) as gateway:
-            while True:
-                now_ms = int(time.time() * 1000)
-                report = executor.step(gateway, markets, now_ms, execute=args.execute)
-                print(json.dumps(report, sort_keys=True), flush=True)
-                if args.once:
-                    return 0
-                time.sleep(args.poll_seconds)
-        return 0
+            return _run_rest_poll_loop(
+                executor, gateway, markets, execute=args.execute, once=args.once, poll_seconds=args.poll_seconds
+            )
+
+    if args.venue == "vanta":
+        from connectors.vanta import VantaClient, VantaConfig, VantaOrderClient
+
+        from .vanta_gateway import VANTA_API_URL, VantaGateway
+
+        account_id = (args.vanta_account_id or os.environ.get("VANTA_ACCOUNT_ID", "")).strip()
+        if not account_id:
+            raise ValueError("VANTA_ACCOUNT_ID_REQUIRED")
+        cfg = VantaConfig(
+            account_id=account_id,
+            api_key=os.environ["VANTA_API_KEY"],
+            api_secret=os.environ["VANTA_API_SECRET"],
+        )
+        client = VantaClient(cfg)
+        vanta_order_client = (
+            VantaOrderClient(cfg, confirm_account_id=account_id, allow_execution=True)
+            if args.execute
+            else None
+        )
+        executor = BybitCwsaExecutor(
+            state_db=args.state_db,
+            source_db=args.source_db,
+            member_k=TRIADA_HYDRO5K_K,
+            rulebook_key=args.rulebook_key,
+            allow_rest_reconciliation=True,
+        )
+        with VantaGateway(client, account_id=account_id, endpoint=VANTA_API_URL, order_client=vanta_order_client) as gateway:
+            markets = _load_markets_json(args.markets_json) if args.markets_json else gateway.load_markets()
+            return _run_rest_poll_loop(
+                executor, gateway, markets, execute=args.execute, once=args.once, poll_seconds=args.poll_seconds
+            )
 
     from connectors.bybit.client import BybitClient
     from connectors.bybit.config import BybitConfig, Environment, Mode

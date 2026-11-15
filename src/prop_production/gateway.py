@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import importlib
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from urllib.parse import quote
 
 from .contracts import SYNTHETIC_ACCOUNT, SYNTHETIC_ENDPOINT
@@ -21,6 +24,15 @@ class Position:
     quantity: Decimal
     entry_price: Decimal
     mark_price: Decimal
+
+
+@dataclass(frozen=True)
+class MarketSpec:
+    """Minimal venue perp market constraints."""
+
+    symbol: str
+    min_amount: Decimal
+    amount_step: Decimal
 
 
 @dataclass(frozen=True)
@@ -194,7 +206,7 @@ def normalize_broker_status(
     A provider FILLED is not a terminal financial fact until actual executions
     conserve the full signed order quantity at an independently complete cutoff.
     """
-    if provider not in ("propr", "bybit_demo"):
+    if provider not in ("propr", "bybit_demo", "vanta"):
         raise ValueError("BROKER_PROVIDER_NORMALIZER_NOT_PINNED")
     if (
         not isinstance(raw_status, str)
@@ -210,6 +222,15 @@ def normalize_broker_status(
     # Provider-specific source vocabulary belongs here, not in Guardian.
     if provider == "propr":
         nonterminal = {"open": "ACCEPTED", "partially_filled": "PARTIAL", "partial": "PARTIAL"}
+        terminal = {
+            "filled": "FILLED",
+            "cancelled": "CANCELLED",
+            "canceled": "CANCELLED",
+            "expired": "EXPIRED",
+            "rejected": "REJECTED",
+        }
+    elif provider == "vanta":
+        nonterminal = {"open": "ACCEPTED", "pending": "ACCEPTED", "partially_filled": "PARTIAL"}
         terminal = {
             "filled": "FILLED",
             "cancelled": "CANCELLED",
@@ -703,3 +724,72 @@ def rest_account_path(account_id: str) -> str:
     if not account_id or "/" in account_id:
         raise ValueError("INVALID_ACCOUNT")
     return "/accounts/" + quote(account_id, safe="")
+
+
+_LoopT = TypeVar("_LoopT")
+
+
+class AsyncLoopRunner:
+    """Dedicated background event loop runner for synchronous BrokerGateway adapters."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        loop: asyncio.AbstractEventLoop | None = None,
+        timeout_s: float = 15.0,
+    ) -> None:
+        self._name = name
+        self._external_loop = loop
+        self._owned_loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._timeout_s = timeout_s
+
+    def ensure_loop(self) -> asyncio.AbstractEventLoop:
+        if self._external_loop is not None:
+            return self._external_loop
+        if self._owned_loop is not None and not self._owned_loop.is_closed():
+            return self._owned_loop
+
+        ready = threading.Event()
+        holder: dict[str, asyncio.AbstractEventLoop] = {}
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            holder["loop"] = loop
+            ready.set()
+            loop.run_forever()
+            loop.close()
+
+        thread = threading.Thread(target=_runner, name=self._name, daemon=True)
+        thread.start()
+        ready.wait(timeout=5.0)
+        loop = holder.get("loop")
+        if loop is None:
+            raise RuntimeError(f"EVENT_LOOP_START_FAILED:{self._name}")
+        self._owned_loop = loop
+        self._thread = thread
+        return loop
+
+    def run(self, coro: Coroutine[Any, Any, _LoopT]) -> _LoopT:
+        loop = self.ensure_loop()
+        future: concurrent.futures.Future[_LoopT] = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result(timeout=self._timeout_s)
+
+    def close(self, *closables: Any) -> None:
+        if self._external_loop is not None or (
+            self._owned_loop is not None and not self._owned_loop.is_closed()
+        ):
+            for client in closables:
+                if client is not None and hasattr(client, "close"):
+                    try:
+                        self.run(client.close())
+                    except Exception:
+                        pass
+        if self._owned_loop is not None and not self._owned_loop.is_closed():
+            self._owned_loop.call_soon_threadsafe(self._owned_loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        self._owned_loop = None
