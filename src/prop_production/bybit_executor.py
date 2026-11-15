@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -138,6 +140,23 @@ def _reduce_only_for_delta(current_qty: Decimal, delta_qty: Decimal) -> bool:
     return False
 
 
+def _symbol_mark_price(
+    sym: str, snap: BrokerSnapshot, spec: MarketSpec
+) -> Decimal | None:
+    """Return best finite positive mark price for sym from broker state or market spec."""
+    for pos in snap.positions:
+        if pos.market == sym:
+            for px in (pos.mark_price, pos.entry_price):
+                if px.is_finite() and px > _ZERO:
+                    return px
+    for mkt, px, _known_ms in snap.market_marks:
+        if mkt == sym and px.is_finite() and px > _ZERO:
+            return px
+    if spec.reference_price is not None and spec.reference_price.is_finite() and spec.reference_price > _ZERO:
+        return spec.reference_price
+    return None
+
+
 class BybitCwsaExecutor:
     """Durable, fail-closed 5m CWSA-to-BrokerGateway executor driven by prop rulebooks."""
 
@@ -151,7 +170,18 @@ class BybitCwsaExecutor:
         internal_daily_stop_usd: Decimal | None = None,
         max_source_lag_ms: int | None = 600_000,
         allow_rest_reconciliation: bool = False,
+        min_trade_notional_usd: Decimal = _ZERO,
+        jitter_min_seconds: int = 0,
+        jitter_max_seconds: int = 0,
+        jitter_seed: str | None = None,
     ) -> None:
+        if not min_trade_notional_usd.is_finite() or min_trade_notional_usd < _ZERO:
+            raise ValueError("INVALID_MIN_TRADE_NOTIONAL")
+        if jitter_min_seconds < 0 or jitter_max_seconds < jitter_min_seconds:
+            raise ValueError("INVALID_JITTER_RANGE")
+        jitter_max_ms = jitter_max_seconds * 1000
+        if max_source_lag_ms is not None and jitter_max_ms > 0 and jitter_max_ms >= max_source_lag_ms:
+            raise ValueError("JITTER_EXCEEDS_MAX_SOURCE_LAG")
         self._state_db = state_db
         self._source_db = source_db
         self._member_k = dict(member_k)
@@ -166,6 +196,10 @@ class BybitCwsaExecutor:
         )
         self._max_source_lag_ms = max_source_lag_ms
         self._allow_rest_reconciliation = allow_rest_reconciliation
+        self._min_trade_notional = min_trade_notional_usd
+        self._jitter_min_ms = jitter_min_seconds * 1000
+        self._jitter_max_ms = jitter_max_ms
+        self._jitter_seed = jitter_seed if jitter_seed is not None else secrets.token_hex(8)
         self._state_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -252,6 +286,15 @@ class BybitCwsaExecutor:
                     last_day TEXT NOT NULL,
                     last_equity TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wave_jitter (
+                    wave_key TEXT PRIMARY KEY,
+                    first_seen_ms INTEGER NOT NULL,
+                    eligible_at_ms INTEGER NOT NULL
                 )
                 """
             )
@@ -392,6 +435,26 @@ class BybitCwsaExecutor:
                 "(wave_key, next_cp_ms, processed_at_ms, intents_count) VALUES (?, ?, ?, ?)",
                 (wave_key, next_cp_ms, now_ms, count),
             )
+
+    def _jitter_eligible_at(self, wave_key: str, now_ms: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT eligible_at_ms FROM wave_jitter WHERE wave_key = ?", (wave_key,)
+            ).fetchone()
+            if row is not None:
+                return int(row[0])
+            span = self._jitter_max_ms - self._jitter_min_ms + 1
+            digest_bytes = hashlib.sha256(
+                f"{wave_key}:{self._jitter_seed}".encode("utf-8")
+            ).digest()
+            delay_ms = self._jitter_min_ms + (int.from_bytes(digest_bytes[:8], "big") % span)
+            eligible_at_ms = now_ms + delay_ms
+            conn.execute(
+                "INSERT OR IGNORE INTO wave_jitter (wave_key, first_seen_ms, eligible_at_ms) "
+                "VALUES (?, ?, ?)",
+                (wave_key, now_ms, eligible_at_ms),
+            )
+            return eligible_at_ms
 
     def _get_halt(self, scope: str) -> str | None:
         with self._connect() as conn:
@@ -585,6 +648,15 @@ class BybitCwsaExecutor:
             qty_step = _quantize_step(raw_delta, spec.amount_step)
             if abs(qty_step) < spec.min_amount:
                 continue
+            if (
+                risk is None
+                and self._min_trade_notional > _ZERO
+                and target_by_symbol.get(sym, _ZERO) != _ZERO
+            ):
+                mark_px = _symbol_mark_price(sym, snap, spec)
+                if mark_px is not None and abs(qty_step) * mark_px < self._min_trade_notional:
+                    skipped.append({"symbol": sym, "reason": "BELOW_NOTIONAL_DEADBAND"})
+                    continue
             reduce_only = _reduce_only_for_delta(current_by_symbol.get(sym, _ZERO), qty_step)
             intent_id = f"hy-{wave_key[:12]}-{sym.split('/')[0][:12]}"[:36]
             planned.append(
@@ -612,6 +684,22 @@ class BybitCwsaExecutor:
                 "ignored_legs_count": ignored_legs_count,
                 "submitted": 0,
             }
+
+        if risk is None and self._jitter_max_ms > 0 and planned:
+            eligible_at_ms = self._jitter_eligible_at(wave_key, now_ms)
+            if now_ms < eligible_at_ms:
+                return {
+                    "status": "JITTER_DEFERRED",
+                    "wave_key": wave_key,
+                    "next_cp_ms": next_cp_ms,
+                    "eligible_at_ms": eligible_at_ms,
+                    "remaining_ms": eligible_at_ms - now_ms,
+                    "planned_count": len(planned),
+                    "planned": planned,
+                    "skipped": skipped,
+                    "ignored_legs_count": ignored_legs_count,
+                    "submitted": 0,
+                }
 
         results: list[dict[str, Any]] = []
         for intent in planned:
@@ -681,15 +769,40 @@ def _load_markets_json(path: Path) -> dict[str, MarketSpec]:
     for coin, row in raw.items():
         if not isinstance(coin, str) or not isinstance(row, dict):
             raise ValueError("MARKETS_JSON_ENTRY_INVALID")
+        ref_raw = row.get("reference_price")
         out[coin] = MarketSpec(
             symbol=str(row.get("symbol") or coin),
             min_amount=decimal(row.get("min_amount", "0")),
             amount_step=decimal(row.get("amount_step", "0")),
+            reference_price=decimal(ref_raw) if ref_raw is not None else None,
         )
     return out
 
 
 CwsaExecutor = BybitCwsaExecutor
+
+
+def _sleep_for_report(report: dict[str, Any], poll_seconds: int) -> None:
+    if report.get("status") == "JITTER_DEFERRED":
+        remaining_s = max(0.2, float(report.get("remaining_ms", 0)) / 1000.0 + 0.05)
+        time.sleep(min(float(poll_seconds), remaining_s))
+        return
+    time.sleep(poll_seconds)
+
+
+def _executor_from_args(
+    args: argparse.Namespace, *, allow_rest_reconciliation: bool
+) -> BybitCwsaExecutor:
+    return BybitCwsaExecutor(
+        state_db=args.state_db,
+        source_db=args.source_db,
+        member_k=TRIADA_HYDRO5K_K,
+        rulebook_key=args.rulebook_key,
+        allow_rest_reconciliation=allow_rest_reconciliation,
+        min_trade_notional_usd=decimal(args.min_trade_notional_usd),
+        jitter_min_seconds=args.jitter_min_seconds,
+        jitter_max_seconds=args.jitter_max_seconds,
+    )
 
 
 def _run_rest_poll_loop(
@@ -707,7 +820,7 @@ def _run_rest_poll_loop(
         print(json.dumps(report, sort_keys=True), flush=True)
         if once:
             return 0
-        time.sleep(poll_seconds)
+        _sleep_for_report(report, poll_seconds)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -729,6 +842,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vanta-account-id", default=None)
     parser.add_argument("--markets-json", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=int, default=15)
+    parser.add_argument("--min-trade-notional-usd", default="30")
+    parser.add_argument("--jitter-min-seconds", type=int, default=0)
+    parser.add_argument("--jitter-max-seconds", type=int, default=45)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -758,13 +874,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.execute
             else None
         )
-        executor = BybitCwsaExecutor(
-            state_db=args.state_db,
-            source_db=args.source_db,
-            member_k=TRIADA_HYDRO5K_K,
-            rulebook_key=args.rulebook_key,
-            allow_rest_reconciliation=True,
-        )
+        executor = _executor_from_args(args, allow_rest_reconciliation=True)
         with ProprGateway(rest, account_id=account_id, endpoint=endpoint, order_client=order_client) as gateway:
             return _run_rest_poll_loop(
                 executor, gateway, markets, execute=args.execute, once=args.once, poll_seconds=args.poll_seconds
@@ -789,13 +899,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.execute
             else None
         )
-        executor = BybitCwsaExecutor(
-            state_db=args.state_db,
-            source_db=args.source_db,
-            member_k=TRIADA_HYDRO5K_K,
-            rulebook_key=args.rulebook_key,
-            allow_rest_reconciliation=True,
-        )
+        executor = _executor_from_args(args, allow_rest_reconciliation=True)
         with VantaGateway(client, account_id=account_id, endpoint=VANTA_API_URL, order_client=vanta_order_client) as gateway:
             markets = _load_markets_json(args.markets_json) if args.markets_json else gateway.load_markets()
             return _run_rest_poll_loop(
@@ -817,12 +921,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_demo_uid=uid,
     )
     client = BybitClient(cfg)
-    executor = BybitCwsaExecutor(
-        state_db=args.state_db,
-        source_db=args.source_db,
-        member_k=TRIADA_HYDRO5K_K,
-        rulebook_key=args.rulebook_key,
-    )
+    executor = _executor_from_args(args, allow_rest_reconciliation=False)
 
     while True:
         reconciler = BybitDemoReconciler(client)
@@ -839,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     time.sleep(args.poll_seconds)
                     break
-                time.sleep(args.poll_seconds)
+                _sleep_for_report(report, args.poll_seconds)
     return 0
 
 

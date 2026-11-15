@@ -523,3 +523,215 @@ def test_non_continuous_cwsa_phase_blocks_entries_but_allows_dd_flatten(tmp_path
     dd = ex.step(gw_dd, markets, 1794683605000, execute=True)
     assert dd["status"] == "HALT_FLATTENED"
     assert gw_dd.submitted[0]["reduce_only"] is True
+
+
+def test_notional_deadband_filters_micro_tweaks_but_allows_full_close_and_halt(tmp_path: Path) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    markets = _markets()
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001"), "ACT08": Decimal("0"), "ACT09": Decimal("0")},
+        min_trade_notional_usd=Decimal("30"),
+    )
+    _seed_empty_baseline(ex, source_db, markets)
+
+    # Fresh opening with no mark price fails open on deadband so new entry opens cleanly (0.005 ETH = $15)
+    _write_cwsa_db(
+        source_db,
+        seq=746,
+        next_cp=1794683700000,
+        positions_by_sid={
+            "ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/ETH", "quantity": "10"}],
+        },
+    )
+    gw_open = _FakeGateway(_snap())
+    res_open = ex.step(gw_open, markets, 1794683600000, execute=True)
+    assert res_open["submitted"] == 1
+    assert gw_open.submitted[0]["quantity"] == "0.01"
+
+    # Follow-up tweak: ACT04 adds +10 ETH -> delta +0.01 ETH at $2000 = $20 < $30 -> skipped
+    gw_hold = _FakeGateway(
+        _snap(positions=(Position("ETH/USDT:USDT", Decimal("0.01"), Decimal("2000"), Decimal("2000")),))
+    )
+    _write_cwsa_db(
+        source_db,
+        seq=747,
+        next_cp=1794684000000,
+        positions_by_sid={
+            "ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/ETH", "quantity": "20"}],
+        },
+    )
+    res_skip = ex.step(gw_hold, markets, 1794683800000, execute=True)
+    assert res_skip["status"] == "EXECUTED"
+    assert res_skip["submitted"] == 0
+    assert res_skip["skipped"] == [{"symbol": "ETH/USDT:USDT", "reason": "BELOW_NOTIONAL_DEADBAND"}]
+
+    # Next bar adds another +10 ETH -> accumulated drift is now +0.02 ETH * $2000 = $40 >= $30 -> executes
+    _write_cwsa_db(
+        source_db,
+        seq=748,
+        next_cp=1794684300000,
+        positions_by_sid={
+            "ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/ETH", "quantity": "30"}],
+        },
+    )
+    res_catchup = ex.step(gw_hold, markets, 1794684100000, execute=True)
+    assert res_catchup["submitted"] == 1
+    assert gw_hold.submitted[0]["quantity"] == "0.02"
+
+    # Residual full exit (target == 0) bypasses deadband even if remaining position is worth < $30 ($20)
+    _write_cwsa_db(
+        source_db,
+        seq=749,
+        next_cp=1794684600000,
+        positions_by_sid={"ACT04": []},
+    )
+    res_close = ex.step(gw_hold, markets, 1794684400000, execute=True)
+    assert res_close["submitted"] == 1  # catchup mock still holds 0.01 -> closes 0.01 cleanly
+    assert len(gw_hold.submitted) == 2
+    assert gw_hold.submitted[-1]["quantity"] == "-0.01"
+    assert gw_hold.submitted[-1]["reduce_only"] is True
+
+
+def test_post_wave_jitter_defers_live_only_and_never_delays_halts(tmp_path: Path) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    markets = _markets()
+
+    with pytest.raises(ValueError, match="JITTER_EXCEEDS_MAX_SOURCE_LAG"):
+        BybitCwsaExecutor(
+            state_db=state_db,
+            source_db=source_db,
+            member_k=TRIADA_HYDRO5K_K,
+            max_source_lag_ms=600_000,
+            jitter_min_seconds=0,
+            jitter_max_seconds=600,
+        )
+
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001"), "ACT08": Decimal("0"), "ACT09": Decimal("0")},
+        jitter_min_seconds=10,
+        jitter_max_seconds=45,
+        jitter_seed="fixed-test-seed",
+    )
+    _seed_empty_baseline(ex, source_db, markets)
+
+    _write_cwsa_db(
+        source_db,
+        seq=746,
+        next_cp=1794683700000,
+        positions_by_sid={
+            "ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "10"}],
+        },
+    )
+    gw = _FakeGateway(_snap())
+
+    # Dry-run shadow does not wait on jitter
+    dry = ex.step(gw, markets, 1794683600000, execute=False)
+    assert dry["status"] == "SHADOW_DRY_RUN"
+    assert dry["planned_count"] == 1
+
+    # Execute poll at arrival defers cleanly inside [10s, 45s]
+    deferred = ex.step(gw, markets, 1794683600000, execute=True)
+    assert deferred["status"] == "JITTER_DEFERRED"
+    assert deferred["submitted"] == 0
+    assert 10_000 <= deferred["remaining_ms"] <= 45_000
+    eligible_ms = deferred["eligible_at_ms"]
+
+    # Poll 1ms before eligible_at_ms still defers without changing eligible_at_ms
+    still_wait = ex.step(gw, markets, eligible_ms - 1, execute=True)
+    assert still_wait["status"] == "JITTER_DEFERRED"
+    assert still_wait["eligible_at_ms"] == eligible_ms
+
+    # Poll at eligible_at_ms dispatches cleanly
+    fired = ex.step(gw, markets, eligible_ms, execute=True)
+    assert fired["status"] == "EXECUTED"
+    assert fired["submitted"] == 1
+
+    # Emergency DD halt flatten never defers for jitter
+    gw_dd = _FakeGateway(
+        _snap(
+            equity=Decimal("4500"),
+            positions=(Position("BTC/USDT:USDT", Decimal("0.01"), Decimal("90000"), Decimal("90000")),),
+        )
+    )
+    halted = ex.step(gw_dd, markets, eligible_ms + 100, execute=True)
+    assert halted["status"] == "HALT_FLATTENED"
+    assert Decimal(gw_dd.submitted[0]["quantity"]) == Decimal("-0.01")
+
+
+def test_cli_global_defaults_and_hydro_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from prop_production import bybit_executor
+
+    captured: list[dict[str, Any]] = []
+
+    class _StubRest:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+    class _StubGateway:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        def __enter__(self) -> _StubGateway:
+            return self
+
+        def __exit__(self, *_a: Any) -> None:
+            pass
+
+    monkeypatch.setenv("PROPR_API_KEY", "k")
+    monkeypatch.setattr("connectors.propr.rest.ProprRest", _StubRest)
+    monkeypatch.setattr("prop_production.propr_gateway.ProprGateway", _StubGateway)
+
+    def _fake_loop(executor: BybitCwsaExecutor, *_a: Any, **_kw: Any) -> int:
+        captured.append(
+            {
+                "min_notional": executor._min_trade_notional,
+                "jitter_min_ms": executor._jitter_min_ms,
+                "jitter_max_ms": executor._jitter_max_ms,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr(bybit_executor, "_run_rest_poll_loop", _fake_loop)
+    markets_file = tmp_path / "markets.json"
+    markets_file.write_text('{"BTC": {"symbol": "BTC", "min_amount": "0.001", "amount_step": "0.001"}}')
+    state_db = str(tmp_path / "cli_exec.sqlite")
+
+    assert bybit_executor.main(
+        [
+            "--venue",
+            "propr",
+            "--propr-account-id",
+            "acc-1",
+            "--state-db",
+            state_db,
+            "--markets-json",
+            str(markets_file),
+            "--once",
+        ]
+    ) == 0
+    assert captured[-1] == {"min_notional": Decimal("30"), "jitter_min_ms": 0, "jitter_max_ms": 45_000}
+
+    assert bybit_executor.main(
+        [
+            "--venue",
+            "propr",
+            "--propr-account-id",
+            "acc-1",
+            "--state-db",
+            state_db,
+            "--markets-json",
+            str(markets_file),
+            "--min-trade-notional-usd",
+            "15",
+            "--jitter-max-seconds",
+            "0",
+            "--once",
+        ]
+    ) == 0
+    assert captured[-1] == {"min_notional": Decimal("15"), "jitter_min_ms": 0, "jitter_max_ms": 0}

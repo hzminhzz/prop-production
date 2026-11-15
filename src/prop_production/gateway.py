@@ -33,6 +33,7 @@ class MarketSpec:
     symbol: str
     min_amount: Decimal
     amount_step: Decimal
+    reference_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
