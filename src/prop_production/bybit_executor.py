@@ -25,6 +25,7 @@ _ALLOWED_REST_UNCERTAINTY = frozenset(
     {
         "PROVIDER_CASH_UNVERIFIED",
         "PROVIDER_CUTOFF_UNPROVEN",
+        "PROVIDER_TIME_STALE",
         "RECONCILIATION_UNCERTAIN",
         "STREAM_NOT_CONNECTED",
     }
@@ -521,9 +522,15 @@ class BybitCwsaExecutor:
         if risk is not None and risk[0] == "BLOCKED":
             return {"status": "BLOCKED", "reason": risk[1], "submitted": 0}
 
-        current_by_symbol: dict[str, Decimal] = {p.market: p.quantity for p in snap.positions}
+        current_by_symbol: dict[str, Decimal] = {}
+        for pos in snap.positions:
+            if pos.quantity != _ZERO:
+                current_by_symbol[pos.market] = current_by_symbol.get(pos.market, _ZERO) + pos.quantity
         open_order_symbols = {
-            o.market for o in snap.orders if o.status in {"OPEN", "ACCEPTED", "PARTIAL"}
+            o.market
+            for o in snap.orders
+            if o.status in {"OPEN", "ACCEPTED", "PARTIAL"}
+            or (o.status == "UNKNOWN" and str(o.raw_status or "").lower() == "pending")
         }
         skipped: list[dict[str, str]] = []
         target_by_symbol: dict[str, Decimal] = {}

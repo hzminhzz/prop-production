@@ -194,11 +194,12 @@ def test_cwsa_executor_rest_mode_allows_propr_observability_and_blocks_real_faul
     propr_reasons = (
         "PROVIDER_CASH_UNVERIFIED",
         "PROVIDER_CUTOFF_UNPROVEN",
+        "PROVIDER_TIME_STALE",
         "RECONCILIATION_UNCERTAIN",
         "STREAM_NOT_CONNECTED",
     )
 
-    # Allowed REST observability + BALANCE basis uses provider_balance when cash is None
+    # Allowed REST observability (incl. idle updatedAt + closed qty=0 rows) + BALANCE uses provider_balance
     snap_ok = BrokerSnapshot(
         account_binding="b",
         endpoint=PROPR_API_URL,
@@ -210,6 +211,7 @@ def test_cwsa_executor_rest_mode_allows_propr_observability_and_blocks_real_faul
         unrealized=Decimal("0"),
         initial_margin=Decimal("0"),
         maintenance_margin=Decimal("0"),
+        positions=(Position("BTC", Decimal("0"), Decimal("90000"), Decimal("90000")),),
         financial_complete=False,
         provider_balance=Decimal("5000"),
         evidence_schema="propr_native_evidence_v1",
@@ -224,8 +226,8 @@ def test_cwsa_executor_rest_mode_allows_propr_observability_and_blocks_real_faul
     assert res["status"] == "EXECUTED"
     assert res["submitted"] == 1  # BTC multi-asset allowed (not HYRO_POLICY_BLOCKED)
 
-    # Real fault (stale timestamp) still blocks immediately
-    snap_stale = BrokerSnapshot(
+    # Real fault (inventory failure) still blocks immediately
+    snap_bad = BrokerSnapshot(
         account_binding="b",
         endpoint=PROPR_API_URL,
         observed_at_ms=1794683500000,
@@ -239,12 +241,12 @@ def test_cwsa_executor_rest_mode_allows_propr_observability_and_blocks_real_faul
         financial_complete=False,
         provider_balance=Decimal("5000"),
         evidence_schema="propr_native_evidence_v1",
-        native_inventory_read_complete=True,
-        uncertainty_reasons=propr_reasons + ("PROVIDER_TIME_STALE",),
+        native_inventory_read_complete=False,
+        uncertainty_reasons=propr_reasons + ("INVENTORY_UNVERIFIED",),
     )
-    blocked = ex.step(_FakeGateway(snap_stale), markets, 1794683605000, execute=True)
+    blocked = ex.step(_FakeGateway(snap_bad), markets, 1794683905000, execute=True)
     assert blocked["status"] == "BLOCKED"
-    assert "PROVIDER_TIME_STALE" in blocked["reason"]
+    assert "INVENTORY_UNVERIFIED" in blocked["reason"]
 
 
 def test_propr_gateway_end_to_end_with_mock_transport() -> None:
