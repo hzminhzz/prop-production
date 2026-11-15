@@ -8,7 +8,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 
 from prop_production.bybit_executor import CwsaExecutor
@@ -65,6 +64,7 @@ def test_build_vanta_markets_maps_hl_coins_and_ignores_disabled() -> None:
 
 
 def test_vanta_gateway_end_to_end_observe_execute_and_eliminated_block(tmp_path: Path) -> None:
+    httpx = pytest.importorskip("httpx")
     vanta_mod = pytest.importorskip("connectors.vanta")
     VantaClient = vanta_mod.VantaClient
     VantaConfig = vanta_mod.VantaConfig

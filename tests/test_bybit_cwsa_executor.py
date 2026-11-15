@@ -665,6 +665,9 @@ def test_post_wave_jitter_defers_live_only_and_never_delays_halts(tmp_path: Path
 
 
 def test_cli_global_defaults_and_hydro_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    from types import ModuleType
+
     from prop_production import bybit_executor
 
     captured: list[dict[str, Any]] = []
@@ -683,8 +686,18 @@ def test_cli_global_defaults_and_hydro_override(tmp_path: Path, monkeypatch: pyt
         def __exit__(self, *_a: Any) -> None:
             pass
 
+    connectors_pkg = ModuleType("connectors")
+    connectors_propr = ModuleType("connectors.propr")
+    connectors_propr_rest = ModuleType("connectors.propr.rest")
+    connectors_propr_rest.ProprRest = _StubRest  # type: ignore[attr-defined]
+    connectors_propr_rest.ProprOrderClient = _StubRest  # type: ignore[attr-defined]
+    connectors_pkg.propr = connectors_propr  # type: ignore[attr-defined]
+    connectors_propr.rest = connectors_propr_rest  # type: ignore[attr-defined]
+
     monkeypatch.setenv("PROPR_API_KEY", "k")
-    monkeypatch.setattr("connectors.propr.rest.ProprRest", _StubRest)
+    monkeypatch.setitem(sys.modules, "connectors", connectors_pkg)
+    monkeypatch.setitem(sys.modules, "connectors.propr", connectors_propr)
+    monkeypatch.setitem(sys.modules, "connectors.propr.rest", connectors_propr_rest)
     monkeypatch.setattr("prop_production.propr_gateway.ProprGateway", _StubGateway)
 
     def _fake_loop(executor: BybitCwsaExecutor, *_a: Any, **_kw: Any) -> int:

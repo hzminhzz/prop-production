@@ -8,7 +8,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 
 from prop_production.bybit_executor import BybitCwsaExecutor, CwsaExecutor, MarketSpec
@@ -250,6 +249,7 @@ def test_cwsa_executor_rest_mode_allows_propr_observability_and_blocks_real_faul
 
 
 def test_propr_gateway_end_to_end_with_mock_transport() -> None:
+    httpx = pytest.importorskip("httpx")
     ProprRest = pytest.importorskip("connectors.propr.rest").ProprRest
     ProprOrderClient = pytest.importorskip("connectors.propr.rest").ProprOrderClient
 
