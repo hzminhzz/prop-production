@@ -123,6 +123,7 @@ class BybitCwsaExecutor:
         member_k: dict[str, Decimal],
         rulebook_key: str = "hyrotrader:two_step:phase_1",
         internal_daily_stop_usd: Decimal | None = None,
+        max_source_lag_ms: int | None = 600_000,
     ) -> None:
         self._state_db = state_db
         self._source_db = source_db
@@ -134,6 +135,7 @@ class BybitCwsaExecutor:
             if internal_daily_stop_usd is not None
             else decimal(self._spec.daily_loss) * Decimal("0.8")
         )
+        self._max_source_lag_ms = max_source_lag_ms
         self._state_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -311,6 +313,8 @@ class BybitCwsaExecutor:
         else:
             halt_reason = ""
             wave_key, next_cp_ms, coin_targets = load_cwsa_targets(self._source_db, self._member_k)
+            if self._max_source_lag_ms is not None and now_ms - next_cp_ms > self._max_source_lag_ms:
+                return {"status": "BLOCKED", "reason": f"BLOCKED_CWSA_STALE:lag_ms={now_ms - next_cp_ms}", "submitted": 0}
             if self._wave_processed(wave_key):
                 return {"status": "ALREADY_PROCESSED", "wave_key": wave_key, "submitted": 0}
             for coin, qty in coin_targets.items():

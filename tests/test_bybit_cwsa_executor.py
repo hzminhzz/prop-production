@@ -141,7 +141,9 @@ def test_fail_closed_risk_and_skew(tmp_path: Path) -> None:
     source_db = tmp_path / "source.sqlite3"
     state_db = tmp_path / "exec.sqlite"
     _seed_source_db(source_db)
-    executor = BybitCwsaExecutor(state_db=state_db, source_db=source_db, member_k=TRIADA_HYDRO5K_K)
+    executor = BybitCwsaExecutor(
+        state_db=state_db, source_db=source_db, member_k=TRIADA_HYDRO5K_K, max_source_lag_ms=None
+    )
 
     # Incomplete finance blocks (never auto-flatten on blind snapshot)
     gw_inc = _FakeGateway(
@@ -207,3 +209,25 @@ def test_fail_closed_risk_and_skew(tmp_path: Path) -> None:
     _seed_source_db(skew_db, skew=True)
     with pytest.raises(ValueError, match="CWSA_CHECKPOINT_SKEW"):
         load_cwsa_targets(skew_db, TRIADA_HYDRO5K_K)
+
+
+def test_filled_orders_not_skipped_k_changes_wave_and_stale_blocks(tmp_path: Path) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    _seed_source_db(source_db)
+    ex = BybitCwsaExecutor(
+        state_db=tmp_path / "exec.sqlite", source_db=source_db, member_k=TRIADA_HYDRO5K_K
+    )
+    gw_filled = _FakeGateway(
+        _snap(orders=(BrokerOrder("i1", "o1", "BTC/USDT:USDT", Decimal("0.01"), Decimal("0.01"), "FILLED"),))
+    )
+    res = ex.step(gw_filled, _markets(), 1794683500000, execute=False)
+    assert res["skipped"] == []
+    assert res["planned_count"] == 2
+
+    wk1, _, _ = load_cwsa_targets(source_db, TRIADA_HYDRO5K_K)
+    wk2, _, _ = load_cwsa_targets(source_db, {**TRIADA_HYDRO5K_K, "ACT04": Decimal("0.00030")})
+    assert wk1 != wk2
+
+    stale = ex.step(gw_filled, _markets(), 1794683700000 + 600_001, execute=False)
+    assert stale["status"] == "BLOCKED"
+    assert "BLOCKED_CWSA_STALE" in stale["reason"]
