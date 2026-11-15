@@ -12,7 +12,7 @@ dependencies = ["cryptography>=50.0.2,<51"]
 
 [project.optional-dependencies]
 connector = [
-    "trading-connector-library @ git+https://github.com/hzminhzz/trading-connector.git@588ef56c9945f4d5d05877c62115d9eaa798362a",
+    "trading-connector-library @ git+https://github.com/hzminhzz/trading-connector.git@7ed3cc0fb191fa290021d006d74741557534f119",
     "ccxt==4.5.74",
 ]
 

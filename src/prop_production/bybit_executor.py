@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
@@ -18,9 +18,17 @@ from typing import Any
 from .bybit_gateway import BybitDemoGateway
 from .evidence import decimal, digest
 from .gateway import BrokerSnapshot
-from .prop_firms import get_challenge_spec
+from .prop_firms import ChallengeRulebookSpec, get_challenge_spec
 
 _ZERO = Decimal("0")
+_ALLOWED_REST_UNCERTAINTY = frozenset(
+    {
+        "PROVIDER_CASH_UNVERIFIED",
+        "PROVIDER_CUTOFF_UNPROVEN",
+        "RECONCILIATION_UNCERTAIN",
+        "STREAM_NOT_CONNECTED",
+    }
+)
 
 TRIADA_HYDRO5K_K: dict[str, Decimal] = {
     "ACT04": Decimal("0.00045"),
@@ -38,8 +46,12 @@ class MarketSpec:
     amount_step: Decimal
 
 
-def _utc_day_key(now_ms: int) -> str:
-    return datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+def _utc_day_key(now_ms: int, reset_time_hhmm: str = "00:00") -> str:
+    dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+    if reset_time_hhmm and reset_time_hhmm != "UNKNOWN" and ":" in reset_time_hhmm:
+        hh_str, mm_str = reset_time_hhmm.split(":", 1)
+        dt = dt - timedelta(hours=int(hh_str), minutes=int(mm_str))
+    return dt.strftime("%Y-%m-%d")
 
 
 def _quantize_step(value: Decimal, step: Decimal) -> Decimal:
@@ -136,7 +148,7 @@ def _reduce_only_for_delta(current_qty: Decimal, delta_qty: Decimal) -> bool:
 
 
 class BybitCwsaExecutor:
-    """Durable, fail-closed 5m CWSA-to-BybitDemoGateway executor."""
+    """Durable, fail-closed 5m CWSA-to-BrokerGateway executor driven by prop rulebooks."""
 
     def __init__(
         self,
@@ -147,18 +159,22 @@ class BybitCwsaExecutor:
         rulebook_key: str = "hyrotrader:two_step:phase_1",
         internal_daily_stop_usd: Decimal | None = None,
         max_source_lag_ms: int | None = 600_000,
+        allow_rest_reconciliation: bool = False,
     ) -> None:
         self._state_db = state_db
         self._source_db = source_db
         self._member_k = dict(member_k)
-        self._spec = get_challenge_spec(rulebook_key)
-        self._static_floor = decimal(self._spec.initial) - decimal(self._spec.trailing_loss)
+        self._spec: ChallengeRulebookSpec = get_challenge_spec(rulebook_key)
+        self._initial = decimal(self._spec.initial)
+        self._trailing_loss = decimal(self._spec.trailing_loss)
+        self._static_floor = self._initial - self._trailing_loss
         self._internal_daily_stop = (
             internal_daily_stop_usd
             if internal_daily_stop_usd is not None
             else decimal(self._spec.daily_loss) * Decimal("0.8")
         )
         self._max_source_lag_ms = max_source_lag_ms
+        self._allow_rest_reconciliation = allow_rest_reconciliation
         self._state_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -234,6 +250,17 @@ class BybitCwsaExecutor:
                     initial_sign INTEGER NOT NULL,
                     recorded_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (source_id, coin)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trailing_state (
+                    scope TEXT PRIMARY KEY,
+                    peak_equity TEXT NOT NULL,
+                    last_day TEXT NOT NULL,
+                    last_equity TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
                 )
                 """
             )
@@ -389,27 +416,94 @@ class BybitCwsaExecutor:
                 (scope, reason, now_ms),
             )
 
+    def _trailing_floor(self, equity: Decimal, day_key: str, now_ms: int) -> tuple[Decimal, str]:
+        basis = self._spec.trailing_basis.upper()
+        if basis == "STATIC":
+            return self._static_floor, "HALT_STATIC_DD"
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT peak_equity, last_day, last_equity FROM trailing_state WHERE scope = ?",
+                (basis,),
+            ).fetchone()
+            if row is None:
+                peak = max(self._initial, equity) if basis == "INTRADAY_EQUITY" else self._initial
+                last_day = day_key
+                last_equity = equity
+                conn.execute(
+                    "INSERT INTO trailing_state "
+                    "(scope, peak_equity, last_day, last_equity, updated_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (basis, str(peak), last_day, str(last_equity), now_ms),
+                )
+            else:
+                peak = decimal(row[0])
+                last_day = str(row[1])
+                last_equity = decimal(row[2])
+                if basis == "INTRADAY_EQUITY":
+                    peak = max(peak, equity)
+                elif basis == "EOD_EQUITY":
+                    if day_key != last_day:
+                        peak = max(peak, last_equity)
+                        last_day = day_key
+                    last_equity = equity
+                else:
+                    raise ValueError(f"UNSUPPORTED_TRAILING_BASIS:{basis}")
+                conn.execute(
+                    "UPDATE trailing_state "
+                    "SET peak_equity = ?, last_day = ?, last_equity = ?, updated_at_ms = ? "
+                    "WHERE scope = ?",
+                    (str(peak), last_day, str(last_equity), now_ms, basis),
+                )
+
+        floor = peak - self._trailing_loss
+        if self._spec.trailing_locks_at_initial:
+            floor = min(floor, self._initial)
+        return floor, "HALT_TRAILING_DD"
+
     def _risk_check(self, snap: BrokerSnapshot, now_ms: int) -> tuple[str, str] | None:
-        if not snap.financial_complete or snap.uncertainty_reasons:
+        if self._allow_rest_reconciliation:
+            unexpected = [r for r in snap.uncertainty_reasons if r not in _ALLOWED_REST_UNCERTAINTY]
+            if unexpected:
+                return ("BLOCKED", f"BLOCKED_RECONCILIATION:{','.join(unexpected)}")
+            if snap.evidence_schema is not None and not snap.native_inventory_read_complete:
+                return ("BLOCKED", "BLOCKED_RECONCILIATION:INVENTORY_INCOMPLETE")
+        elif not snap.financial_complete or snap.uncertainty_reasons:
             reasons = ",".join(snap.uncertainty_reasons) or "INCOMPLETE"
             return ("BLOCKED", f"BLOCKED_RECONCILIATION:{reasons}")
+
         if snap.equity is None:
             return ("BLOCKED", "BLOCKED_EQUITY_MISSING")
+
         hard = self._get_halt("HARD")
         if hard is not None:
-            return ("HALT_STATIC_DD", hard)
-        if snap.equity <= self._static_floor:
-            reason = f"HALT_STATIC_DD:equity={snap.equity}<={self._static_floor}"
+            hard_status = "HALT_STATIC_DD" if self._spec.trailing_basis.upper() == "STATIC" else "HALT_TRAILING_DD"
+            return (hard_status, hard)
+
+        day_key = _utc_day_key(now_ms, self._spec.reset_time_hhmm)
+        floor, dd_status = self._trailing_floor(snap.equity, day_key, now_ms)
+        if snap.equity <= floor:
+            reason = f"{dd_status}:equity={snap.equity}<={floor}"
             self._set_halt("HARD", reason, now_ms)
-            return ("HALT_STATIC_DD", reason)
-        day_utc = _utc_day_key(now_ms)
-        daily = self._get_halt(f"DAY:{day_utc}")
+            return (dd_status, reason)
+
+        daily = self._get_halt(f"DAY:{day_key}")
         if daily is not None:
             return ("HALT_DAILY_STOP", daily)
-        day_start = self._day_baseline(day_utc, snap.equity, now_ms)
+
+        daily_basis = self._spec.daily_basis.upper()
+        if daily_basis == "BALANCE":
+            balance = snap.cash if snap.cash is not None else snap.provider_balance
+            if balance is None:
+                return ("BLOCKED", "BLOCKED_BALANCE_MISSING")
+            day_metric = balance
+        else:
+            day_metric = snap.equity
+
+        day_start = self._day_baseline(day_key, day_metric, now_ms)
         if day_start - snap.equity >= self._internal_daily_stop:
             reason = f"HALT_DAILY_STOP:loss={day_start - snap.equity}>={self._internal_daily_stop}"
-            self._set_halt(f"DAY:{day_utc}", reason, now_ms)
+            self._set_halt(f"DAY:{day_key}", reason, now_ms)
             return ("HALT_DAILY_STOP", reason)
         return None
 
@@ -478,8 +572,9 @@ class BybitCwsaExecutor:
 
         all_symbols = sorted(set(target_by_symbol) | set(current_by_symbol))
         spec_by_symbol = {s.symbol: s for s in markets.values()}
+        enforce_hyro_usdt = self._spec.firm_slug in ("hyrotrader", "crypto-fund-trader")
         for sym in all_symbols:
-            if sym == "EUR/USD" or not sym.endswith("/USDT:USDT"):
+            if enforce_hyro_usdt and (sym == "EUR/USD" or not sym.endswith("/USDT:USDT")):
                 skipped.append({"symbol": sym, "reason": "HYRO_POLICY_BLOCKED"})
                 continue
             if sym in open_order_symbols:
@@ -581,6 +676,25 @@ def _build_markets(exchange: Any) -> dict[str, MarketSpec]:
     return out
 
 
+def _load_markets_json(path: Path) -> dict[str, MarketSpec]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("MARKETS_JSON_INVALID")
+    out: dict[str, MarketSpec] = {}
+    for coin, row in raw.items():
+        if not isinstance(coin, str) or not isinstance(row, dict):
+            raise ValueError("MARKETS_JSON_ENTRY_INVALID")
+        out[coin] = MarketSpec(
+            symbol=str(row.get("symbol") or coin),
+            min_amount=decimal(row.get("min_amount", "0")),
+            amount_step=decimal(row.get("amount_step", "0")),
+        )
+    return out
+
+
+CwsaExecutor = BybitCwsaExecutor
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -593,11 +707,57 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path("/var/lib/prop-production-hydro/executor.sqlite"),
     )
+    parser.add_argument("--venue", choices=("bybit", "propr"), default="bybit")
+    parser.add_argument("--rulebook-key", default="hyrotrader:two_step:phase_1")
     parser.add_argument("--env-prefix", default="BYBIT_HYDRO")
+    parser.add_argument("--propr-account-id", default=None)
+    parser.add_argument("--markets-json", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=int, default=15)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.venue == "propr":
+        from connectors.propr.rest import ProprOrderClient, ProprRest
+
+        from .propr_gateway import PROPR_API_URL, ProprGateway
+
+        account_id = (args.propr_account_id or os.environ.get("PROPR_ACCOUNT_ID", "")).strip()
+        if not account_id:
+            raise ValueError("PROPR_ACCOUNT_ID_REQUIRED")
+        if args.markets_json is None:
+            raise ValueError("PROPR_MARKETS_JSON_REQUIRED")
+        api_key = os.environ.get("PROPR_LIVE_API_KEY") or os.environ["PROPR_API_KEY"]
+        endpoint = os.environ.get("PROPR_API_URL", PROPR_API_URL).rstrip("/") or PROPR_API_URL
+        markets = _load_markets_json(args.markets_json)
+        rest = ProprRest(endpoint, api_key)
+        order_client = (
+            ProprOrderClient(
+                endpoint,
+                api_key,
+                account_id=account_id,
+                confirm_account_id=account_id,
+                allow_execution=True,
+            )
+            if args.execute
+            else None
+        )
+        executor = BybitCwsaExecutor(
+            state_db=args.state_db,
+            source_db=args.source_db,
+            member_k=TRIADA_HYDRO5K_K,
+            rulebook_key=args.rulebook_key,
+            allow_rest_reconciliation=True,
+        )
+        with ProprGateway(rest, account_id=account_id, endpoint=endpoint, order_client=order_client) as gateway:
+            while True:
+                now_ms = int(time.time() * 1000)
+                report = executor.step(gateway, markets, now_ms, execute=args.execute)
+                print(json.dumps(report, sort_keys=True), flush=True)
+                if args.once:
+                    return 0
+                time.sleep(args.poll_seconds)
+        return 0
 
     from connectors.bybit.client import BybitClient
     from connectors.bybit.config import BybitConfig, Environment, Mode
@@ -614,11 +774,11 @@ def main(argv: list[str] | None = None) -> int:
         expected_demo_uid=uid,
     )
     client = BybitClient(cfg)
-    reconciler = BybitDemoReconciler(client)
     executor = BybitCwsaExecutor(
         state_db=args.state_db,
         source_db=args.source_db,
         member_k=TRIADA_HYDRO5K_K,
+        rulebook_key=args.rulebook_key,
     )
 
     while True:
