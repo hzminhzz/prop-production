@@ -291,7 +291,7 @@ def fresh_heartbeats(state: Path, started: float) -> None:
     paths = [state / "health" / role / "heartbeat.json"
              for role in ("guardian", "observer", "bybit")]
     paths.append(state / "watchdog" / "heartbeat.json")
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if all(path.is_file() and path.stat().st_mtime >= started for path in paths):
             try:

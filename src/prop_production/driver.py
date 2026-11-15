@@ -25,7 +25,7 @@ PERIODIC: dict[str, dict[str, Any] | None] = {"guardian": {"command": "reconcile
 DAY_MS = 86_400_000
 INTERVAL_S = 4        # default cadence; overridable via PROP_DRIVER_INTERVAL
 RESPONSE_TIMEOUT_S = 30
-STARTUP_TIMEOUT_S = 30
+STARTUP_TIMEOUT_S = 90
 MAX_RESPONSE_BYTES = 1_000_000
 
 
@@ -174,8 +174,9 @@ def drive(role: str, root: Path, *, interval_s: int) -> None:
 def main() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     interval = _bounded_int("PROP_DRIVER_INTERVAL", INTERVAL_S, 1, 60)
-    global RESPONSE_TIMEOUT_S
+    global RESPONSE_TIMEOUT_S, STARTUP_TIMEOUT_S
     RESPONSE_TIMEOUT_S = _bounded_int("PROP_DRIVER_RESPONSE_TIMEOUT", RESPONSE_TIMEOUT_S, 5, 300)
+    STARTUP_TIMEOUT_S = _bounded_int("PROP_DRIVER_STARTUP_TIMEOUT", STARTUP_TIMEOUT_S, 5, 300)
     if len(sys.argv) != 3 or sys.argv[1] not in PERIODIC or PERIODIC[sys.argv[1]] is None:
         raise SystemExit("usage: driver.py {guardian|planner} STATE_ROOT")
     drive(sys.argv[1], Path(sys.argv[2]).resolve(), interval_s=interval)

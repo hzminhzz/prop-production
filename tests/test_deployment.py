@@ -240,3 +240,37 @@ def test_daily_baseline_reset_rejected_for_other_reasons(tmp_path):
             assert "DAILY_BASELINE_RESET_ONLY_FOR_MIDNIGHT_INCIDENTS" in str(error)
     finally:
         journal.close()
+
+
+def test_driver_startup_timeout_defaults_and_bounds(monkeypatch, tmp_path):
+    import sys
+
+    from prop_production import driver
+
+    called = {}
+
+    def fake_drive(role, root, *, interval_s):
+        called["role"] = role
+        called["root"] = root
+        called["interval_s"] = interval_s
+        called["startup_timeout_s"] = driver.STARTUP_TIMEOUT_S
+
+    monkeypatch.setattr(driver, "drive", fake_drive)
+    monkeypatch.setattr(sys, "argv", ["driver.py", "guardian", str(tmp_path)])
+    monkeypatch.delenv("PROP_DRIVER_STARTUP_TIMEOUT", raising=False)
+    monkeypatch.setattr(driver, "STARTUP_TIMEOUT_S", 90)
+    driver.main()
+    assert called["startup_timeout_s"] == 90
+
+    monkeypatch.setenv("PROP_DRIVER_STARTUP_TIMEOUT", "120")
+    driver.main()
+    assert called["startup_timeout_s"] == 120
+
+    monkeypatch.setenv("PROP_DRIVER_STARTUP_TIMEOUT", "999")
+    try:
+        driver.main()
+        assert False, "out-of-bounds PROP_DRIVER_STARTUP_TIMEOUT accepted"
+    except SystemExit as error:
+        assert "OUT_OF_BOUNDS" in str(error)
+    finally:
+        monkeypatch.setattr(driver, "STARTUP_TIMEOUT_S", 90)
