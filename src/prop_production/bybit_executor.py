@@ -23,9 +23,9 @@ from .prop_firms import get_challenge_spec
 _ZERO = Decimal("0")
 
 TRIADA_HYDRO5K_K: dict[str, Decimal] = {
-    "ACT04": Decimal("0.00030"),
-    "ACT08": Decimal("0.00237"),
-    "ACT09": Decimal("0.00066"),
+    "ACT04": Decimal("0.00045"),
+    "ACT08": Decimal("0.00356"),
+    "ACT09": Decimal("0.00099"),
 }
 
 
@@ -116,14 +116,18 @@ class BybitCwsaExecutor:
         source_db: Path,
         member_k: dict[str, Decimal],
         rulebook_key: str = "hyrotrader:two_step:phase_1",
-        internal_daily_stop_usd: Decimal = Decimal("200"),
+        internal_daily_stop_usd: Decimal | None = None,
     ) -> None:
         self._state_db = state_db
         self._source_db = source_db
         self._member_k = dict(member_k)
         self._spec = get_challenge_spec(rulebook_key)
         self._static_floor = decimal(self._spec.initial) - decimal(self._spec.trailing_loss)
-        self._internal_daily_stop = internal_daily_stop_usd
+        self._internal_daily_stop = (
+            internal_daily_stop_usd
+            if internal_daily_stop_usd is not None
+            else decimal(self._spec.daily_loss) * Decimal("0.8")
+        )
         self._state_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -170,6 +174,15 @@ class BybitCwsaExecutor:
                     broker_id TEXT,
                     reason TEXT,
                     created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS halt_state (
+                    scope TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL
                 )
                 """
@@ -225,17 +238,42 @@ class BybitCwsaExecutor:
                 (wave_key, next_cp_ms, now_ms, count),
             )
 
-    def _risk_check(self, snap: BrokerSnapshot, now_ms: int) -> str | None:
+    def _get_halt(self, scope: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT reason FROM halt_state WHERE scope = ?", (scope,)
+            ).fetchone()
+            return str(row[0]) if row is not None else None
+
+    def _set_halt(self, scope: str, reason: str, now_ms: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO halt_state (scope, reason, updated_at_ms) VALUES (?, ?, ?)",
+                (scope, reason, now_ms),
+            )
+
+    def _risk_check(self, snap: BrokerSnapshot, now_ms: int) -> tuple[str, str] | None:
         if not snap.financial_complete or snap.uncertainty_reasons:
             reasons = ",".join(snap.uncertainty_reasons) or "INCOMPLETE"
-            return f"BLOCKED_RECONCILIATION:{reasons}"
+            return ("BLOCKED", f"BLOCKED_RECONCILIATION:{reasons}")
         if snap.equity is None:
-            return "BLOCKED_EQUITY_MISSING"
+            return ("BLOCKED", "BLOCKED_EQUITY_MISSING")
+        hard = self._get_halt("HARD")
+        if hard is not None:
+            return ("HALT_STATIC_DD", hard)
         if snap.equity <= self._static_floor:
-            return f"HALT_STATIC_DD:equity={snap.equity}<={self._static_floor}"
-        day_start = self._day_baseline(_utc_day_key(now_ms), snap.equity, now_ms)
+            reason = f"HALT_STATIC_DD:equity={snap.equity}<={self._static_floor}"
+            self._set_halt("HARD", reason, now_ms)
+            return ("HALT_STATIC_DD", reason)
+        day_utc = _utc_day_key(now_ms)
+        daily = self._get_halt(f"DAY:{day_utc}")
+        if daily is not None:
+            return ("HALT_DAILY_STOP", daily)
+        day_start = self._day_baseline(day_utc, snap.equity, now_ms)
         if day_start - snap.equity >= self._internal_daily_stop:
-            return f"HALT_DAILY_STOP:loss={day_start - snap.equity}>={self._internal_daily_stop}"
+            reason = f"HALT_DAILY_STOP:loss={day_start - snap.equity}>={self._internal_daily_stop}"
+            self._set_halt(f"DAY:{day_utc}", reason, now_ms)
+            return ("HALT_DAILY_STOP", reason)
         return None
 
     def step(
@@ -248,29 +286,34 @@ class BybitCwsaExecutor:
     ) -> dict[str, Any]:
         """Run one reconcile -> target -> risk -> dispatch cycle."""
         snap: BrokerSnapshot = gateway.observe(now_ms)
-        blocker = self._risk_check(snap, now_ms)
-        if blocker is not None:
-            return {"status": "BLOCKED", "reason": blocker, "submitted": 0}
-
-        wave_key, next_cp_ms, coin_targets = load_cwsa_targets(self._source_db, self._member_k)
-        if self._wave_processed(wave_key):
-            return {"status": "ALREADY_PROCESSED", "wave_key": wave_key, "submitted": 0}
+        risk = self._risk_check(snap, now_ms)
+        if risk is not None and risk[0] == "BLOCKED":
+            return {"status": "BLOCKED", "reason": risk[1], "submitted": 0}
 
         current_by_symbol: dict[str, Decimal] = {p.market: p.quantity for p in snap.positions}
         open_order_symbols = {o.market for o in snap.orders}
+        skipped: list[dict[str, str]] = []
+        target_by_symbol: dict[str, Decimal] = {}
+
+        if risk is not None:
+            # Flatten is just target_by_symbol={} routed through the same delta engine.
+            halt_reason = risk[1]
+            wave_key = digest({"halt": halt_reason, "syms": sorted(current_by_symbol), "ms": now_ms})
+            next_cp_ms = now_ms
+        else:
+            halt_reason = ""
+            wave_key, next_cp_ms, coin_targets = load_cwsa_targets(self._source_db, self._member_k)
+            if self._wave_processed(wave_key):
+                return {"status": "ALREADY_PROCESSED", "wave_key": wave_key, "submitted": 0}
+            for coin, qty in coin_targets.items():
+                spec = markets.get(coin) or markets.get(f"1000{coin}")
+                if spec is None:
+                    skipped.append({"coin": coin, "reason": "UNSUPPORTED_BYBIT_USDT_PERP"})
+                    continue
+                scaled = qty * Decimal("1000") if spec.symbol.startswith("1000") and not coin.startswith("1000") else qty
+                target_by_symbol[spec.symbol] = target_by_symbol.get(spec.symbol, _ZERO) + scaled
 
         planned: list[dict[str, Any]] = []
-        skipped: list[dict[str, str]] = []
-
-        # Build target map by Bybit symbol; include open positions not in targets (target=0 to close).
-        target_by_symbol: dict[str, Decimal] = {}
-        for coin, qty in coin_targets.items():
-            spec = markets.get(coin) or markets.get(f"1000{coin}")
-            if spec is None:
-                skipped.append({"coin": coin, "reason": "UNSUPPORTED_BYBIT_USDT_PERP"})
-                continue
-            scaled = qty * Decimal("1000") if spec.symbol.startswith("1000") and not coin.startswith("1000") else qty
-            target_by_symbol[spec.symbol] = target_by_symbol.get(spec.symbol, _ZERO) + scaled
 
         all_symbols = sorted(set(target_by_symbol) | set(current_by_symbol))
         spec_by_symbol = {s.symbol: s for s in markets.values()}
@@ -301,9 +344,13 @@ class BybitCwsaExecutor:
                 }
             )
 
+        if risk is not None and not planned:
+            return {"status": "HALTED", "reason": halt_reason, "skipped": skipped, "submitted": 0}
+
         if not execute:
             return {
-                "status": "SHADOW_DRY_RUN",
+                "status": "SHADOW_HALT_FLATTEN" if risk is not None else "SHADOW_DRY_RUN",
+                "reason": halt_reason or None,
                 "wave_key": wave_key,
                 "next_cp_ms": next_cp_ms,
                 "planned_count": len(planned),
@@ -337,11 +384,19 @@ class BybitCwsaExecutor:
                 }
             )
 
-        self._mark_wave_processed(wave_key, next_cp_ms, now_ms, len(results))
+        if risk is None:
+            self._mark_wave_processed(wave_key, next_cp_ms, now_ms, len(results))
+            return {
+                "status": "EXECUTED",
+                "wave_key": wave_key,
+                "next_cp_ms": next_cp_ms,
+                "submitted": len(results),
+                "results": results,
+                "skipped": skipped,
+            }
         return {
-            "status": "EXECUTED",
-            "wave_key": wave_key,
-            "next_cp_ms": next_cp_ms,
+            "status": "HALT_FLATTENED",
+            "reason": halt_reason,
             "submitted": len(results),
             "results": results,
             "skipped": skipped,
