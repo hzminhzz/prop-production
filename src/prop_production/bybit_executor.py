@@ -94,7 +94,13 @@ def load_cwsa_targets(
             qty = decimal(pos["quantity"])
             net[coin] = net.get(coin, _ZERO) + qty * k
 
-    wave_key = digest({"next_cp_ms": next_cp_ms, "sources": wave_parts})
+    wave_key = digest(
+        {
+            "next_cp_ms": next_cp_ms,
+            "sources": wave_parts,
+            "k": {sid: str(k) for sid, k in sorted(member_k.items())},
+        }
+    )
     return wave_key, next_cp_ms, {c: q for c, q in sorted(net.items()) if q != _ZERO}
 
 
@@ -291,7 +297,9 @@ class BybitCwsaExecutor:
             return {"status": "BLOCKED", "reason": risk[1], "submitted": 0}
 
         current_by_symbol: dict[str, Decimal] = {p.market: p.quantity for p in snap.positions}
-        open_order_symbols = {o.market for o in snap.orders}
+        open_order_symbols = {
+            o.market for o in snap.orders if o.status in {"OPEN", "ACCEPTED", "PARTIAL"}
+        }
         skipped: list[dict[str, str]] = []
         target_by_symbol: dict[str, Decimal] = {}
 
