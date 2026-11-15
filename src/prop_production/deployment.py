@@ -252,9 +252,10 @@ def activate_release(
             shutil.copy2(release / "units" / unit, unit_dir / unit)
         _pointer(opt, release)
         service(["daemon-reload"])
-        service(["start", *UNITS])
-        service(["is-active", "--quiet", *UNITS])
-        health_check()
+        if previous_active:
+            service(["start", *previous_active])
+            service(["is-active", "--quiet", *previous_active])
+            health_check()
     except BaseException:
         try:
             _restore(opt, unit_dir, record, service)

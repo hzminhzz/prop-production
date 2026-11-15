@@ -158,7 +158,4 @@ done
 # recovery record; no financial database is ever restored automatically.
 release_complete "$RELEASE_DIR"
 PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment activate "$RELEASE_DIR" --lock-fd 9
-systemctl enable prop-production-broker.service prop-production-guardian.service \
-    prop-production-planner.service prop-production-observer.service prop-production-watchdog.service \
-    prop-production-bybit-observer.service
 printf 'DEPLOYED_SHADOW commit=%s\n' "$RELEASE_SHA"

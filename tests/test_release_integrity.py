@@ -284,3 +284,21 @@ def test_packaged_systemd_units_and_acyclic_module_graph(tmp_path):
 
     assert cycles == []
     assert judge_importers <= {"cli"}
+
+
+def test_activation_with_disabled_units_skips_start_and_health_check(tmp_path):
+    opt, units, candidate, _, _ = layout(tmp_path)
+    calls = []
+    health_calls = 0
+
+    def health():
+        nonlocal health_calls
+        health_calls += 1
+
+    activate_release(opt, units, candidate, previous_active=[],
+                     health_check=health, service=calls.append)
+    assert (opt / "current").resolve() == candidate
+    assert ["stop", *UNITS] in calls
+    assert not any(call[0] in {"start", "is-active"} for call in calls)
+    assert health_calls == 0
+    assert json.loads((opt / "activation.json").read_text())["phase"] == "ACTIVE"
