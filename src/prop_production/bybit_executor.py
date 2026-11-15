@@ -50,11 +50,11 @@ def _quantize_step(value: Decimal, step: Decimal) -> Decimal:
     return sign * units * step
 
 
-def load_cwsa_targets(
+def _load_cwsa_snapshot(
     source_db: Path,
     member_k: dict[str, Decimal],
-) -> tuple[str, int, dict[str, Decimal]]:
-    """Read latest CWSA 5m wave for all portfolio members from read-only SQLite."""
+) -> tuple[str, int, dict[str, dict[str, Decimal]], dict[str, str]]:
+    """Read latest CWSA 5m wave per source from read-only SQLite."""
     uri = f"file:{source_db}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     try:
@@ -62,7 +62,7 @@ def load_cwsa_targets(
     finally:
         conn.close()
 
-    by_source: dict[str, tuple[str, int, list[dict[str, Any]]]] = {}
+    by_source: dict[str, tuple[str, int, str, dict[str, Decimal]]] = {}
     for _stream, scope_raw, state_raw in rows:
         scope = json.loads(scope_raw)
         sid = scope.get("source_id")
@@ -72,7 +72,14 @@ def load_cwsa_targets(
         seq = int(state["sequence"])
         next_cp = int(state["next_checkpoint_ms"])
         econ_sha = str(state["economic_sha"])
-        by_source[sid] = (f"{seq}:{next_cp}:{econ_sha}", next_cp, list(state["positions"]))
+        phase = str(state.get("phase") or "CONTINUOUS")
+        pos_map: dict[str, Decimal] = {}
+        for pos in state["positions"]:
+            coin = str(pos["instrument"]).split("/")[-1]
+            qty = decimal(pos["quantity"])
+            if qty != _ZERO:
+                pos_map[coin] = pos_map.get(coin, _ZERO) + qty
+        by_source[sid] = (f"{seq}:{next_cp}:{econ_sha}", next_cp, phase, pos_map)
 
     missing = sorted(set(member_k) - set(by_source))
     if missing:
@@ -83,16 +90,14 @@ def load_cwsa_targets(
         raise ValueError("CWSA_CHECKPOINT_SKEW")
     next_cp_ms = next(iter(next_cps))
 
-    net: dict[str, Decimal] = {}
     wave_parts: dict[str, str] = {}
+    positions_by_source: dict[str, dict[str, Decimal]] = {}
+    phases: dict[str, str] = {}
     for sid in sorted(member_k):
-        sig, _cp, positions = by_source[sid]
+        sig, _cp, phase, pos_map = by_source[sid]
         wave_parts[sid] = sig
-        k = member_k[sid]
-        for pos in positions:
-            coin = str(pos["instrument"]).split("/")[-1]
-            qty = decimal(pos["quantity"])
-            net[coin] = net.get(coin, _ZERO) + qty * k
+        phases[sid] = phase
+        positions_by_source[sid] = pos_map
 
     wave_key = digest(
         {
@@ -101,7 +106,25 @@ def load_cwsa_targets(
             "k": {sid: str(k) for sid, k in sorted(member_k.items())},
         }
     )
+    return wave_key, next_cp_ms, positions_by_source, phases
+
+
+def load_cwsa_targets(
+    source_db: Path,
+    member_k: dict[str, Decimal],
+) -> tuple[str, int, dict[str, Decimal]]:
+    """Read latest netted CWSA 5m wave for all portfolio members from read-only SQLite."""
+    wave_key, next_cp_ms, positions_by_source, _phases = _load_cwsa_snapshot(source_db, member_k)
+    net: dict[str, Decimal] = {}
+    for sid, pos_map in positions_by_source.items():
+        k = member_k[sid]
+        for coin, qty in pos_map.items():
+            net[coin] = net.get(coin, _ZERO) + qty * k
     return wave_key, next_cp_ms, {c: q for c, q in sorted(net.items()) if q != _ZERO}
+
+
+def _symbol_for_coin(coin: str, markets: dict[str, MarketSpec]) -> MarketSpec | None:
+    return markets.get(coin) or markets.get(f"1000{coin}")
 
 
 def _reduce_only_for_delta(current_qty: Decimal, delta_qty: Decimal) -> bool:
@@ -195,6 +218,112 @@ class BybitCwsaExecutor:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS initialized_sources (
+                    source_id TEXT PRIMARY KEY,
+                    initialized_at_ms INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ignored_source_legs (
+                    source_id TEXT NOT NULL,
+                    coin TEXT NOT NULL,
+                    initial_sign INTEGER NOT NULL,
+                    recorded_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (source_id, coin)
+                )
+                """
+            )
+
+    def _apply_source_baselines(
+        self,
+        positions_by_source: dict[str, dict[str, Decimal]],
+        markets: dict[str, MarketSpec],
+        current_by_symbol: dict[str, Decimal],
+        now_ms: int,
+        *,
+        persist: bool,
+    ) -> tuple[dict[str, Decimal], int]:
+        """Exclude pre-existing source legs until closed or flipped across zero.
+
+        ponytail: uses cwsa_heads state directly; misses a close+same-side-reopen that
+        completes entirely between two poll ticks (add cwsa_outcomes replay if needed).
+        """
+        with self._connect() as conn:
+            init_rows = conn.execute("SELECT source_id FROM initialized_sources").fetchall()
+            initialized = {str(r[0]) for r in init_rows}
+            ign_rows = conn.execute(
+                "SELECT source_id, coin, initial_sign FROM ignored_source_legs"
+            ).fetchall()
+            ignored: dict[tuple[str, str], int] = {
+                (str(r[0]), str(r[1])): int(r[2]) for r in ign_rows
+            }
+            migrating_live = (
+                not initialized
+                and conn.execute("SELECT 1 FROM processed_waves LIMIT 1").fetchone() is not None
+            )
+
+        new_sources: list[str] = []
+        to_insert: list[tuple[str, str, int, int]] = []
+        to_delete: list[tuple[str, str]] = []
+
+        for sid in sorted(positions_by_source):
+            pos_map = positions_by_source[sid]
+            if sid not in initialized:
+                new_sources.append(sid)
+                for coin, qty in sorted(pos_map.items()):
+                    if qty == _ZERO:
+                        continue
+                    if migrating_live:
+                        spec = _symbol_for_coin(coin, markets)
+                        if spec is not None and current_by_symbol.get(spec.symbol, _ZERO) != _ZERO:
+                            continue
+                    sign = 1 if qty > _ZERO else -1
+                    ignored[(sid, coin)] = sign
+                    to_insert.append((sid, coin, sign, now_ms))
+            else:
+                for (ign_sid, coin), init_sign in list(ignored.items()):
+                    if ign_sid != sid:
+                        continue
+                    cur_qty = pos_map.get(coin, _ZERO)
+                    cur_sign = 0 if cur_qty == _ZERO else (1 if cur_qty > _ZERO else -1)
+                    if cur_qty == _ZERO or cur_sign != init_sign:
+                        del ignored[(sid, coin)]
+                        to_delete.append((sid, coin))
+
+        if persist and (new_sources or to_insert or to_delete):
+            with self._connect() as conn:
+                for sid in new_sources:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO initialized_sources (source_id, initialized_at_ms) "
+                        "VALUES (?, ?)",
+                        (sid, now_ms),
+                    )
+                for sid, coin, sign, ts in to_insert:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO ignored_source_legs "
+                        "(source_id, coin, initial_sign, recorded_at_ms) VALUES (?, ?, ?, ?)",
+                        (sid, coin, sign, ts),
+                    )
+                for sid, coin in to_delete:
+                    conn.execute(
+                        "DELETE FROM ignored_source_legs WHERE source_id = ? AND coin = ?",
+                        (sid, coin),
+                    )
+
+        net: dict[str, Decimal] = {}
+        ignored_count = 0
+        for sid, pos_map in positions_by_source.items():
+            k = self._member_k[sid]
+            for coin, qty in pos_map.items():
+                if (sid, coin) in ignored:
+                    ignored_count += 1
+                    continue
+                net[coin] = net.get(coin, _ZERO) + qty * k
+        return {c: q for c, q in sorted(net.items()) if q != _ZERO}, ignored_count
 
     def _day_baseline(self, day_utc: str, equity: Decimal, now_ms: int) -> Decimal:
         with self._connect() as conn:
@@ -304,6 +433,7 @@ class BybitCwsaExecutor:
         }
         skipped: list[dict[str, str]] = []
         target_by_symbol: dict[str, Decimal] = {}
+        ignored_legs_count = 0
 
         if risk is not None:
             # Flatten is just target_by_symbol={} routed through the same delta engine.
@@ -312,13 +442,32 @@ class BybitCwsaExecutor:
             next_cp_ms = now_ms
         else:
             halt_reason = ""
-            wave_key, next_cp_ms, coin_targets = load_cwsa_targets(self._source_db, self._member_k)
+            wave_key, next_cp_ms, positions_by_source, phases = _load_cwsa_snapshot(
+                self._source_db, self._member_k
+            )
+            non_continuous = [
+                (sid, ph) for sid, ph in sorted(phases.items()) if ph != "CONTINUOUS"
+            ]
+            if non_continuous:
+                sid, ph = non_continuous[0]
+                return {
+                    "status": "BLOCKED",
+                    "reason": f"BLOCKED_CWSA_NOT_CONTINUOUS:{sid}:{ph}",
+                    "submitted": 0,
+                }
             if self._max_source_lag_ms is not None and now_ms - next_cp_ms > self._max_source_lag_ms:
                 return {"status": "BLOCKED", "reason": f"BLOCKED_CWSA_STALE:lag_ms={now_ms - next_cp_ms}", "submitted": 0}
+            coin_targets, ignored_legs_count = self._apply_source_baselines(
+                positions_by_source,
+                markets,
+                current_by_symbol,
+                now_ms,
+                persist=execute,
+            )
             if self._wave_processed(wave_key):
                 return {"status": "ALREADY_PROCESSED", "wave_key": wave_key, "submitted": 0}
             for coin, qty in coin_targets.items():
-                spec = markets.get(coin) or markets.get(f"1000{coin}")
+                spec = _symbol_for_coin(coin, markets)
                 if spec is None:
                     skipped.append({"coin": coin, "reason": "UNSUPPORTED_BYBIT_USDT_PERP"})
                     continue
@@ -368,6 +517,7 @@ class BybitCwsaExecutor:
                 "planned_count": len(planned),
                 "planned": planned,
                 "skipped": skipped,
+                "ignored_legs_count": ignored_legs_count,
                 "submitted": 0,
             }
 
@@ -403,6 +553,7 @@ class BybitCwsaExecutor:
                 "wave_key": wave_key,
                 "next_cp_ms": next_cp_ms,
                 "submitted": len(results),
+                "ignored_legs_count": ignored_legs_count,
                 "results": results,
                 "skipped": skipped,
             }
