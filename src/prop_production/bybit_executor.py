@@ -18,7 +18,7 @@ from typing import Any
 
 from .bybit_gateway import BybitDemoGateway
 from .evidence import decimal, digest
-from .gateway import BrokerSnapshot, MarketSpec
+from .gateway import BrokerSnapshot, MarketSpec, Outcome
 from .prop_firms import ChallengeRulebookSpec, get_challenge_spec
 
 _ZERO = Decimal("0")
@@ -39,11 +39,24 @@ TRIADA_HYDRO5K_K: dict[str, Decimal] = {
 }
 
 
+def _parse_hhmm(value: str) -> tuple[int, int] | None:
+    if ":" not in value:
+        return None
+    hh_str, mm_str = value.split(":", 1)
+    if not (hh_str.isdigit() and mm_str.isdigit() and len(hh_str) == 2 and len(mm_str) == 2):
+        return None
+    hh, mm = int(hh_str), int(mm_str)
+    if 0 <= hh < 24 and 0 <= mm < 60:
+        return hh, mm
+    return None
+
+
 def _utc_day_key(now_ms: int, reset_time_hhmm: str = "00:00") -> str:
     dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
-    if reset_time_hhmm and reset_time_hhmm != "UNKNOWN" and ":" in reset_time_hhmm:
-        hh_str, mm_str = reset_time_hhmm.split(":", 1)
-        dt = dt - timedelta(hours=int(hh_str), minutes=int(mm_str))
+    if reset_time_hhmm and reset_time_hhmm.upper() != "UNKNOWN":
+        parsed = _parse_hhmm(reset_time_hhmm)
+        if parsed is not None:
+            dt = dt - timedelta(hours=parsed[0], minutes=parsed[1])
     return dt.strftime("%Y-%m-%d")
 
 
@@ -174,6 +187,8 @@ class BybitCwsaExecutor:
         jitter_min_seconds: int = 0,
         jitter_max_seconds: int = 0,
         jitter_seed: str | None = None,
+        reset_time_hhmm: str | None = None,
+        day_start_equity_usd: Decimal | None = None,
     ) -> None:
         if not min_trade_notional_usd.is_finite() or min_trade_notional_usd < _ZERO:
             raise ValueError("INVALID_MIN_TRADE_NOTIONAL")
@@ -186,6 +201,19 @@ class BybitCwsaExecutor:
         self._source_db = source_db
         self._member_k = dict(member_k)
         self._spec: ChallengeRulebookSpec = get_challenge_spec(rulebook_key)
+        effective_reset = (
+            reset_time_hhmm.strip()
+            if reset_time_hhmm is not None and reset_time_hhmm.strip()
+            else self._spec.reset_time_hhmm
+        )
+        if effective_reset.upper() != "UNKNOWN" and _parse_hhmm(effective_reset) is None:
+            raise ValueError("INVALID_RESET_TIME_HHMM")
+        if day_start_equity_usd is not None and (
+            not day_start_equity_usd.is_finite() or day_start_equity_usd <= _ZERO
+        ):
+            raise ValueError("INVALID_DAY_START_EQUITY")
+        self._reset_time_hhmm = effective_reset
+        self._day_start_equity_override = day_start_equity_usd
         self._initial = decimal(self._spec.initial)
         self._trailing_loss = decimal(self._spec.trailing_loss)
         self._static_floor = self._initial - self._trailing_loss
@@ -388,6 +416,25 @@ class BybitCwsaExecutor:
 
     def _day_baseline(self, day_utc: str, equity: Decimal, now_ms: int) -> Decimal:
         with self._connect() as conn:
+            if self._day_start_equity_override is None:
+                conn.execute("DELETE FROM daily_baselines WHERE day_utc = 'OVERRIDE_APPLIED'")
+            else:
+                override_str = str(self._day_start_equity_override)
+                applied = conn.execute(
+                    "SELECT start_equity FROM daily_baselines WHERE day_utc = 'OVERRIDE_APPLIED'"
+                ).fetchone()
+                if applied is None or str(applied[0]) != override_str:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO daily_baselines (day_utc, start_equity, recorded_at_ms) "
+                        "VALUES (?, ?, ?)",
+                        (day_utc, override_str, now_ms),
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO daily_baselines (day_utc, start_equity, recorded_at_ms) "
+                        "VALUES ('OVERRIDE_APPLIED', ?, ?)",
+                        (override_str, now_ms),
+                    )
+                    return self._day_start_equity_override
             row = conn.execute(
                 "SELECT start_equity FROM daily_baselines WHERE day_utc = ?", (day_utc,)
             ).fetchone()
@@ -409,14 +456,18 @@ class BybitCwsaExecutor:
 
     def _record_intent_pending(
         self, intent_id: str, wave_key: str, symbol: str, qty: Decimal, reduce_only: bool, now_ms: int
-    ) -> None:
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO order_intents "
+            cur = conn.execute(
+                "INSERT INTO order_intents "
                 "(intent_id, wave_key, symbol, quantity, reduce_only, status, broker_id, reason, "
-                "created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, 'PENDING_SUBMIT', NULL, NULL, ?, ?)",
+                "created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, 'PENDING_SUBMIT', NULL, NULL, ?, ?) "
+                "ON CONFLICT(intent_id) DO UPDATE SET "
+                "status = 'PENDING_SUBMIT', broker_id = NULL, reason = NULL, updated_at_ms = excluded.updated_at_ms "
+                "WHERE order_intents.status NOT IN ('FILLED', 'ACCEPTED', 'PARTIAL')",
                 (intent_id, wave_key, symbol, str(qty), int(reduce_only), now_ms, now_ms),
             )
+            return cur.rowcount > 0
 
     def _update_intent_outcome(
         self, intent_id: str, status: str, broker_id: str | None, reason: str | None, now_ms: int
@@ -427,6 +478,15 @@ class BybitCwsaExecutor:
                 "WHERE intent_id = ?",
                 (status, broker_id, reason, now_ms, intent_id),
             )
+
+    def _unresolved_intent(self) -> tuple[str, str, str] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT intent_id, symbol, status FROM order_intents "
+                "WHERE status IN ('PENDING_SUBMIT', 'UNKNOWN') "
+                "ORDER BY updated_at_ms DESC, intent_id ASC LIMIT 1"
+            ).fetchone()
+            return (str(row[0]), str(row[1]), str(row[2])) if row is not None else None
 
     def _mark_wave_processed(self, wave_key: str, next_cp_ms: int, now_ms: int, count: int) -> None:
         with self._connect() as conn:
@@ -534,7 +594,9 @@ class BybitCwsaExecutor:
             hard_status = "HALT_STATIC_DD" if self._spec.trailing_basis.upper() == "STATIC" else "HALT_TRAILING_DD"
             return (hard_status, hard)
 
-        day_key = _utc_day_key(now_ms, self._spec.reset_time_hhmm)
+        if not self._reset_time_hhmm or self._reset_time_hhmm.upper() == "UNKNOWN":
+            return ("BLOCKED", "BLOCKED_RESET_TIME_UNKNOWN")
+        day_key = _utc_day_key(now_ms, self._reset_time_hhmm)
         floor, dd_status = self._trailing_floor(snap.equity, day_key, now_ms)
         if snap.equity <= floor:
             reason = f"{dd_status}:equity={snap.equity}<={floor}"
@@ -546,11 +608,11 @@ class BybitCwsaExecutor:
             return ("HALT_DAILY_STOP", daily)
 
         daily_basis = self._spec.daily_basis.upper()
-        if daily_basis == "BALANCE":
+        if daily_basis in ("BALANCE", "MAX_BALANCE_EQUITY"):
             balance = snap.cash if snap.cash is not None else snap.provider_balance
             if balance is None:
                 return ("BLOCKED", "BLOCKED_BALANCE_MISSING")
-            day_metric = balance
+            day_metric = balance if daily_basis == "BALANCE" else max(balance, snap.equity)
         else:
             day_metric = snap.equity
 
@@ -574,6 +636,17 @@ class BybitCwsaExecutor:
         risk = self._risk_check(snap, now_ms)
         if risk is not None and risk[0] == "BLOCKED":
             return {"status": "BLOCKED", "reason": risk[1], "submitted": 0}
+        order_halt = self._get_halt("ORDER_UNKNOWN")
+        if order_halt is not None:
+            return {"status": "HALTED", "reason": order_halt, "submitted": 0}
+        unresolved = self._unresolved_intent()
+        if unresolved is not None:
+            intent_id, sym, st = unresolved
+            return {
+                "status": "BLOCKED",
+                "reason": f"BLOCKED_UNRESOLVED_INTENT:{intent_id}:{sym}:{st}",
+                "submitted": 0,
+            }
 
         current_by_symbol: dict[str, Decimal] = {}
         for pos in snap.positions:
@@ -592,7 +665,12 @@ class BybitCwsaExecutor:
         if risk is not None:
             # Flatten is just target_by_symbol={} routed through the same delta engine.
             halt_reason = risk[1]
-            wave_key = digest({"halt": halt_reason, "syms": sorted(current_by_symbol), "ms": now_ms})
+            wave_key = digest(
+                {
+                    "halt": halt_reason,
+                    "pos": {s: str(q) for s, q in sorted(current_by_symbol.items())},
+                }
+            )
             next_cp_ms = now_ms
         else:
             halt_reason = ""
@@ -702,16 +780,26 @@ class BybitCwsaExecutor:
                 }
 
         results: list[dict[str, Any]] = []
+        unknown_halt: str | None = None
         for intent in planned:
-            self._record_intent_pending(
+            if not self._record_intent_pending(
                 intent["intent_id"],
                 wave_key,
                 intent["market"],
                 decimal(intent["quantity"]),
                 bool(intent["reduce_only"]),
                 now_ms,
-            )
-            outcome = gateway.submit(intent)
+            ):
+                skipped.append({"symbol": intent["market"], "reason": "INTENT_ALREADY_SUBMITTED"})
+                continue
+            try:
+                outcome = gateway.submit(intent)
+            except Exception as exc:
+                outcome = Outcome(
+                    status="UNKNOWN",
+                    broker_id=None,
+                    reason=f"SUBMIT_EXCEPTION:{type(exc).__name__}",
+                )
             self._update_intent_outcome(
                 intent["intent_id"], outcome.status, outcome.broker_id, outcome.reason, now_ms
             )
@@ -725,7 +813,21 @@ class BybitCwsaExecutor:
                     "reason": outcome.reason,
                 }
             )
+            if outcome.status == "UNKNOWN":
+                unknown_halt = f"HALT_ORDER_UNKNOWN:{intent['intent_id']}:{outcome.reason or 'UNKNOWN'}"
+                self._set_halt("ORDER_UNKNOWN", unknown_halt, now_ms)
+                break
 
+        if unknown_halt is not None:
+            return {
+                "status": "HALTED",
+                "reason": unknown_halt,
+                "wave_key": wave_key,
+                "next_cp_ms": next_cp_ms,
+                "submitted": len(results),
+                "results": results,
+                "skipped": skipped,
+            }
         if risk is None:
             self._mark_wave_processed(wave_key, next_cp_ms, now_ms, len(results))
             return {
@@ -790,18 +892,39 @@ def _sleep_for_report(report: dict[str, Any], poll_seconds: int) -> None:
     time.sleep(poll_seconds)
 
 
+def _load_k_json(source: Path | str) -> dict[str, Decimal]:
+    raw_str = str(source).strip()
+    text = raw_str if raw_str.startswith("{") else Path(source).read_text(encoding="utf-8")
+    raw = json.loads(text)
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("K_JSON_INVALID")
+    out: dict[str, Decimal] = {}
+    for sid, val in raw.items():
+        if not isinstance(sid, str) or not sid.strip() or isinstance(val, bool):
+            raise ValueError("K_JSON_ENTRY_INVALID")
+        k_dec = decimal(val)
+        if not k_dec.is_finite() or k_dec < _ZERO:
+            raise ValueError("K_JSON_VALUE_INVALID")
+        out[sid.strip()] = k_dec
+    return out
+
+
 def _executor_from_args(
     args: argparse.Namespace, *, allow_rest_reconciliation: bool
 ) -> BybitCwsaExecutor:
+    member_k = _load_k_json(args.k_json) if args.k_json is not None else TRIADA_HYDRO5K_K
+    day_start = decimal(args.day_start_equity) if args.day_start_equity is not None else None
     return BybitCwsaExecutor(
         state_db=args.state_db,
         source_db=args.source_db,
-        member_k=TRIADA_HYDRO5K_K,
+        member_k=member_k,
         rulebook_key=args.rulebook_key,
         allow_rest_reconciliation=allow_rest_reconciliation,
         min_trade_notional_usd=decimal(args.min_trade_notional_usd),
         jitter_min_seconds=args.jitter_min_seconds,
         jitter_max_seconds=args.jitter_max_seconds,
+        reset_time_hhmm=args.reset_time_hhmm,
+        day_start_equity_usd=day_start,
     )
 
 
@@ -841,6 +964,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--propr-account-id", default=None)
     parser.add_argument("--vanta-account-id", default=None)
     parser.add_argument("--markets-json", type=Path, default=None)
+    parser.add_argument("--k-json", default=None)
+    parser.add_argument("--reset-time-hhmm", default=None)
+    parser.add_argument("--day-start-equity", default=None)
     parser.add_argument("--poll-seconds", type=int, default=15)
     parser.add_argument("--min-trade-notional-usd", default="30")
     parser.add_argument("--jitter-min-seconds", type=int, default=0)

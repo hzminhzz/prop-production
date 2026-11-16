@@ -74,14 +74,24 @@ def seal_bundle(root: Path) -> dict[str, Any]:
     commit = (root / "COMMIT").read_text().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("RELEASE_COMMIT")
+    files = _inventory(root)
     value = {"schema": "prop_release_bundle_v1", "application_commit": commit,
              "compatibility_sha256": _sha(root / "compatibility.json"),
-             "files": _inventory(root), "trading_authorized": False}
+             "files": files, "trading_authorized": False}
     _atomic_json(root / "BUNDLE.json", value)
-    return verify_bundle(root, expected_commit=commit)
+    return _verify_bundle(root, expected_commit=commit, precomputed_files=files)
 
 
 def verify_bundle(root: Path, *, expected_commit: str | None = None) -> dict[str, Any]:
+    return _verify_bundle(root, expected_commit=expected_commit)
+
+
+def _verify_bundle(
+    root: Path,
+    *,
+    expected_commit: str | None = None,
+    precomputed_files: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("RELEASE_DIRECTORY")
     value = json.loads((root / "BUNDLE.json").read_text())
@@ -98,7 +108,8 @@ def verify_bundle(root: Path, *, expected_commit: str | None = None) -> dict[str
             or (root / "SOURCE.sha256").read_text().split()[0] != _sha(root / "SOURCE.tar")
             or not os.access(root / "venv/bin/python", os.X_OK)):
         raise ValueError("RELEASE_IDENTITY_OR_CONTRACT")
-    if value.get("files") != _inventory(root):
+    actual_files = precomputed_files if precomputed_files is not None else _inventory(root)
+    if value.get("files") != actual_files:
         raise ValueError("RELEASE_CONTENT_DRIFT")
     for unit in UNITS:
         if not (root / "units" / unit).is_file():
@@ -147,9 +158,10 @@ def _pointer(opt: Path, release: Path | None) -> None:
         os.close(descriptor)
 
 
-def _code_transition(source: Path, target: Path) -> dict[str, Any]:
+def _code_transition(source: Path, target: Path, *, target_verified: bool = False) -> dict[str, Any]:
     verify_bundle(source)
-    verify_bundle(target)
+    if not target_verified:
+        verify_bundle(target)
     return asdict(code_recovery(
         json.loads((source / "compatibility.json").read_text()),
         json.loads((target / "compatibility.json").read_text()),
@@ -227,7 +239,7 @@ def activate_release(
     if previous is not None and previous.parent != (opt / "releases").resolve():
         raise ValueError("PREVIOUS_RELEASE_OUTSIDE_ROOT")
     if previous is not None:
-        transition = _code_transition(previous, release)
+        transition = _code_transition(previous, release, target_verified=True)
         if transition["successor"] != "COMPATIBLE":
             service(["stop", *UNITS])
             _atomic_json(opt / "code-fence.json", transition)

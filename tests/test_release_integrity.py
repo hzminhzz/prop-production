@@ -302,3 +302,46 @@ def test_activation_with_disabled_units_skips_start_and_health_check(tmp_path):
     assert not any(call[0] in {"start", "is-active"} for call in calls)
     assert health_calls == 0
     assert json.loads((opt / "activation.json").read_text())["phase"] == "ACTIVE"
+
+
+def test_seal_and_activate_hash_candidate_once(tmp_path, monkeypatch):
+    from prop_production import deployment
+
+    opt = tmp_path / "opt"
+    previous = bundle(opt, "c" * 40)
+    (opt / "current").symlink_to(previous)
+    units = tmp_path / "units"
+    units.mkdir()
+    for unit in UNITS:
+        (units / unit).write_text("old unit: " + unit)
+
+    candidate = opt / "releases" / ("a" * 40)
+    for name in ("source", "connector", "units", "dist", "venv/bin"):
+        (candidate / name).mkdir(parents=True, exist_ok=True)
+    (candidate / "COMMIT").write_text(("a" * 40) + "\n")
+    (candidate / "TREE").write_text("b" * 40 + "\n")
+    (candidate / "SOURCE.tar").write_bytes(b"fixture Git archive")
+    archive_sha = hashlib.sha256(b"fixture Git archive").hexdigest()
+    (candidate / "SOURCE.sha256").write_text(archive_sha + "  SOURCE.tar\n")
+    (candidate / "compatibility.json").write_text(json.dumps(MANIFEST))
+    (candidate / "source/fixture.py").write_text("FIXTURE = True\n")
+    (candidate / "connector/provider.py").write_text("MODE = 'READ_ONLY'\n")
+    (candidate / "dist/application.whl").write_bytes(b"fixture artifact")
+    (candidate / "venv/bin/python").write_text("#!/bin/sh\nexit 0\n")
+    (candidate / "venv/bin/python").chmod(0o755)
+    for unit in UNITS:
+        (candidate / "units" / unit).write_text("candidate unit: " + unit)
+
+    counts: dict[Path, int] = {}
+    real_inventory = deployment._inventory
+
+    def counted_inventory(root: Path) -> dict[str, object]:
+        counts[root] = counts.get(root, 0) + 1
+        return real_inventory(root)
+
+    monkeypatch.setattr(deployment, "_inventory", counted_inventory)
+    seal_bundle(candidate)
+    assert counts[candidate] == 1
+    activate_release(opt, units, candidate, previous_active=[], health_check=lambda: None, service=lambda _: None)
+    assert counts[candidate] == 2
+    assert counts[previous] == 1

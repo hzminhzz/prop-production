@@ -155,6 +155,7 @@ def test_cwsa_executor_supports_eod_trailing_rollover(tmp_path: Path) -> None:
         rulebook_key="vanta-trading:grow:funded",  # initial=5000, trailing=400 EOD_EQUITY
         internal_daily_stop_usd=Decimal("500"),
         max_source_lag_ms=None,
+        reset_time_hhmm="00:00",
     )
     markets = _propr_markets()
 

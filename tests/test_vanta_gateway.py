@@ -158,6 +158,7 @@ def test_vanta_gateway_end_to_end_observe_execute_and_eliminated_block(tmp_path:
         member_k={"ACT04": Decimal("0.001")},
         rulebook_key="vanta-trading:classic_1step_5pct:phase_1",
         allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
     )
 
     with VantaGateway(client, account_id=account_id, endpoint=VANTA_API_URL, order_client=order_client) as gw:

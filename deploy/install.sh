@@ -71,7 +71,6 @@ else
     chown -R root:root "$RELEASE_DIR"
     chmod -R go-w "$RELEASE_DIR"
     PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment seal "$RELEASE_DIR"
-    release_complete "$RELEASE_DIR"
 fi
 OPT_VENV="$RELEASE_DIR/venv"
 
@@ -123,12 +122,15 @@ chown root:prop "$STATE/trust/settings.json" "$STATE/trust/floor.sqlite"
 chmod 0640 "$STATE/trust/settings.json"
 chmod 0440 "$STATE/trust/floor.sqlite"
 
-# 6. Observer credentials: root-only file, value flows file-to-file only.
-[ -f /etc/prop-production/observer.env ] || {
+# 6. Observer credentials: root-only file, value flows file-to-file only (skip if unused).
+if [ ! -f /etc/prop-production/observer.env ] && [ -f /home/quant/dev/trading-connector/.env ] \
+    && grep -q '^PROPR_API_KEY=.' /home/quant/dev/trading-connector/.env; then
     mkdir -p /etc/prop-production
-    grep '^PROPR_API_KEY=' /home/quant/dev/trading-connector/.env > /etc/prop-production/observer.env
-    chown root:root /etc/prop-production/observer.env; chmod 0600 /etc/prop-production/observer.env
-}
+    (umask 077 && grep '^PROPR_API_KEY=' /home/quant/dev/trading-connector/.env > /etc/prop-production/observer.env.tmp)
+    chown root:root /etc/prop-production/observer.env.tmp
+    chmod 0600 /etc/prop-production/observer.env.tmp
+    mv /etc/prop-production/observer.env.tmp /etc/prop-production/observer.env
+fi
 
 # Bybit requires an independently authenticated dedicated Demo key/UID.
 # Never copy BYBIT_PROP_* or generic mainnet keys; never fall back to Testnet.
@@ -156,6 +158,5 @@ done
 # services, switches one immutable code set, and verifies fresh role heartbeats.
 # Failure restores the previous code+units. Interrupted activation has a durable
 # recovery record; no financial database is ever restored automatically.
-release_complete "$RELEASE_DIR"
 PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment activate "$RELEASE_DIR" --lock-fd 9
 printf 'DEPLOYED_SHADOW commit=%s\n' "$RELEASE_SHA"
