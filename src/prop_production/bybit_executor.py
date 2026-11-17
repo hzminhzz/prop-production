@@ -68,6 +68,16 @@ def _quantize_step(value: Decimal, step: Decimal) -> Decimal:
     return sign * units * step
 
 
+def _coin_from_instrument(instrument: object) -> str:
+    raw = str(instrument).strip()
+    if ":perp:" in raw:
+        rest = raw.split(":perp:", 1)[1]
+        if "/" in rest:
+            dex, name = rest.split("/", 1)
+            return name if dex in ("", "default") else f"{dex}:{name}"
+    return raw.split("/")[-1]
+
+
 def _load_cwsa_snapshot(
     source_db: Path,
     member_k: dict[str, Decimal],
@@ -93,7 +103,7 @@ def _load_cwsa_snapshot(
         phase = str(state.get("phase") or "CONTINUOUS")
         pos_map: dict[str, Decimal] = {}
         for pos in state["positions"]:
-            coin = str(pos["instrument"]).split("/")[-1]
+            coin = _coin_from_instrument(pos["instrument"])
             qty = decimal(pos["quantity"])
             if qty != _ZERO:
                 pos_map[coin] = pos_map.get(coin, _ZERO) + qty
@@ -234,6 +244,10 @@ class BybitCwsaExecutor:
         self._jitter_seed = jitter_seed if jitter_seed is not None else secrets.token_hex(8)
         self._state_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+
+    @property
+    def expected_initial(self) -> Decimal:
+        return self._initial
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -497,6 +511,22 @@ class BybitCwsaExecutor:
         broker_id = str(row[0]).strip()
         return broker_id or None
 
+    def lookup_intent_id(self, broker_id: str) -> str | None:
+        """Return persisted intent_id for broker_id from order_intents, if present."""
+        key = str(broker_id or "").strip()
+        if not key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT intent_id FROM order_intents WHERE broker_id = ? "
+                "ORDER BY updated_at_ms DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        intent_id = str(row[0]).strip()
+        return intent_id or None
+
     def _unresolved_intent(self) -> tuple[str, str, str] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -721,7 +751,11 @@ class BybitCwsaExecutor:
                 if spec is None:
                     skipped.append({"coin": coin, "reason": "UNSUPPORTED_BYBIT_USDT_PERP"})
                     continue
-                scaled = qty * Decimal("1000") if spec.symbol.startswith("1000") and not coin.startswith("1000") else qty
+                scaled = (
+                    qty * Decimal("1000")
+                    if spec.symbol.startswith("1000") and not coin.startswith(("1000", "k"))
+                    else qty
+                )
                 target_by_symbol[spec.symbol] = target_by_symbol.get(spec.symbol, _ZERO) + scaled
 
         planned: list[dict[str, Any]] = []
@@ -754,7 +788,8 @@ class BybitCwsaExecutor:
                     skipped.append({"symbol": sym, "reason": "BELOW_NOTIONAL_DEADBAND"})
                     continue
             reduce_only = _reduce_only_for_delta(current_by_symbol.get(sym, _ZERO), qty_step)
-            intent_id = f"hy-{wave_key[:12]}-{sym.split('/')[0][:12]}"[:36]
+            sym_prefix = sym.split("/")[0][:7]
+            intent_id = f"hy-{wave_key[:12]}-{sym_prefix}-{digest(sym)[:6]}"[:36]
             planned.append(
                 {
                     "intent_id": intent_id,
@@ -847,6 +882,28 @@ class BybitCwsaExecutor:
                 "skipped": skipped,
             }
         if risk is None:
+            rate_limited = next(
+                (
+                    str(r.get("reason") or "")
+                    for r in results
+                    if r.get("status") == "REJECTED"
+                    and (
+                        r.get("reason") == "VANTA_COOLDOWN_ACTIVE"
+                        or str(r.get("reason") or "").startswith(("HTTP_429:", "RATE_LIMIT"))
+                    )
+                ),
+                None,
+            )
+            if rate_limited is not None:
+                return {
+                    "status": "BLOCKED",
+                    "reason": f"BLOCKED_RATE_LIMITED:{rate_limited}",
+                    "wave_key": wave_key,
+                    "next_cp_ms": next_cp_ms,
+                    "submitted": len(results),
+                    "results": results,
+                    "skipped": skipped,
+                }
             self._mark_wave_processed(wave_key, next_cp_ms, now_ms, len(results))
             return {
                 "status": "EXECUTED",
@@ -1063,8 +1120,9 @@ def main(argv: list[str] | None = None) -> int:
             account_id=account_id,
             endpoint=VANTA_API_URL,
             order_client=vanta_order_client,
-            expected_account_size=executor._initial,
+            expected_account_size=executor.expected_initial,
             broker_id_lookup=executor.lookup_broker_id,
+            intent_id_lookup=executor.lookup_intent_id,
         ) as gateway:
             if args.markets_json:
                 markets = _load_markets_json(args.markets_json)

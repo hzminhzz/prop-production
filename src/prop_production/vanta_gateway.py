@@ -52,7 +52,6 @@ _REJECTED_SUBMIT_ERRORS = frozenset(
         "VantaRateLimitError",
     }
 )
-_REJECTED_STATUS_CODES = frozenset({400, 401, 403, 404, 409, 429})
 
 
 def vanta_account_binding(account_id: str, endpoint: str = VANTA_API_URL) -> str:
@@ -120,7 +119,7 @@ def _is_definitive_rejection(exc: BaseException) -> bool:
     if type(exc).__name__ in _REJECTED_SUBMIT_ERRORS:
         return True
     status_code = _status_code(exc)
-    return status_code is not None and status_code in _REJECTED_STATUS_CODES
+    return status_code is not None and 400 <= status_code < 500 and status_code != 408
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -184,9 +183,10 @@ class VantaGateway:
         endpoint: str = VANTA_API_URL,
         order_client: Any | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
-        command_timeout_s: float = 15.0,
+        command_timeout_s: float = 35.0,
         expected_account_size: Decimal | None = None,
         broker_id_lookup: Callable[[str], str | None] | None = None,
+        intent_id_lookup: Callable[[str], str | None] | None = None,
     ) -> None:
         clean_id = account_id.strip()
         clean_ep = endpoint.rstrip("/")
@@ -206,6 +206,7 @@ class VantaGateway:
         )
         self._expected_account_size = expected_account_size
         self._broker_id_lookup = broker_id_lookup
+        self._intent_id_lookup = intent_id_lookup
         self._submitted_lock = threading.Lock()
         self._submitted_targets: dict[str, str] = {}
         self._broker_to_intent: dict[str, str] = {}
@@ -371,9 +372,12 @@ class VantaGateway:
                 complete_history=False,
                 executions_reconciled=False,
             )
+            intent_id = broker_to_intent.get(uuid) or (
+                str(self._intent_id_lookup(uuid) or "").strip() if self._intent_id_lookup else ""
+            )
             orders.append(
                 BrokerOrder(
-                    intent_id=broker_to_intent.get(uuid, ""),
+                    intent_id=intent_id,
                     broker_id=uuid,
                     market=pair,
                     quantity=signed_qty,
@@ -503,16 +507,41 @@ class VantaGateway:
 
         order = ack.get("order") if isinstance(ack.get("order"), Mapping) else {}
         broker_id = str(order.get("orderUuid") or ack.get("order_uuid") or "").strip()
+        if ack.get("success") is False:
+            return Outcome(
+                status="REJECTED",
+                broker_id=broker_id or None,
+                reason=str(ack.get("error_message") or "REJECTED"),
+            )
         if not broker_id:
             return Outcome(status="UNKNOWN", broker_id=None, reason="MISSING_BROKER_ID")
 
+        filled_flag = order.get("filled")
+        filled_qty = _finite_decimal(order.get("quantity")) if filled_flag is True else None
         with self._submitted_lock:
             self._submitted_targets[intent_id] = broker_id
             self._broker_to_intent[broker_id] = intent_id
+            if filled_flag is True:
+                prev_pos = self._last_positions.get(trade_pair, _ZERO)
+                if order_type == "FLAT":
+                    if (
+                        filled_qty is not None
+                        and filled_qty != _ZERO
+                        and abs(filled_qty) < abs(prev_pos)
+                    ):
+                        sign = Decimal("-1") if prev_pos > _ZERO else Decimal("1")
+                        self._last_positions[trade_pair] = prev_pos + sign * abs(filled_qty)
+                    else:
+                        self._last_positions[trade_pair] = _ZERO
+                else:
+                    exec_qty = (
+                        abs(filled_qty)
+                        if filled_qty is not None and filled_qty != _ZERO
+                        else submit_qty
+                    )
+                    signed_delta = exec_qty if order_type == "LONG" else -exec_qty
+                    self._last_positions[trade_pair] = prev_pos + signed_delta
 
-        if ack.get("success") is False:
-            return Outcome(status="REJECTED", broker_id=broker_id, reason=str(ack.get("error_message") or "REJECTED"))
-        filled_flag = order.get("filled")
         if filled_flag is True:
             binding_cap = order.get("bindingCap") if order.get("bindingCap") is not None else ack.get("bindingCap")
             reason: str | None = None
@@ -544,7 +573,7 @@ class VantaGateway:
             return Outcome(status="UNKNOWN", reason="CANCEL_TARGET_UNKNOWN")
 
         try:
-            self._loop_runner.run(
+            ack = self._loop_runner.run(
                 order_client.submit_order({"execution_type": "LIMIT_CANCEL", "order_uuid": broker_id})
             )
         except Exception as exc:
@@ -557,5 +586,11 @@ class VantaGateway:
                 status="UNKNOWN",
                 broker_id=broker_id,
                 reason=f"CANCEL_AMBIGUOUS:{type(exc).__name__}",
+            )
+        if isinstance(ack, Mapping) and ack.get("success") is False:
+            return Outcome(
+                status="REJECTED",
+                broker_id=broker_id,
+                reason=str(ack.get("error_message") or "CANCEL_REJECTED"),
             )
         return Outcome(status="CANCELLED", broker_id=broker_id)

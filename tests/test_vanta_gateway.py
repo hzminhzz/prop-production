@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 from decimal import Decimal
@@ -692,3 +693,228 @@ def test_vanta_gateway_limit_orders_binding_cap_cancel_errors_and_paused_identit
     ex._update_intent_outcome("i-db", "ACCEPTED", "ord-from-db", None, now_ms)
     assert ex.lookup_broker_id("i-db") == "ord-from-db"
     assert ex.lookup_broker_id("missing") is None
+
+
+def test_vanta_gateway_rejection_codes_ack_false_position_tracking_timeout_and_restart_lookup(
+    tmp_path: Path,
+) -> None:
+    httpx = pytest.importorskip("httpx")
+    vanta_mod = pytest.importorskip("connectors.vanta")
+    VantaClient = vanta_mod.VantaClient
+    VantaConfig = vanta_mod.VantaConfig
+    VantaOrderClient = vanta_mod.VantaOrderClient
+
+    assert inspect.signature(VantaGateway.__init__).parameters["command_timeout_s"].default == 35.0
+
+    account_id = "6f1c2e34-9a4b-4c1d-8e2f-1a2b3c4d5e6f"
+    cfg = VantaConfig(account_id=account_id, api_key="vk_test_id", api_secret="vks_test_secret")
+    now_ms = 1794683600000
+
+    state: dict[str, Any] = {
+        "post_mode": "422",
+        "orders": [],
+        "posted": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET":
+            if path == "/api/v1/keys/self":
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"keyId": cfg.api_key, "accountId": account_id}},
+                )
+            if path == "/api/v1/trading/account":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "accountId": account_id,
+                            "evaluation": {"isEliminated": False},
+                            "account": {
+                                "currentBalance": 5000,
+                                "currentEquity": 5000,
+                                "openPnL": 0,
+                                "capitalUsed": 0,
+                            },
+                            "meta": {"generatedAtMs": 1794683599000, "stale": False},
+                        },
+                    },
+                )
+            if path == "/api/v1/trading/positions":
+                return httpx.Response(200, json={"success": True, "data": []})
+            if path == "/api/v1/trading/orders":
+                return httpx.Response(200, json={"success": True, "data": state["orders"]})
+        elif request.method == "POST" and path == "/api/v1/trading/orders":
+            trade = json.loads(request.content)["trade"]
+            state["posted"].append(trade)
+            mode = state["post_mode"]
+            if mode == "422":
+                return httpx.Response(422, json={"error": "unprocessable_entity"})
+            if mode == "408":
+                return httpx.Response(408, json={"error": "request_timeout"})
+            if mode == "ack_false_no_uuid":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {"success": False, "error_message": "INSUFFICIENT_MARGIN"},
+                    },
+                )
+            if mode == "cancel_ack_false":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {"success": False, "error_message": "ALREADY_CLOSED"},
+                    },
+                )
+            if mode == "fill_full":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "success": True,
+                            "order_uuid": f"ord-{len(state['posted'])}",
+                            "order": {
+                                "orderUuid": f"ord-{len(state['posted'])}",
+                                "filled": True,
+                                "quantity": trade["quantity"],
+                            },
+                        },
+                    },
+                )
+            if mode == "fill_partial_001":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "success": True,
+                            "order_uuid": f"ord-{len(state['posted'])}",
+                            "order": {
+                                "orderUuid": f"ord-{len(state['posted'])}",
+                                "filled": True,
+                                "quantity": 0.01,
+                            },
+                        },
+                    },
+                )
+            if mode == "fill_no_qty":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "success": True,
+                            "order_uuid": f"ord-{len(state['posted'])}",
+                            "order": {
+                                "orderUuid": f"ord-{len(state['posted'])}",
+                                "filled": True,
+                            },
+                        },
+                    },
+                )
+        raise AssertionError(f"Unexpected {request.method} {path}")
+
+    transport = httpx.MockTransport(handler)
+    client = VantaClient(cfg, transport=transport)
+    order_client = VantaOrderClient(
+        cfg, confirm_account_id=account_id, allow_execution=True, transport=transport
+    )
+
+    with VantaGateway(client, account_id=account_id, order_client=order_client) as gw:
+        assert gw._loop_runner._timeout_s == 35.0
+
+        state["post_mode"] = "422"
+        out_422 = gw.submit({"intent_id": "i-422", "market": "BTCUSDC", "quantity": "0.01"})
+        assert out_422 == Outcome(status="REJECTED", broker_id=None, reason="HTTP_422:unprocessable_entity")
+
+        state["post_mode"] = "408"
+        out_408 = gw.submit({"intent_id": "i-408", "market": "BTCUSDC", "quantity": "0.01"})
+        assert out_408 == Outcome(status="UNKNOWN", broker_id=None, reason="SUBMIT_AMBIGUOUS:VantaAPIError")
+
+        state["post_mode"] = "ack_false_no_uuid"
+        out_ack_false = gw.submit({"intent_id": "i-af", "market": "BTCUSDC", "quantity": "0.01"})
+        assert out_ack_false == Outcome(
+            status="REJECTED", broker_id=None, reason="INSUFFICIENT_MARGIN"
+        )
+
+        state["post_mode"] = "fill_full"
+        assert (
+            gw.submit({"intent_id": "i-open", "market": "BTCUSDC", "quantity": "0.02"}).status
+            == "FILLED"
+        )
+        assert gw._last_positions["BTCUSDC"] == Decimal("0.02")
+
+        state["post_mode"] = "fill_partial_001"
+        assert (
+            gw.submit(
+                {"intent_id": "i-flat-part", "market": "BTCUSDC", "quantity": "-0.02", "reduce_only": True}
+            ).status
+            == "FILLED"
+        )
+        assert state["posted"][-1]["order_type"] == "FLAT"
+        assert gw._last_positions["BTCUSDC"] == Decimal("0.01")
+
+        state["post_mode"] = "fill_full"
+        assert (
+            gw.submit(
+                {"intent_id": "i-flat-rest", "market": "BTCUSDC", "quantity": "-0.01", "reduce_only": True}
+            ).status
+            == "FILLED"
+        )
+        assert state["posted"][-1]["order_type"] == "FLAT"
+        assert gw._last_positions["BTCUSDC"] == Decimal("0")
+
+        state["post_mode"] = "fill_no_qty"
+        assert (
+            gw.submit({"intent_id": "i-short", "market": "ETHUSDC", "quantity": "-0.5"}).status
+            == "FILLED"
+        )
+        assert gw._last_positions["ETHUSDC"] == Decimal("-0.5")
+
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    _write_cwsa_db(source_db, seq=1, next_cp=now_ms, positions_by_sid={"ACT04": []})
+    ex = CwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001")},
+        rulebook_key="vanta-trading:classic_1step_5pct:phase_1",
+        allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
+    )
+    ex._record_intent_pending("i-lim-restart", "wk-r", "BTCUSDC", Decimal("0.01"), False, now_ms)
+    ex._update_intent_outcome("i-lim-restart", "ACCEPTED", "ord-restart-1", None, now_ms)
+
+    state["orders"] = [
+        {
+            "orderUuid": "ord-restart-1",
+            "tradePair": "BTCUSDC",
+            "orderType": "LONG",
+            "executionType": "LIMIT",
+            "quantity": 0.01,
+        }
+    ]
+    state["post_mode"] = "cancel_ack_false"
+    client_restarted = VantaClient(cfg, transport=transport)
+    order_client_restarted = VantaOrderClient(
+        cfg, confirm_account_id=account_id, allow_execution=True, transport=transport
+    )
+    with VantaGateway(
+        client_restarted,
+        account_id=account_id,
+        order_client=order_client_restarted,
+        broker_id_lookup=ex.lookup_broker_id,
+        intent_id_lookup=ex.lookup_intent_id,
+    ) as gw_restarted:
+        snap = gw_restarted.observe(now_ms)
+        assert len(snap.orders) == 1
+        assert snap.orders[0].intent_id == "i-lim-restart"
+        assert snap.orders[0].broker_id == "ord-restart-1"
+        assert gw_restarted.cancel("i-lim-restart") == Outcome(
+            status="REJECTED", broker_id="ord-restart-1", reason="ALREADY_CLOSED"
+        )

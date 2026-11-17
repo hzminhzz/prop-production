@@ -591,9 +591,10 @@ def test_cli_vanta_omitted_reset_time_and_rulebook_scale_and_market_load_retry(
     )
     assert len(captured_executors) == 1
     assert captured_executors[0]._reset_time_hhmm == "00:00"
-    assert captured_executors[0]._initial == Decimal("10000")
+    assert captured_executors[0].expected_initial == Decimal("10000")
     assert captured_gw_kwargs[-1]["expected_account_size"] == Decimal("10000")
     assert callable(captured_gw_kwargs[-1]["broker_id_lookup"])
+    assert callable(captured_gw_kwargs[-1]["intent_id_lookup"])
     assert load_attempts == 2
     assert sleep_calls == [7]
 
@@ -647,3 +648,183 @@ def test_cli_vanta_omitted_reset_time_and_rulebook_scale_and_market_load_retry(
                 "--once",
             ]
         )
+
+
+def test_rate_limit_rejection_defers_wave_completion_and_retries_only_rejected_leg(
+    tmp_path: Path,
+) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    markets = _markets()
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001"), "ACT08": Decimal("0.001"), "ACT09": Decimal("0")},
+    )
+    _seed_empty_baseline(ex, source_db, markets)
+
+    _write_head(
+        source_db,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "20"}],
+            "ACT08": [{"instrument": "hyperliquid/mainnet:perp:default/ETH", "quantity": "-100"}],
+            "ACT09": [],
+        },
+    )
+    wave_key, _, _ = load_cwsa_targets(source_db, ex._member_k)
+
+    gw1 = _FakeGateway(
+        _snap(),
+        outcomes=[
+            Outcome(status="FILLED", broker_id="ord-btc"),
+            Outcome(status="REJECTED", broker_id=None, reason="HTTP_429:too_many_failed_requests"),
+        ],
+    )
+    res1 = ex.step(gw1, markets, _BASE_MS, execute=True)
+    assert res1["status"] == "BLOCKED"
+    assert res1["reason"] == "BLOCKED_RATE_LIMITED:HTTP_429:too_many_failed_requests"
+    assert res1["submitted"] == 2
+    assert len(gw1.submitted) == 2
+
+    with closing(sqlite3.connect(state_db)) as conn:
+        assert (
+            conn.execute("SELECT 1 FROM processed_waves WHERE wave_key = ?", (wave_key,)).fetchone()
+            is None
+        )
+
+    gw2 = _FakeGateway(
+        _snap(),
+        outcomes=[Outcome(status="REJECTED", broker_id=None, reason="VANTA_COOLDOWN_ACTIVE")],
+    )
+    res2 = ex.step(gw2, markets, _BASE_MS + 5_000, execute=True)
+    assert res2["status"] == "BLOCKED"
+    assert res2["reason"] == "BLOCKED_RATE_LIMITED:VANTA_COOLDOWN_ACTIVE"
+    assert [i["market"] for i in gw2.submitted] == ["ETH/USDT:USDT"]
+    assert res2["skipped"] == [{"symbol": "BTC/USDT:USDT", "reason": "INTENT_ALREADY_SUBMITTED"}]
+
+    gw3 = _FakeGateway(
+        _snap(),
+        outcomes=[Outcome(status="FILLED", broker_id="ord-eth")],
+    )
+    res3 = ex.step(gw3, markets, _BASE_MS + 65_000, execute=True)
+    assert res3["status"] == "EXECUTED"
+    assert [i["market"] for i in gw3.submitted] == ["ETH/USDT:USDT"]
+    assert res3["skipped"] == [{"symbol": "BTC/USDT:USDT", "reason": "INTENT_ALREADY_SUBMITTED"}]
+    assert ex.lookup_intent_id("ord-btc") == res1["results"][0]["intent_id"]
+    assert ex.lookup_intent_id("ord-eth") == res3["results"][0]["intent_id"]
+
+    with closing(sqlite3.connect(state_db)) as conn:
+        assert (
+            conn.execute("SELECT 1 FROM processed_waves WHERE wave_key = ?", (wave_key,)).fetchone()
+            is not None
+        )
+
+    _write_head(
+        source_db,
+        seq=747,
+        next_cp=_BASE_MS + 400_000,
+        positions_by_sid={
+            "ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "30"}],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    perm_wave_key, _, _ = load_cwsa_targets(source_db, ex._member_k)
+    gw_perm = _FakeGateway(
+        _snap(),
+        outcomes=[Outcome(status="REJECTED", broker_id=None, reason="HTTP_403:Daily loss limit exceeded")],
+    )
+    res_perm = ex.step(gw_perm, markets, _BASE_MS + 70_000, execute=True)
+    assert res_perm["status"] == "EXECUTED"
+    with closing(sqlite3.connect(state_db)) as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM processed_waves WHERE wave_key = ?", (perm_wave_key,)
+            ).fetchone()
+            is not None
+        )
+
+
+def test_hip3_dex_prefix_kpepe_scaling_long_symbol_intent_ids_and_lookup_intent_id(
+    tmp_path: Path,
+) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    markets = {
+        "BTC": MarketSpec(symbol="BTCUSDC", min_amount=Decimal("1e-8"), amount_step=Decimal("0")),
+        "xyz:GOLD": MarketSpec(
+            symbol="GOLDUSDC", min_amount=Decimal("1e-8"), amount_step=Decimal("0")
+        ),
+        "kPEPE": MarketSpec(
+            symbol="1000PEPEUSDC", min_amount=Decimal("1"), amount_step=Decimal("1")
+        ),
+        "BONK": MarketSpec(
+            symbol="1000BONKUSDC", min_amount=Decimal("1"), amount_step=Decimal("1")
+        ),
+        "AVALANCHE1": MarketSpec(
+            symbol="AVALANCHEUSDC1", min_amount=Decimal("0.01"), amount_step=Decimal("0.01")
+        ),
+        "AVALANCHE2": MarketSpec(
+            symbol="AVALANCHEUSDC2", min_amount=Decimal("0.01"), amount_step=Decimal("0.01")
+        ),
+    }
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.1"), "ACT08": Decimal("0"), "ACT09": Decimal("0")},
+        rulebook_key="vanta-trading:classic_1step_5pct:phase_1",
+        allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
+    )
+    assert ex.expected_initial == Decimal("5000")
+    _seed_empty_baseline(ex, source_db, markets)
+
+    _write_head(
+        source_db,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {"instrument": "hyperliquid/mainnet:perp:xyz/GOLD", "quantity": "5"},
+                {"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "1"},
+                {"instrument": "hyperliquid/mainnet:perp:default/kPEPE", "quantity": "20"},
+                {"instrument": "hyperliquid/mainnet:perp:default/BONK", "quantity": "10"},
+                {"instrument": "AVALANCHE1", "quantity": "10"},
+                {"instrument": "AVALANCHE2", "quantity": "20"},
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    wave_key, _, targets = load_cwsa_targets(source_db, ex._member_k)
+    assert targets["xyz:GOLD"] == Decimal("0.5")
+    assert targets["BTC"] == Decimal("0.1")
+
+    gw = _FakeGateway(_snap())
+    res = ex.step(gw, markets, _BASE_MS, execute=True)
+    assert res["status"] == "EXECUTED"
+    assert res["submitted"] == 6
+
+    by_market = {item["market"]: item for item in gw.submitted}
+    assert Decimal(by_market["GOLDUSDC"]["quantity"]) == Decimal("0.5")
+    assert Decimal(by_market["BTCUSDC"]["quantity"]) == Decimal("0.1")
+    assert Decimal(by_market["1000PEPEUSDC"]["quantity"]) == Decimal("2")
+    assert Decimal(by_market["1000BONKUSDC"]["quantity"]) == Decimal("1000")
+
+    id1 = by_market["AVALANCHEUSDC1"]["intent_id"]
+    id2 = by_market["AVALANCHEUSDC2"]["intent_id"]
+    assert id1 != id2
+    assert len(id1) <= 36
+    assert len(id2) <= 36
+    assert id1.startswith(f"hy-{wave_key[:12]}-")
+    assert id2.startswith(f"hy-{wave_key[:12]}-")
+
+    ex._record_intent_pending("i-older", "wk-x", "BTCUSDC", Decimal("0.1"), False, _BASE_MS + 1)
+    ex._update_intent_outcome("i-older", "ACCEPTED", "ord-shared", None, _BASE_MS + 2)
+    ex._record_intent_pending("i-newer", "wk-x", "BTCUSDC", Decimal("0.1"), False, _BASE_MS + 3)
+    ex._update_intent_outcome("i-newer", "ACCEPTED", "ord-shared", None, _BASE_MS + 4)
+    assert ex.lookup_intent_id("ord-shared") == "i-newer"
+    assert ex.lookup_intent_id("missing") is None
+    assert ex.lookup_intent_id("") is None
