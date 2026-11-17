@@ -399,3 +399,105 @@ def test_cli_k_json_reset_time_and_day_start_equity(tmp_path: Path, monkeypatch:
         == 0
     )
     assert captured[-1]["member_k"] == {"WALLET_C": Decimal("0.01")}
+
+
+def test_rulebook_scale_scales_vanta_10k_floors_and_cli_accepts_vanta_key_id_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    _write_head(source_db, seq=1, next_cp=_BASE_MS, positions_by_sid={"ACT04": [], "ACT08": [], "ACT09": []})
+
+    ex_daily = BybitCwsaExecutor(
+        state_db=tmp_path / "vanta_10k_daily.sqlite",
+        source_db=source_db,
+        member_k=TRIADA_HYDRO5K_K,
+        rulebook_key="vanta-trading:classic_1step_3pct:phase_1",
+        rulebook_scale=Decimal("2"),
+        reset_time_hhmm="00:00",
+    )
+    assert ex_daily.step(_FakeGateway(_snap(equity=Decimal("10000"))), _markets(), _BASE_MS, execute=False)[
+        "status"
+    ] == "SHADOW_DRY_RUN"
+    res_daily = ex_daily.step(_FakeGateway(_snap(equity=Decimal("9760"))), _markets(), _BASE_MS + 5_000, execute=False)
+    assert res_daily["status"] == "HALTED"
+    assert "HALT_DAILY_STOP" in res_daily["reason"]
+
+    ex_static = BybitCwsaExecutor(
+        state_db=tmp_path / "vanta_10k_static.sqlite",
+        source_db=source_db,
+        member_k=TRIADA_HYDRO5K_K,
+        rulebook_key="vanta-trading:classic_1step_3pct:phase_1",
+        rulebook_scale=Decimal("2"),
+        reset_time_hhmm="00:00",
+    )
+    res_static = ex_static.step(_FakeGateway(_snap(equity=Decimal("9500"))), _markets(), _BASE_MS, execute=False)
+    assert res_static["status"] == "HALTED"
+    assert "HALT_STATIC_DD" in res_static["reason"]
+
+    captured_cfg: list[dict[str, str]] = []
+
+    class _StubConfig:
+        def __init__(self, account_id: str, api_key: str, api_secret: str) -> None:
+            self.account_id = account_id
+            self.api_key = api_key
+            self.api_secret = api_secret
+            captured_cfg.append({"account_id": account_id, "api_key": api_key, "api_secret": api_secret})
+
+    class _StubClient:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+    class _StubGateway:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        def __enter__(self) -> _StubGateway:
+            return self
+
+        def __exit__(self, *_a: Any) -> None:
+            pass
+
+    connectors_pkg = ModuleType("connectors")
+    connectors_vanta = ModuleType("connectors.vanta")
+    connectors_vanta.VantaConfig = _StubConfig  # type: ignore[attr-defined]
+    connectors_vanta.VantaClient = _StubClient  # type: ignore[attr-defined]
+    connectors_vanta.VantaOrderClient = _StubClient  # type: ignore[attr-defined]
+    connectors_pkg.vanta = connectors_vanta  # type: ignore[attr-defined]
+
+    monkeypatch.delenv("VANTA_API_KEY", raising=False)
+    monkeypatch.delenv("VANTA_API_SECRET", raising=False)
+    monkeypatch.setenv("VANTA_ACCOUNT_ID", "6f1c2e34-9a4b-4c1d-8e2f-1a2b3c4d5e6f")
+    monkeypatch.setenv("VANTA_KEY_ID", "vk_test_id")
+    monkeypatch.setenv("VANTA_SECRET", "vks_test_secret")
+    monkeypatch.setitem(sys.modules, "connectors", connectors_pkg)
+    monkeypatch.setitem(sys.modules, "connectors.vanta", connectors_vanta)
+    monkeypatch.setattr("prop_production.vanta_gateway.VantaGateway", _StubGateway)
+    monkeypatch.setattr(bybit_executor, "_run_rest_poll_loop", lambda *_a, **_kw: 0)
+
+    markets_file = tmp_path / "markets.json"
+    markets_file.write_text('{"BTC": {"symbol": "BTCUSDC", "min_amount": "1e-8", "amount_step": "0"}}')
+    assert (
+        bybit_executor.main(
+            [
+                "--venue",
+                "vanta",
+                "--source-db",
+                str(source_db),
+                "--state-db",
+                str(tmp_path / "cli_vanta.sqlite"),
+                "--markets-json",
+                str(markets_file),
+                "--reset-time-hhmm",
+                "00:00",
+                "--once",
+            ]
+        )
+        == 0
+    )
+    assert captured_cfg == [
+        {
+            "account_id": "6f1c2e34-9a4b-4c1d-8e2f-1a2b3c4d5e6f",
+            "api_key": "vk_test_id",
+            "api_secret": "vks_test_secret",
+        }
+    ]
