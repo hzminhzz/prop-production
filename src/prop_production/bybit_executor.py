@@ -189,9 +189,12 @@ class BybitCwsaExecutor:
         jitter_seed: str | None = None,
         reset_time_hhmm: str | None = None,
         day_start_equity_usd: Decimal | None = None,
+        rulebook_scale: Decimal = Decimal("1"),
     ) -> None:
         if not min_trade_notional_usd.is_finite() or min_trade_notional_usd < _ZERO:
             raise ValueError("INVALID_MIN_TRADE_NOTIONAL")
+        if not rulebook_scale.is_finite() or rulebook_scale <= _ZERO:
+            raise ValueError("INVALID_RULEBOOK_SCALE")
         if jitter_min_seconds < 0 or jitter_max_seconds < jitter_min_seconds:
             raise ValueError("INVALID_JITTER_RANGE")
         jitter_max_ms = jitter_max_seconds * 1000
@@ -214,13 +217,14 @@ class BybitCwsaExecutor:
             raise ValueError("INVALID_DAY_START_EQUITY")
         self._reset_time_hhmm = effective_reset
         self._day_start_equity_override = day_start_equity_usd
-        self._initial = decimal(self._spec.initial)
-        self._trailing_loss = decimal(self._spec.trailing_loss)
+        self._rulebook_scale = rulebook_scale
+        self._initial = decimal(self._spec.initial) * rulebook_scale
+        self._trailing_loss = decimal(self._spec.trailing_loss) * rulebook_scale
         self._static_floor = self._initial - self._trailing_loss
         self._internal_daily_stop = (
             internal_daily_stop_usd
             if internal_daily_stop_usd is not None
-            else decimal(self._spec.daily_loss) * Decimal("0.8")
+            else decimal(self._spec.daily_loss) * rulebook_scale * Decimal("0.8")
         )
         self._max_source_lag_ms = max_source_lag_ms
         self._allow_rest_reconciliation = allow_rest_reconciliation
@@ -478,6 +482,20 @@ class BybitCwsaExecutor:
                 "WHERE intent_id = ?",
                 (status, broker_id, reason, now_ms, intent_id),
             )
+
+    def lookup_broker_id(self, intent_id: str) -> str | None:
+        """Return persisted broker_id for intent_id from order_intents, if present."""
+        key = str(intent_id or "").strip()
+        if not key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT broker_id FROM order_intents WHERE intent_id = ?", (key,)
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        broker_id = str(row[0]).strip()
+        return broker_id or None
 
     def _unresolved_intent(self) -> tuple[str, str, str] | None:
         with self._connect() as conn:
@@ -910,10 +928,14 @@ def _load_k_json(source: Path | str) -> dict[str, Decimal]:
 
 
 def _executor_from_args(
-    args: argparse.Namespace, *, allow_rest_reconciliation: bool
+    args: argparse.Namespace,
+    *,
+    allow_rest_reconciliation: bool,
+    default_reset_time_hhmm: str | None = None,
 ) -> BybitCwsaExecutor:
     member_k = _load_k_json(args.k_json) if args.k_json is not None else TRIADA_HYDRO5K_K
     day_start = decimal(args.day_start_equity) if args.day_start_equity is not None else None
+    reset_hhmm = args.reset_time_hhmm if args.reset_time_hhmm is not None else default_reset_time_hhmm
     return BybitCwsaExecutor(
         state_db=args.state_db,
         source_db=args.source_db,
@@ -923,8 +945,9 @@ def _executor_from_args(
         min_trade_notional_usd=decimal(args.min_trade_notional_usd),
         jitter_min_seconds=args.jitter_min_seconds,
         jitter_max_seconds=args.jitter_max_seconds,
-        reset_time_hhmm=args.reset_time_hhmm,
+        reset_time_hhmm=reset_hhmm,
         day_start_equity_usd=day_start,
+        rulebook_scale=decimal(args.rulebook_scale),
     )
 
 
@@ -960,6 +983,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--venue", choices=("bybit", "propr", "vanta"), default="bybit")
     parser.add_argument("--rulebook-key", default="hyrotrader:two_step:phase_1")
+    parser.add_argument("--rulebook-scale", default="1")
     parser.add_argument("--env-prefix", default="BYBIT_HYDRO")
     parser.add_argument("--propr-account-id", default=None)
     parser.add_argument("--vanta-account-id", default=None)
@@ -1009,15 +1033,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.venue == "vanta":
         from connectors.vanta import VantaClient, VantaConfig, VantaOrderClient
 
-        from .vanta_gateway import VANTA_API_URL, VantaGateway
+        from .vanta_gateway import VANTA_API_URL, VantaGateway, is_transient_vanta_read_error
 
         account_id = (args.vanta_account_id or os.environ.get("VANTA_ACCOUNT_ID", "")).strip()
         if not account_id:
             raise ValueError("VANTA_ACCOUNT_ID_REQUIRED")
+        api_key = os.environ.get("VANTA_API_KEY", "").strip() or os.environ.get("VANTA_KEY_ID", "").strip()
+        api_secret = (
+            os.environ.get("VANTA_API_SECRET", "").strip() or os.environ.get("VANTA_SECRET", "").strip()
+        )
+        if not api_key or not api_secret:
+            raise ValueError("VANTA_CREDENTIALS_REQUIRED")
         cfg = VantaConfig(
             account_id=account_id,
-            api_key=os.environ["VANTA_API_KEY"],
-            api_secret=os.environ["VANTA_API_SECRET"],
+            api_key=api_key,
+            api_secret=api_secret,
         )
         client = VantaClient(cfg)
         vanta_order_client = (
@@ -1025,9 +1055,39 @@ def main(argv: list[str] | None = None) -> int:
             if args.execute
             else None
         )
-        executor = _executor_from_args(args, allow_rest_reconciliation=True)
-        with VantaGateway(client, account_id=account_id, endpoint=VANTA_API_URL, order_client=vanta_order_client) as gateway:
-            markets = _load_markets_json(args.markets_json) if args.markets_json else gateway.load_markets()
+        executor = _executor_from_args(
+            args, allow_rest_reconciliation=True, default_reset_time_hhmm="00:00"
+        )
+        with VantaGateway(
+            client,
+            account_id=account_id,
+            endpoint=VANTA_API_URL,
+            order_client=vanta_order_client,
+            expected_account_size=executor._initial,
+            broker_id_lookup=executor.lookup_broker_id,
+        ) as gateway:
+            if args.markets_json:
+                markets = _load_markets_json(args.markets_json)
+            else:
+                while True:
+                    try:
+                        markets = gateway.load_markets()
+                        break
+                    except Exception as exc:
+                        if args.once or not is_transient_vanta_read_error(exc):
+                            raise
+                        print(
+                            json.dumps(
+                                {
+                                    "status": "BLOCKED",
+                                    "reason": f"VANTA_MARKETS_UNAVAILABLE:{type(exc).__name__}",
+                                    "submitted": 0,
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                        time.sleep(args.poll_seconds)
             return _run_rest_poll_loop(
                 executor, gateway, markets, execute=args.execute, once=args.once, poll_seconds=args.poll_seconds
             )

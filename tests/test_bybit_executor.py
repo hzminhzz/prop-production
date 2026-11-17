@@ -501,3 +501,149 @@ def test_rulebook_scale_scales_vanta_10k_floors_and_cli_accepts_vanta_key_id_env
             "api_secret": "vks_test_secret",
         }
     ]
+
+
+def test_cli_vanta_omitted_reset_time_and_rulebook_scale_and_market_load_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    _write_head(source_db, seq=1, next_cp=_BASE_MS, positions_by_sid={"ACT04": [], "ACT08": [], "ACT09": []})
+
+    captured_executors: list[BybitCwsaExecutor] = []
+    captured_gw_kwargs: list[dict[str, Any]] = []
+    load_attempts = 0
+    sleep_calls: list[int] = []
+
+    class _TransientError(RuntimeError):
+        status_code = 503
+
+    class _FatalAuthError(RuntimeError):
+        status_code = 401
+
+    class _StubConfig:
+        def __init__(self, account_id: str, api_key: str, api_secret: str) -> None:
+            self.account_id = account_id
+            self.api_key = api_key
+            self.api_secret = api_secret
+
+    class _StubClient:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+    class _StubGateway:
+        def __init__(self, *_a: Any, **kw: Any) -> None:
+            captured_gw_kwargs.append(kw)
+
+        def __enter__(self) -> _StubGateway:
+            return self
+
+        def __exit__(self, *_a: Any) -> None:
+            pass
+
+        def load_markets(self) -> dict[str, MarketSpec]:
+            nonlocal load_attempts
+            load_attempts += 1
+            if load_attempts == 1:
+                raise _TransientError("validator down")
+            if load_attempts == 99:
+                raise _FatalAuthError("bad key")
+            return {"BTC": MarketSpec(symbol="BTCUSDC", min_amount=Decimal("1e-8"), amount_step=Decimal("0"))}
+
+    connectors_pkg = ModuleType("connectors")
+    connectors_vanta = ModuleType("connectors.vanta")
+    connectors_vanta.VantaConfig = _StubConfig  # type: ignore[attr-defined]
+    connectors_vanta.VantaClient = _StubClient  # type: ignore[attr-defined]
+    connectors_vanta.VantaOrderClient = _StubClient  # type: ignore[attr-defined]
+    connectors_pkg.vanta = connectors_vanta  # type: ignore[attr-defined]
+
+    monkeypatch.setenv("VANTA_ACCOUNT_ID", "6f1c2e34-9a4b-4c1d-8e2f-1a2b3c4d5e6f")
+    monkeypatch.setenv("VANTA_API_KEY", "vk_test_id")
+    monkeypatch.setenv("VANTA_API_SECRET", "vks_test_secret")
+    monkeypatch.setitem(sys.modules, "connectors", connectors_pkg)
+    monkeypatch.setitem(sys.modules, "connectors.vanta", connectors_vanta)
+    monkeypatch.setattr("prop_production.vanta_gateway.VantaGateway", _StubGateway)
+    monkeypatch.setattr(bybit_executor.time, "sleep", lambda s: sleep_calls.append(int(s)))
+
+    def _fake_loop(executor: BybitCwsaExecutor, *_a: Any, **_kw: Any) -> int:
+        captured_executors.append(executor)
+        return 0
+
+    monkeypatch.setattr(bybit_executor, "_run_rest_poll_loop", _fake_loop)
+
+    assert (
+        bybit_executor.main(
+            [
+                "--venue",
+                "vanta",
+                "--rulebook-key",
+                "vanta-trading:classic_1step_3pct:phase_1",
+                "--rulebook-scale",
+                "2",
+                "--source-db",
+                str(source_db),
+                "--state-db",
+                str(tmp_path / "cli_vanta_scale2.sqlite"),
+                "--poll-seconds",
+                "7",
+            ]
+        )
+        == 0
+    )
+    assert len(captured_executors) == 1
+    assert captured_executors[0]._reset_time_hhmm == "00:00"
+    assert captured_executors[0]._initial == Decimal("10000")
+    assert captured_gw_kwargs[-1]["expected_account_size"] == Decimal("10000")
+    assert callable(captured_gw_kwargs[-1]["broker_id_lookup"])
+    assert load_attempts == 2
+    assert sleep_calls == [7]
+
+    # --once fails loudly on transient load_markets error
+    load_attempts = 0
+    with pytest.raises(_TransientError):
+        bybit_executor.main(
+            [
+                "--venue",
+                "vanta",
+                "--rulebook-key",
+                "vanta-trading:classic_1step_3pct:phase_1",
+                "--source-db",
+                str(source_db),
+                "--state-db",
+                str(tmp_path / "cli_vanta_once_err.sqlite"),
+                "--once",
+            ]
+        )
+
+    # daemon fails loudly on fatal auth error without sleeping
+    load_attempts = 98
+    sleep_calls.clear()
+    with pytest.raises(_FatalAuthError):
+        bybit_executor.main(
+            [
+                "--venue",
+                "vanta",
+                "--rulebook-key",
+                "vanta-trading:classic_1step_3pct:phase_1",
+                "--source-db",
+                str(source_db),
+                "--state-db",
+                str(tmp_path / "cli_vanta_auth_err.sqlite"),
+            ]
+        )
+    assert sleep_calls == []
+
+    # Empty credentials fail closed
+    monkeypatch.setenv("VANTA_API_KEY", "")
+    monkeypatch.delenv("VANTA_KEY_ID", raising=False)
+    with pytest.raises(ValueError, match="VANTA_CREDENTIALS_REQUIRED"):
+        bybit_executor.main(
+            [
+                "--venue",
+                "vanta",
+                "--source-db",
+                str(source_db),
+                "--state-db",
+                str(tmp_path / "cli_vanta_nocred.sqlite"),
+                "--once",
+            ]
+        )

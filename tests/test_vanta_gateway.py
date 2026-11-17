@@ -511,3 +511,184 @@ def test_vanta_gateway_uses_flat_on_full_close_and_persists_cancel_across_restar
         assert cancel_out == Outcome(status="CANCELLED", broker_id="ord-persisted")
         assert posted[-1]["execution_type"] == "LIMIT_CANCEL"
         assert posted[-1]["order_uuid"] == "ord-persisted"
+
+
+def test_vanta_gateway_limit_orders_binding_cap_cancel_errors_and_paused_identity(tmp_path: Path) -> None:
+    httpx = pytest.importorskip("httpx")
+    vanta_mod = pytest.importorskip("connectors.vanta")
+    VantaAuthenticationError = vanta_mod.VantaAuthenticationError
+    VantaClient = vanta_mod.VantaClient
+    VantaConfig = vanta_mod.VantaConfig
+    VantaOrderClient = vanta_mod.VantaOrderClient
+
+    account_id = "6f1c2e34-9a4b-4c1d-8e2f-1a2b3c4d5e6f"
+    cfg = VantaConfig(account_id=account_id, api_key="vk_test_id", api_secret="vks_test_secret")
+    now_ms = 1794683600000
+    state: dict[str, Any] = {
+        "cancel_mode": "404",
+        "key_status": 200,
+        "paused_until": None,
+        "orders": [],
+        "posted": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET":
+            if path == "/api/v1/keys/self":
+                if state["key_status"] != 200:
+                    return httpx.Response(state["key_status"], json={"error": "unauthorized"})
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "keyId": cfg.api_key,
+                            "accountId": account_id,
+                            "orderPlacementPausedUntil": state["paused_until"],
+                        },
+                    },
+                )
+            if path == "/api/v1/trading/account":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "accountId": account_id,
+                            "evaluation": {"isEliminated": False},
+                            "account": {"currentBalance": 5000, "currentEquity": 5000, "openPnL": 0, "capitalUsed": 0},
+                            "meta": {"generatedAtMs": 1794683599000, "stale": False},
+                        },
+                    },
+                )
+            if path == "/api/v1/trading/positions":
+                return httpx.Response(200, json={"success": True, "data": []})
+            if path == "/api/v1/trading/orders":
+                return httpx.Response(200, json={"success": True, "data": state["orders"]})
+        elif request.method == "POST" and path == "/api/v1/trading/orders":
+            trade = json.loads(request.content)["trade"]
+            state["posted"].append(trade)
+            if trade["execution_type"] == "LIMIT_CANCEL":
+                mode = state["cancel_mode"]
+                if mode == "404":
+                    return httpx.Response(404, json={"error": "order_not_found"})
+                if mode == "403":
+                    return httpx.Response(403, json={"error": "forbidden"})
+                if mode == "503":
+                    return httpx.Response(503, json={"error": "unavailable"})
+                return httpx.Response(200, json={"success": True, "data": {"success": True}})
+            if trade["execution_type"] == "LIMIT":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "success": True,
+                            "order_uuid": "ord-lim-1",
+                            "order": {"orderUuid": "ord-lim-1", "filled": False},
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "success": True,
+                        "order_uuid": "ord-mkt-cap",
+                        "order": {"orderUuid": "ord-mkt-cap", "filled": True, "bindingCap": "CRYPTO_LEVERAGE"},
+                    },
+                },
+            )
+        raise AssertionError(f"Unexpected {request.method} {path}")
+
+    transport = httpx.MockTransport(handler)
+    client = VantaClient(cfg, transport=transport)
+    order_client = VantaOrderClient(cfg, confirm_account_id=account_id, allow_execution=True, transport=transport)
+
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    _write_cwsa_db(source_db, seq=1, next_cp=now_ms, positions_by_sid={"ACT04": []})
+    ex = CwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001")},
+        rulebook_key="vanta-trading:classic_1step_5pct:phase_1",
+        allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
+    )
+
+    with VantaGateway(
+        client,
+        account_id=account_id,
+        order_client=order_client,
+        broker_id_lookup=ex.lookup_broker_id,
+    ) as gw:
+        lim_out = gw.submit(
+            {
+                "intent_id": "i-lim-1",
+                "market": "BTCUSDC",
+                "quantity": "0.01",
+                "order_type": "limit",
+                "limit_price": "50000",
+            }
+        )
+        assert lim_out == Outcome(status="ACCEPTED", broker_id="ord-lim-1")
+        assert state["posted"][-1]["execution_type"] == "LIMIT"
+        assert state["posted"][-1]["limit_price"] == 50000
+
+        state["orders"] = [
+            {
+                "orderUuid": "ord-lim-1",
+                "tradePair": "BTCUSDC",
+                "orderType": "LONG",
+                "executionType": "BRACKET",
+                "value": 500,
+                "limitPrice": 50000,
+            }
+        ]
+        snap = gw.observe(now_ms)
+        assert len(snap.orders) == 1
+        assert snap.orders[0].intent_id == "i-lim-1"
+        assert snap.orders[0].quantity == Decimal("0.01")
+        assert snap.orders[0].reduce_only is True
+
+        cap_out = gw.submit({"intent_id": "i-cap-1", "market": "BTCUSDC", "quantity": "0.02"})
+        assert cap_out == Outcome(status="FILLED", broker_id="ord-mkt-cap", reason="BINDING_CAP:CRYPTO_LEVERAGE")
+
+        state["cancel_mode"] = "404"
+        assert gw.cancel("i-lim-1") == Outcome(status="UNKNOWN", broker_id="ord-lim-1", reason="ORDER_NOT_FOUND")
+        state["cancel_mode"] = "403"
+        assert gw.cancel("i-lim-1").status == "REJECTED"
+        state["cancel_mode"] = "503"
+        assert gw.cancel("i-lim-1") == Outcome(
+            status="UNKNOWN", broker_id="ord-lim-1", reason="CANCEL_AMBIGUOUS:VantaServerError"
+        )
+
+    # Cached orderPlacementPausedUntil blocks submits without network call
+    state["paused_until"] = "2099-01-01T00:00:00.000Z"
+    client_paused = VantaClient(cfg, transport=transport)
+    order_client_paused = VantaOrderClient(
+        cfg, confirm_account_id=account_id, allow_execution=True, transport=transport
+    )
+    with VantaGateway(client_paused, account_id=account_id, order_client=order_client_paused) as gw_paused:
+        gw_paused.observe(now_ms)
+        posts_before = len(state["posted"])
+        assert gw_paused.submit({"intent_id": "i-paused", "market": "BTCUSDC", "quantity": "0.01"}) == Outcome(
+            status="REJECTED", reason="VANTA_COOLDOWN_ACTIVE"
+        )
+        assert len(state["posted"]) == posts_before
+
+    # Fatal auth errors on observe are never swallowed
+    state["key_status"] = 401
+    client_auth = VantaClient(cfg, transport=transport)
+    with VantaGateway(client_auth, account_id=account_id) as gw_auth:
+        with pytest.raises(VantaAuthenticationError):
+            gw_auth.observe(now_ms)
+
+    # Executor lookup_broker_id returns persisted broker_id
+    ex._record_intent_pending("i-db", "wk-1", "BTCUSDC", Decimal("0.01"), False, now_ms)
+    ex._update_intent_outcome("i-db", "ACCEPTED", "ord-from-db", None, now_ms)
+    assert ex.lookup_broker_id("i-db") == "ord-from-db"
+    assert ex.lookup_broker_id("missing") is None
