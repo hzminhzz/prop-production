@@ -392,6 +392,168 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
         )
         assert rejected.status == "REJECTED"
 
+        # IOC Cancelled with partial fill -> CANCELLED with IOC_PARTIAL_FILL:<qty>
+        ex_exec.create_order = AsyncMock(
+            return_value={
+                "id": "ord-ioc-partial",
+                "clientOrderId": "intent-45",
+                "symbol": "BTC/USDT:USDT",
+                "side": "buy",
+                "type": "limit",
+                "price": 50000.0,
+                "amount": 0.1,
+                "filled": 0.04,
+                "status": "canceled",
+                "reduceOnly": False,
+                "timestamp": 1_700_000_005_600,
+                "info": {"orderStatus": "Cancelled", "cumExecQty": "0.04", "positionIdx": "0"},
+            }
+        )
+        ioc_partial = gateway.submit(
+            {"intent_id": "intent-45", "market": "BTC/USDT:USDT", "quantity": "0.1", "price": "50000.0", "reduce_only": False}
+        )
+        assert ioc_partial.status == "CANCELLED"
+        assert ioc_partial.broker_id == "ord-ioc-partial"
+        assert ioc_partial.reason == "IOC_PARTIAL_FILL:0.04"
+
+        # IOC Cancelled with zero fill -> CANCELLED with IOC_ZERO_FILL
+        ex_exec.create_order = AsyncMock(
+            return_value={
+                "id": "ord-ioc-zero",
+                "clientOrderId": "intent-46",
+                "symbol": "BTC/USDT:USDT",
+                "side": "buy",
+                "type": "limit",
+                "price": 50000.0,
+                "amount": 0.1,
+                "filled": 0.0,
+                "status": "canceled",
+                "reduceOnly": False,
+                "timestamp": 1_700_000_005_700,
+                "info": {"orderStatus": "Cancelled", "cumExecQty": "0", "positionIdx": "0"},
+            }
+        )
+        ioc_zero = gateway.submit(
+            {"intent_id": "intent-46", "market": "BTC/USDT:USDT", "quantity": "0.1", "price": "50000.0", "reduce_only": False}
+        )
+        assert ioc_zero.status == "CANCELLED"
+        assert ioc_zero.broker_id == "ord-ioc-zero"
+        assert ioc_zero.reason == "IOC_ZERO_FILL"
+
+        # False Filled qty mismatch -> UNKNOWN
+        ex_exec.create_order = AsyncMock(
+            return_value={
+                "id": "ord-false-fill",
+                "clientOrderId": "intent-47",
+                "symbol": "BTC/USDT:USDT",
+                "side": "buy",
+                "type": "market",
+                "amount": 0.1,
+                "filled": 0.05,
+                "status": "closed",
+                "reduceOnly": False,
+                "timestamp": 1_700_000_005_800,
+                "info": {"orderStatus": "Filled", "cumExecQty": "0.05", "positionIdx": "0"},
+            }
+        )
+        false_fill = gateway.submit(
+            {"intent_id": "intent-47", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False}
+        )
+        assert false_fill.status == "UNKNOWN"
+        assert false_fill.broker_id == "ord-false-fill"
+        assert false_fill.reason == "FALSE_FILLED_QTY_MISMATCH"
+
+        from types import SimpleNamespace
+
+        # Filled status with missing filled_quantity must fail closed as UNKNOWN.
+        ex_exec.create_order = AsyncMock(
+            return_value=SimpleNamespace(order_id="ord-none-fill", status="filled", filled_quantity=None)
+        )
+        orig_create = exec_client.create_order
+        exec_client.create_order = ex_exec.create_order  # type: ignore[method-assign]
+        try:
+            none_fill = gateway.submit(
+                {"intent_id": "intent-48", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False}
+            )
+            assert none_fill.status == "UNKNOWN"
+            assert none_fill.broker_id == "ord-none-fill"
+            assert none_fill.reason == "INVALID_FILLED_QTY"
+        finally:
+            exec_client.create_order = orig_create  # type: ignore[method-assign]
+
+        # Rejected status with positive filled_quantity must fail closed as UNKNOWN.
+        ex_exec.create_order = AsyncMock(
+            return_value={
+                "id": "ord-rej-filled",
+                "clientOrderId": "intent-49",
+                "symbol": "BTC/USDT:USDT",
+                "side": "buy",
+                "type": "market",
+                "amount": 0.1,
+                "filled": 0.02,
+                "status": "rejected",
+                "reduceOnly": False,
+                "timestamp": 1_700_000_005_900,
+                "info": {"orderStatus": "Rejected", "cumExecQty": "0.02", "positionIdx": "0"},
+            }
+        )
+        rej_filled = gateway.submit(
+            {"intent_id": "intent-49", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False}
+        )
+        assert rej_filled.status == "UNKNOWN"
+        assert rej_filled.broker_id == "ord-rej-filled"
+        assert rej_filled.reason == "REJECTED_WITH_ACTUAL_EXECUTIONS"
+
+
+def test_ccxt_hedge_mode_order_fails_closed() -> None:
+    import asyncio
+
+    BybitClient, _, _, _, _, (_, BybitDemoReconciler) = _connector_symbols()
+    from connectors.bybit.models import BybitSnapshotError
+
+    ex = _mock_rest_exchange()
+
+    async def _hedge_orders(*, params: dict[str, Any]) -> list[dict[str, Any]]:
+        if params.get("subType") == "linear" and params.get("settleCoin") == "USDT":
+            return [
+                {
+                    "id": "ord-hedge-1",
+                    "clientOrderId": "intent-hedge-1",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "buy",
+                    "type": "limit",
+                    "price": 50000.0,
+                    "amount": 0.1,
+                    "filled": 0.0,
+                    "status": "open",
+                    "reduceOnly": False,
+                    "timestamp": 1_700_000_002_000,
+                    "info": {
+                        "orderId": "ord-hedge-1",
+                        "orderLinkId": "intent-hedge-1",
+                        "symbol": "BTCUSDT",
+                        "side": "Buy",
+                        "orderType": "Limit",
+                        "price": "50000.0",
+                        "qty": "0.1",
+                        "cumExecQty": "0",
+                        "orderStatus": "New",
+                        "reduceOnly": False,
+                        "positionIdx": "1",
+                    },
+                }
+            ]
+        return []
+
+    ex.fetch_open_orders = AsyncMock(side_effect=_hedge_orders)
+    client = BybitClient(_demo_config(), exchange=ex)
+    reconciler = BybitDemoReconciler(client, ws_exchange=_mock_ws_exchange(), now_ms_fn=lambda: 1_700_000_005_100)
+    with pytest.raises(BybitSnapshotError, match="demo_orders_ccxt: hedge mode order unsupported"):
+        asyncio.run(reconciler.catch_up())
+    snap = reconciler.snapshot()
+    assert snap.connected is False
+    assert "CATCH_UP_FAILED:BybitSnapshotError" in snap.uncertainty_reasons
+
 
 def test_guardian_reconciles_coherent_with_bybit_demo_gateway_and_halts_when_stale(tmp_path: Any) -> None:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey

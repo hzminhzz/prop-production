@@ -126,8 +126,12 @@ class ReleaseVerifier:
     ) -> VerifiedRelease:
         original = verify(envelope, self.key, self.authority)
         p = original
-        if p.get("schema") == PORTFOLIO_RELEASE_V2:
+        if original.get("schema") == PORTFOLIO_RELEASE_V2:
             p = verify_release_contract(p, self.key.public_bytes_raw())
+            if type(now_ms) is not int or any(
+                m["effective_until_ms"] <= now_ms for m in original["mandates"]
+            ):
+                raise ValueError("EXPIRED_OR_FUTURE_RELEASE")
         required = {
             "schema",
             "generation",
@@ -445,7 +449,10 @@ def validate_release_binding(previous: dict[str, Any], current: dict[str, Any], 
                 "pod_fees_paid",
                 "pod_realized",
                 "pod_loss_used",
+                "pod_funding",
+                "funding_events",
                 "checkpoint_basis",
+                "checkpoint_funding_allocations",
             )
         ):
             raise ValueError("MANDATE_RELEASE_MUTATED_OBLIGATIONS")

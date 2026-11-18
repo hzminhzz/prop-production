@@ -10,7 +10,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .checkpoint_accounting import add, apply_fill
+from .checkpoint_accounting import add, apply_fill, apply_funding
 from .checkpoint_admission import prepare_reserve, prepare_review
 from .checkpoint_risk import loss_limit
 from .contracts import (
@@ -33,7 +33,7 @@ from .copy_mandates import (
 )
 from .evidence import canonical, decimal, digest, load_json
 from .finance import Rulebook, account_step
-from .gateway import BrokerGateway, BrokerOrder, BrokerSnapshot
+from .gateway import BrokerGateway, BrokerOrder, BrokerSnapshot, Execution, FundingEvent
 from .guardian_protection import prepare_protective_reduction
 from .journal import Journal, State, StorageUnavailable
 from .planner import compile_pods, validate_quotes
@@ -815,7 +815,14 @@ class Guardian:
         try:
             outcome = self.gateway.submit(wire)
             self._boundary("after_send")
-            if outcome.status not in {"ACCEPTED", "FILLED", "PARTIAL", "REJECTED"}:
+            if outcome.status not in {
+                "ACCEPTED",
+                "FILLED",
+                "PARTIAL",
+                "REJECTED",
+                "CANCELLED",
+                "EXPIRED",
+            }:
                 raise TimeoutError("OUTCOME_NOT_DEFINITIVE")
         except (TimeoutError, ConnectionError, OSError):
 
@@ -899,6 +906,7 @@ class Guardian:
             marks[position.market] = position.mark_price
         new_fees = ZERO
         new_realized = ZERO
+        new_funding = ZERO
         # Charge every adverse move; gains never refill a pod budget during the day.
         for pod, book in state["pod_positions"].items():
             adverse = sum(
@@ -914,90 +922,136 @@ class Guardian:
             # Broker cash belongs to the account; charging the full debit to
             # every pod would double-count common fees and funding.
             used[pod] = str(decimal(used.get(pod, "0")) + adverse)
-        for fill in sorted(snapshot.fills, key=lambda f: (f.known_at_ms, f.execution_id)):
-            body = {
-                "execution_id": fill.execution_id,
-                "intent_id": fill.intent_id,
-                "market": fill.market,
-                "quantity": str(fill.quantity),
-                "price": str(fill.price),
-                "fee": str(fill.fee),
-                "known_at_ms": fill.known_at_ms,
-            }
-            prior = state["fills"].get(fill.execution_id)
-            if prior:
-                if prior != body:
-                    errors.append("FILL_ID_CONFLICT")
-                continue
-            intent = state["intents"].get(fill.intent_id)
-            if intent is None:
-                errors.append("ORPHAN_FILL")
-                continue
-            previous_filled = decimal(intent["filled"])
-            total = previous_filled + fill.quantity
-            if (
-                fill.market != intent["market"]
-                or fill.quantity * decimal(intent["quantity"]) <= 0
-                or abs(total) > abs(decimal(intent["quantity"]))
-                or fill.price <= 0
-                or fill.fee < 0
-                or fill.known_at_ms > snapshot.observed_at_ms
-            ):
-                errors.append("FILL_INCONSISTENT")
-                continue
-            changes = {
-                pod: decimal(change) for pod, change in intent.get("pod_changes", {}).items()
-            }
-            gross_changes = sum((abs(change) for change in changes.values()), ZERO)
-            if (
-                not changes
-                or not gross_changes
-                or sum(changes.values(), ZERO) != decimal(intent["quantity"])
-            ):
-                errors.append("POD_FILL_ALLOCATION_INVALID")
-                continue
-            before_quantity = decimal(state["positions"].get(fill.market, "0"))
-            if (
-                before_quantity * fill.quantity < 0
-                and intent.get("checkpoint_policy") != CHECKPOINT_POLICY_V3
-            ):
-                # Realized PnL needs independently confirmed pod entry basis.
-                errors.append("POD_REALIZED_ATTRIBUTION_UNVERIFIED")
-            new_fees += fill.fee
-            intent["filled"] = str(total)
-            state["fills"][fill.execution_id] = body
-            state["positions"][fill.market] = str(
-                decimal(state["positions"].get(fill.market, "0")) + fill.quantity
+        timeline: list[tuple[int, int, str, Execution | FundingEvent]] = [
+            (f.known_at_ms, 0, f.execution_id, f) for f in snapshot.fills
+        ]
+        if snapshot.funding_events:
+            timeline.extend(
+                (e.known_at_ms, 1, e.funding_id, e) for e in snapshot.funding_events
             )
-            if intent.get("checkpoint_policy") == CHECKPOINT_POLICY_V3:
-                effects = apply_fill(
-                    state, body, previous_filled=previous_filled, before_quantity=before_quantity
+        timeline.sort(key=lambda item: (item[0], item[1], item[2]))
+        for _ts, _rank, _item_id, item in timeline:
+            if isinstance(item, Execution):
+                fill = item
+                body = {
+                    "execution_id": fill.execution_id,
+                    "intent_id": fill.intent_id,
+                    "market": fill.market,
+                    "quantity": str(fill.quantity),
+                    "price": str(fill.price),
+                    "fee": str(fill.fee),
+                    "known_at_ms": fill.known_at_ms,
+                }
+                prior = state["fills"].get(fill.execution_id)
+                if prior:
+                    if prior != body:
+                        errors.append("FILL_ID_CONFLICT")
+                    continue
+                intent = state["intents"].get(fill.intent_id)
+                if intent is None:
+                    errors.append("ORPHAN_FILL")
+                    continue
+                previous_filled = decimal(intent["filled"])
+                total = previous_filled + fill.quantity
+                if (
+                    fill.market != intent["market"]
+                    or fill.quantity * decimal(intent["quantity"]) <= 0
+                    or abs(total) > abs(decimal(intent["quantity"]))
+                    or fill.price <= 0
+                    or fill.fee < 0
+                    or fill.known_at_ms > snapshot.observed_at_ms
+                ):
+                    errors.append("FILL_INCONSISTENT")
+                    continue
+                changes = {
+                    pod: decimal(change) for pod, change in intent.get("pod_changes", {}).items()
+                }
+                gross_changes = sum((abs(change) for change in changes.values()), ZERO)
+                if (
+                    not changes
+                    or not gross_changes
+                    or sum(changes.values(), ZERO) != decimal(intent["quantity"])
+                ):
+                    errors.append("POD_FILL_ALLOCATION_INVALID")
+                    continue
+                before_quantity = decimal(state["positions"].get(fill.market, "0"))
+                if (
+                    before_quantity * fill.quantity < 0
+                    and intent.get("checkpoint_policy") != CHECKPOINT_POLICY_V3
+                ):
+                    # Realized PnL needs independently confirmed pod entry basis.
+                    errors.append("POD_REALIZED_ATTRIBUTION_UNVERIFIED")
+                new_fees += fill.fee
+                intent["filled"] = str(total)
+                state["fills"][fill.execution_id] = body
+                state["positions"][fill.market] = str(
+                    decimal(state["positions"].get(fill.market, "0")) + fill.quantity
                 )
-                new_realized = add(
-                    new_realized, *(decimal(e["realized"]) for e in effects.values())
-                )
-                for pod, effect in effects.items():
-                    allocated = decimal(effect["quantity"])
+                if intent.get("checkpoint_policy") == CHECKPOINT_POLICY_V3:
+                    effects = apply_fill(
+                        state,
+                        body,
+                        previous_filled=previous_filled,
+                        before_quantity=before_quantity,
+                    )
+                    new_realized = add(
+                        new_realized, *(decimal(e["realized"]) for e in effects.values())
+                    )
+                    for pod, effect in effects.items():
+                        allocated = decimal(effect["quantity"])
+                        execution_loss = max(
+                            ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price)
+                        )
+                        used[pod] = str(
+                            add(decimal(used.get(pod, "0")), decimal(effect["fee"]), execution_loss)
+                        )
+                    continue
+                for pod, change in changes.items():
+                    book = state["pod_positions"].setdefault(pod, {})
+                    allocated = change * fill.quantity / decimal(intent["quantity"])
+                    book[fill.market] = str(decimal(book.get(fill.market, "0")) + allocated)
+                    # Gross allocation shares conserve the real broker fee even when
+                    # two pods oppose one another and the net order is much smaller.
+                    fee = fill.fee * abs(change) / gross_changes
+                    pod_fees = state.setdefault("pod_fees_paid", {})
+                    pod_fees[pod] = str(decimal(pod_fees.get(pod, "0")) + fee)
                     execution_loss = max(
                         ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price)
                     )
+                    used[pod] = str(decimal(used.get(pod, "0")) + fee + execution_loss)
+            else:
+                ev = item
+                body = {
+                    "funding_id": ev.funding_id,
+                    "market": ev.market,
+                    "amount": str(ev.amount),
+                    "position_quantity": str(ev.position_quantity),
+                    "known_at_ms": ev.known_at_ms,
+                }
+                prior = state.get("funding_events", {}).get(ev.funding_id)
+                if prior is not None:
+                    if prior != body:
+                        errors.append("FUNDING_ID_CONFLICT")
+                    continue
+                expected_qty = decimal(state["positions"].get(ev.market, "0"))
+                if (
+                    expected_qty == ZERO
+                    or ev.position_quantity != expected_qty
+                    or ev.known_at_ms > snapshot.observed_at_ms
+                ):
+                    errors.append("FUNDING_POSITION_MISMATCH")
+                    continue
+                try:
+                    shares = apply_funding(state, body, expected_quantity=expected_qty)
+                except ValueError:
+                    errors.append("FUNDING_ATTRIBUTION_INVALID")
+                    continue
+                state.setdefault("funding_events", {})[ev.funding_id] = body
+                new_funding = add(new_funding, ev.amount)
+                for pod, share in shares.items():
                     used[pod] = str(
-                        add(decimal(used.get(pod, "0")), decimal(effect["fee"]), execution_loss)
+                        add(decimal(used.get(pod, "0")), max(ZERO, -decimal(share)))
                     )
-                continue
-            for pod, change in changes.items():
-                book = state["pod_positions"].setdefault(pod, {})
-                allocated = change * fill.quantity / decimal(intent["quantity"])
-                book[fill.market] = str(decimal(book.get(fill.market, "0")) + allocated)
-                # Gross allocation shares conserve the real broker fee even when
-                # two pods oppose one another and the net order is much smaller.
-                fee = fill.fee * abs(change) / gross_changes
-                pod_fees = state.setdefault("pod_fees_paid", {})
-                pod_fees[pod] = str(decimal(pod_fees.get(pod, "0")) + fee)
-                execution_loss = max(
-                    ZERO, -allocated * (marks.get(fill.market, fill.price) - fill.price)
-                )
-                used[pod] = str(decimal(used.get(pod, "0")) + fee + execution_loss)
         known_orders: dict[str, BrokerOrder] = {}
         for order in snapshot.orders:
             if order.intent_id in known_orders and order != known_orders[order.intent_id]:
@@ -1060,11 +1114,11 @@ class Guardian:
                 errors.append("BROKER_ENTRY_BASIS_MISMATCH")
         old_cash = state["finance"].get("cash")
         if old_cash is not None and snapshot.cash is not None:
-            # Only actual fills with retained, independently checked entry basis
-            # explain checkpoint realized cash. Other flows remain unqualified.
-            if snapshot.cash - decimal(old_cash) != new_realized - new_fees and (
-                "POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors
-            ):
+            # Only actual fills and verified funding flows with retained,
+            # independently checked basis explain checkpoint realized cash.
+            if snapshot.cash - decimal(old_cash) != add(
+                new_realized, -new_fees, new_funding
+            ) and ("POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors):
                 errors.append("BROKER_CASH_ATTRIBUTION_UNKNOWN")
         finance, finance_errors = account_step(state["finance"], snapshot, self.rules, now_ms)
         previous_day = state["finance"].get("day")

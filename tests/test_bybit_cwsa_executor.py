@@ -16,7 +16,7 @@ from prop_production.bybit_executor import (
     MarketSpec,
     load_cwsa_targets,
 )
-from prop_production.gateway import BrokerOrder, BrokerSnapshot, Outcome, Position
+from prop_production.gateway import BrokerOrder, BrokerSnapshot, Execution, Outcome, Position
 
 
 def _write_cwsa_db(
@@ -87,6 +87,7 @@ def _snap(
     equity: Decimal = Decimal("4990"),
     positions: tuple[Position, ...] = (),
     orders: tuple[BrokerOrder, ...] = (),
+    fills: tuple[Execution, ...] = (),
     financial_complete: bool = True,
     uncertainty_reasons: tuple[str, ...] = (),
 ) -> BrokerSnapshot:
@@ -103,7 +104,7 @@ def _snap(
         maintenance_margin=Decimal("0"),
         positions=positions,
         orders=orders,
-        fills=(),
+        fills=fills,
         uncertainty_reasons=uncertainty_reasons,
         financial_complete=financial_complete,
     )
@@ -748,3 +749,265 @@ def test_cli_global_defaults_and_hydro_override(tmp_path: Path, monkeypatch: pyt
         ]
     ) == 0
     assert captured[-1] == {"min_notional": Decimal("15"), "jitter_min_ms": 0, "jitter_max_ms": 0}
+
+
+def test_reconcile_snapshot_fills_persists_executions_vwap_and_is_idempotent(tmp_path: Path) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    markets = _markets()
+
+    # Verify idempotent schema migration on a legacy order_intents table without execution columns.
+    conn = sqlite3.connect(state_db)
+    try:
+        conn.execute(
+            "CREATE TABLE order_intents (intent_id TEXT PRIMARY KEY, wave_key TEXT NOT NULL, "
+            "symbol TEXT NOT NULL, quantity TEXT NOT NULL, reduce_only INTEGER NOT NULL, "
+            "status TEXT NOT NULL, broker_id TEXT, reason TEXT, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001"), "ACT08": Decimal("0"), "ACT09": Decimal("0")},
+    )
+    _seed_empty_baseline(ex, source_db, markets)
+    _write_cwsa_db(
+        source_db,
+        seq=746,
+        next_cp=1794683700000,
+        positions_by_sid={"ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "9"}]},
+    )
+
+    class _AcceptedGateway:
+        def __init__(self) -> None:
+            self.snap = _snap()
+            self.submitted: list[dict[str, Any]] = []
+
+        def observe(self, _now_ms: int) -> BrokerSnapshot:
+            return self.snap
+
+        def submit(self, intent: dict[str, Any]) -> Outcome:
+            self.submitted.append(intent)
+            return Outcome(status="ACCEPTED", broker_id="oid-btc-1")
+
+    gw = _AcceptedGateway()
+    res = ex.step(gw, markets, 1794683600000, execute=True)
+    assert res["status"] == "EXECUTED"
+    assert res["submitted"] == 1
+    intent_id = gw.submitted[0]["intent_id"]
+
+    # Poll 1: first partial fill arrives (0.004 @ 90000, fee 0.20), order PARTIAL.
+    # VWAP across both fills will be (0.004*90000 + 0.005*90900) / 0.009 = 90500.
+    fill1 = Execution(
+        execution_id="exec-btc-1",
+        intent_id=intent_id,
+        market="BTC/USDT:USDT",
+        quantity=Decimal("0.004"),
+        price=Decimal("90000"),
+        fee=Decimal("0.20"),
+        known_at_ms=1794683601000,
+    )
+    gw.snap = _snap(
+        positions=(Position("BTC/USDT:USDT", Decimal("0.004"), Decimal("90000"), Decimal("90000")),),
+        orders=(BrokerOrder(intent_id, "oid-btc-1", "BTC/USDT:USDT", Decimal("0.009"), Decimal("0.004"), "PARTIAL"),),
+        fills=(fill1,),
+    )
+    assert ex.step(gw, markets, 1794683602000, execute=True)["status"] == "ALREADY_PROCESSED"
+
+    # Poll 2: second fill arrives alongside first fill (0.005 @ 90900, fee 0.25), order FILLED.
+    fill2 = Execution(
+        execution_id="exec-btc-2",
+        intent_id=intent_id,
+        market="BTC/USDT:USDT",
+        quantity=Decimal("0.005"),
+        price=Decimal("90900"),
+        fee=Decimal("0.25"),
+        known_at_ms=1794683603000,
+    )
+    gw.snap = _snap(
+        positions=(Position("BTC/USDT:USDT", Decimal("0.009"), Decimal("90500"), Decimal("90500")),),
+        orders=(BrokerOrder(intent_id, "oid-btc-1", "BTC/USDT:USDT", Decimal("0.009"), Decimal("0.009"), "FILLED"),),
+        fills=(fill1, fill2),
+    )
+    assert ex.step(gw, markets, 1794683604000, execute=True)["status"] == "ALREADY_PROCESSED"
+
+    # Restart executor and re-poll same snapshot to verify idempotency.
+    ex_restarted = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001"), "ACT08": Decimal("0"), "ACT09": Decimal("0")},
+    )
+    assert ex_restarted.step(gw, markets, 1794683605000, execute=True)["status"] == "ALREADY_PROCESSED"
+
+    verify_conn = sqlite3.connect(state_db)
+    try:
+        exec_count = verify_conn.execute(
+            "SELECT COUNT(*) FROM order_executions WHERE intent_id = ?", (intent_id,)
+        ).fetchone()[0]
+        row = verify_conn.execute(
+            "SELECT status, filled_quantity, avg_price, exec_fee FROM order_intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+    finally:
+        verify_conn.close()
+
+    assert exec_count == 2
+    assert row is not None
+    assert row[0] == "FILLED"
+    assert Decimal(row[1]) == Decimal("0.009")
+    assert Decimal(row[2]) == Decimal("90500")
+    assert Decimal(row[3]) == Decimal("0.45")
+
+
+def test_halt_flatten_ioc_zero_fill_retries_with_fresh_intent_id(tmp_path: Path) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    markets = _markets()
+    _write_cwsa_db(source_db, seq=746, next_cp=1794683700000, positions_by_sid={"ACT04": [], "ACT08": [], "ACT09": []})
+    ex = BybitCwsaExecutor(state_db=state_db, source_db=source_db, member_k=TRIADA_HYDRO5K_K)
+
+    class _SequenceGateway:
+        def __init__(self, snap: BrokerSnapshot, outcomes: list[Outcome]) -> None:
+            self.snap = snap
+            self._outcomes = list(outcomes)
+            self.submitted: list[dict[str, Any]] = []
+
+        def observe(self, _now_ms: int) -> BrokerSnapshot:
+            return self.snap
+
+        def submit(self, intent: dict[str, Any]) -> Outcome:
+            self.submitted.append(intent)
+            return self._outcomes.pop(0)
+
+    snap_dd = _snap(
+        equity=Decimal("4500"),
+        positions=(Position("BTC/USDT:USDT", Decimal("0.010"), Decimal("90000"), Decimal("90000")),),
+    )
+    gw = _SequenceGateway(
+        snap_dd,
+        [
+            Outcome(status="CANCELLED", broker_id="oid-cancel-1", reason="IOC_ZERO_FILL"),
+            Outcome(status="FILLED", broker_id="oid-fill-2"),
+        ],
+    )
+    res1 = ex.step(gw, markets, 1794683600000, execute=True)
+    assert res1["status"] == "HALT_FLATTENED"
+    assert res1["submitted"] == 1
+    first_id = res1["results"][0]["intent_id"]
+    assert res1["results"][0]["status"] == "CANCELLED"
+
+    res2 = ex.step(gw, markets, 1794683615000, execute=True)
+    assert res2["status"] == "HALT_FLATTENED"
+    assert res2["submitted"] == 1
+    assert res2["skipped"] == []
+    second_id = res2["results"][0]["intent_id"]
+    assert second_id != first_id
+    assert second_id.endswith("-r1")
+    assert len(second_id) <= 36
+    assert res2["results"][0]["status"] == "FILLED"
+
+    # Lagging snapshot after FILLED does not double-flatten.
+    res3 = ex.step(gw, markets, 1794683630000, execute=True)
+    assert res3["submitted"] == 0
+    assert res3["skipped"] == [{"symbol": "BTC/USDT:USDT", "reason": "INTENT_ALREADY_SUBMITTED"}]
+
+
+def test_reconcile_snapshot_fills_conservation_and_blocked_isolation(tmp_path: Path) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    markets = _markets()
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k={"ACT04": Decimal("0.001"), "ACT08": Decimal("0"), "ACT09": Decimal("0")},
+    )
+    _seed_empty_baseline(ex, source_db, markets)
+    _write_cwsa_db(
+        source_db,
+        seq=746,
+        next_cp=1794683700000,
+        positions_by_sid={"ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "9"}]},
+    )
+
+    class _Gateway:
+        def __init__(self) -> None:
+            self.snap = _snap()
+
+        def observe(self, _now_ms: int) -> BrokerSnapshot:
+            return self.snap
+
+        def submit(self, _intent: dict[str, Any]) -> Outcome:
+            return Outcome(status="ACCEPTED", broker_id="oid-btc-1")
+
+    gw = _Gateway()
+    res = ex.step(gw, markets, 1794683600000, execute=True)
+    intent_id = res["results"][0]["intent_id"]
+
+    # Incomplete snapshot returns BLOCKED and must not mutate order_intents or order_executions.
+    fill1 = Execution("exec-1", intent_id, "BTC/USDT:USDT", Decimal("0.004"), Decimal("90000"), Decimal("0.20"), 1794683601000)
+    gw.snap = _snap(
+        orders=(BrokerOrder(intent_id, "oid-btc-1", "BTC/USDT:USDT", Decimal("0.009"), Decimal("0.004"), "PARTIAL"),),
+        fills=(fill1,),
+        financial_complete=False,
+        uncertainty_reasons=("INCOMPLETE",),
+    )
+    assert ex.step(gw, markets, 1794683601500, execute=True)["status"] == "BLOCKED"
+    conn = sqlite3.connect(state_db)
+    try:
+        assert conn.execute("SELECT status FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()[0] == "ACCEPTED"
+        assert conn.execute("SELECT COUNT(*) FROM order_executions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # Valid PARTIAL updates status ACCEPTED -> PARTIAL, and false FILLED without full conservation keeps PARTIAL.
+    gw.snap = _snap(
+        orders=(BrokerOrder(intent_id, "oid-btc-1", "BTC/USDT:USDT", Decimal("0.009"), Decimal("0.004"), "PARTIAL"),),
+        fills=(fill1,),
+    )
+    ex.step(gw, markets, 1794683602000, execute=True)
+    gw.snap = _snap(
+        orders=(BrokerOrder(intent_id, "oid-btc-1", "BTC/USDT:USDT", Decimal("0.009"), Decimal("0.004"), "FILLED"),),
+        fills=(fill1,),
+    )
+    ex.step(gw, markets, 1794683602500, execute=True)
+    conn = sqlite3.connect(state_db)
+    try:
+        row = conn.execute(
+            "SELECT status, filled_quantity FROM order_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        assert row == ("PARTIAL", "0.004")
+    finally:
+        conn.close()
+
+    # Contradicting fill (wrong symbol or over-fill) raises FILL_CONSERVATION_MISMATCH and rolls back.
+    bad_sym = Execution("exec-bad-sym", intent_id, "ETH/USDT:USDT", Decimal("0.005"), Decimal("3000"), Decimal("0.1"), 1794683603000)
+    gw.snap = _snap(fills=(bad_sym,))
+    with pytest.raises(ValueError, match="FILL_CONSERVATION_MISMATCH"):
+        ex.step(gw, markets, 1794683603000, execute=True)
+
+    over_fill = Execution("exec-over", intent_id, "BTC/USDT:USDT", Decimal("0.006"), Decimal("90000"), Decimal("0.1"), 1794683603100)
+    gw.snap = _snap(fills=(over_fill,))
+    with pytest.raises(ValueError, match="FILL_CONSERVATION_MISMATCH"):
+        ex.step(gw, markets, 1794683603100, execute=True)
+
+    # Full fill transitions PARTIAL -> FILLED with exact conservation.
+    fill2 = Execution("exec-2", intent_id, "BTC/USDT:USDT", Decimal("0.005"), Decimal("90900"), Decimal("0.25"), 1794683604000)
+    gw.snap = _snap(
+        orders=(BrokerOrder(intent_id, "oid-btc-1", "BTC/USDT:USDT", Decimal("0.009"), Decimal("0.009"), "FILLED"),),
+        fills=(fill1, fill2),
+    )
+    ex.step(gw, markets, 1794683604000, execute=True)
+    conn = sqlite3.connect(state_db)
+    try:
+        row = conn.execute(
+            "SELECT status, filled_quantity FROM order_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "FILLED"
+        assert Decimal(row[1]) == Decimal("0.009")
+    finally:
+        conn.close()

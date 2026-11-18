@@ -89,7 +89,7 @@ if [[ "$MODE" == "all" ]]; then
     printf '\n[app + native connector / %s]\n' "$CONNECTOR_SHA"
     PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --extra connector --group dev pytest -q tests/test_native_gateway.py tests/test_propr_gateway.py tests/test_vanta_gateway.py
     printf '\n[Bybit Demo native adapter / %s]\n' "$CONNECTOR_SHA"
-    PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --extra connector --group dev pytest -q tests/test_bybit_gateway.py tests/test_bybit_observer.py
+    PYTHONPATH="$PROP_CONNECTOR_ROOT" uv run --python 3.13 --frozen --extra connector --group dev pytest -q tests/test_bybit_gateway.py tests/test_bybit_observer.py tests/test_bybit_ccxt_gateway.py
     printf '\n[research / %s]\n' "$RESEARCH_SHA"
     (
         cd "$PROP_RESEARCH_ROOT"

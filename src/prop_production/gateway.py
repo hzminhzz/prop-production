@@ -62,6 +62,15 @@ class Execution:
 
 
 @dataclass(frozen=True)
+class FundingEvent:
+    funding_id: str
+    market: str
+    amount: Decimal
+    position_quantity: Decimal
+    known_at_ms: int
+
+
+@dataclass(frozen=True)
 class BrokerSnapshot:
     account_binding: str
     endpoint: str
@@ -93,6 +102,7 @@ class BrokerSnapshot:
     native_inventory_read_complete: bool = False
     native_inventory_count: tuple[int, int, int] | None = None
     execution_capabilities: tuple[dict[str, Any], ...] = ()
+    funding_events: tuple[FundingEvent, ...] = ()
 
     def ready(self, now_ms: int, max_age_ms: int) -> bool:
         amounts = (
@@ -156,6 +166,19 @@ class BrokerSnapshot:
                 or fill.fee < 0
                 or type(fill.known_at_ms) is not int
                 or not 0 <= fill.known_at_ms <= self.observed_at_ms
+            ):
+                return False
+        for event in self.funding_events:
+            if (
+                not event.funding_id
+                or not event.market
+                or any(
+                    not isinstance(v, Decimal) or not v.is_finite()
+                    for v in (event.amount, event.position_quantity)
+                )
+                or event.position_quantity == 0
+                or type(event.known_at_ms) is not int
+                or not 0 <= event.known_at_ms <= self.observed_at_ms
             ):
                 return False
         return bool(
@@ -362,6 +385,16 @@ def snapshot_from_wire(raw: dict[str, Any]) -> BrokerSnapshot:
         )
         for f in raw["fills"]
     )
+    funding_events = tuple(
+        FundingEvent(
+            e["funding_id"],
+            e["market"],
+            decimal(e["amount"]),
+            decimal(e["position_quantity"]),
+            e["known_at_ms"],
+        )
+        for e in raw.get("funding_events", ())
+    )
     return BrokerSnapshot(
         raw["account_binding"],
         raw["endpoint"],
@@ -395,6 +428,7 @@ def snapshot_from_wire(raw: dict[str, Any]) -> BrokerSnapshot:
         if raw.get("native_inventory_count") is not None
         else None,
         tuple(raw.get("execution_capabilities", ())),
+        funding_events,
     )
 
 

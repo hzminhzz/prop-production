@@ -121,7 +121,7 @@ def parse_vector(rows: Any) -> dict[str, Any]:
         key, value = row["instrument"], row["quantity"]
         if (
             not isinstance(key, str)
-            or re.fullmatch(r"hyperliquid/mainnet:perp:[^/\\s:]+/[^/\\s:]+", key) is None
+            or re.fullmatch(r"hyperliquid/mainnet:perp:[^/\s:]+/[^/\s:]+", key) is None
             or not isinstance(value, str)
             or len(value) > 128
         ):

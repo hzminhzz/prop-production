@@ -253,12 +253,17 @@ def verify_release_contract(payload: dict[str, Any], authority_public: bytes) ->
     if len(mandates) != len(payload["members"]):
         raise ValueError("MANDATE_RELEASE_MEMBERS")
     seen = set()
+    seen_ids = set()
     for raw in mandates:
         m = CopyMandate.parse(raw).data
         identity = (m["account_id"], m["pod_id"])
         if identity in seen:
             raise ValueError("MANDATE_RELEASE_OPENING_OVERLAP")
         seen.add(identity)
+        mandate_identity = (m["account_id"], m["mandate_id"])
+        if mandate_identity in seen_ids:
+            raise ValueError("MANDATE_RELEASE_DUPLICATE_ID")
+        seen_ids.add(mandate_identity)
         source = payload["checkpoint_scopes"].get(m["source_id"])
         if (
             source is None
@@ -271,6 +276,11 @@ def verify_release_contract(payload: dict[str, Any], authority_public: bytes) ->
             or m["effective_until_ms"] > payload["expires_at_ms"]
         ):
             raise ValueError("MANDATE_RELEASE_SCOPE")
+        if any(
+            market.split(":perp:", 1)[1].split("/", 1)[0] not in source["dexes"]
+            for market in m["allowed_markets"]
+        ):
+            raise ValueError("MANDATE_RELEASE_DEX_SCOPE")
         member = next((x for x in payload["members"] if x["pod_id"] == m["pod_id"]), None)
         if (
             member is None
@@ -591,8 +601,11 @@ def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], 
             "pod_fees_paid",
             "pod_realized",
             "pod_loss_used",
+            "pod_funding",
+            "funding_events",
             "checkpoint_basis",
             "checkpoint_allocations",
+            "checkpoint_funding_allocations",
             "checkpoint_internal_effects",
             "checkpoint_market_claims",
             "halts",

@@ -18,7 +18,7 @@ from typing import Any
 
 from .bybit_gateway import BybitDemoGateway
 from .evidence import decimal, digest
-from .gateway import BrokerSnapshot, MarketSpec, Outcome
+from .gateway import BrokerOrder, BrokerSnapshot, MarketSpec, Outcome
 from .prop_firms import ChallengeRulebookSpec, get_challenge_spec
 
 _ZERO = Decimal("0")
@@ -296,6 +296,25 @@ class BybitCwsaExecutor:
                 )
                 """
             )
+            existing_cols = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(order_intents)").fetchall()
+            }
+            for col in ("filled_quantity", "avg_price", "exec_fee"):
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE order_intents ADD COLUMN {col} TEXT")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_executions (
+                    execution_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    fee TEXT NOT NULL,
+                    known_at_ms INTEGER NOT NULL
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS halt_state (
@@ -482,7 +501,7 @@ class BybitCwsaExecutor:
                 "created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, 'PENDING_SUBMIT', NULL, NULL, ?, ?) "
                 "ON CONFLICT(intent_id) DO UPDATE SET "
                 "status = 'PENDING_SUBMIT', broker_id = NULL, reason = NULL, updated_at_ms = excluded.updated_at_ms "
-                "WHERE order_intents.status NOT IN ('FILLED', 'ACCEPTED', 'PARTIAL')",
+                "WHERE order_intents.status NOT IN ('FILLED', 'ACCEPTED', 'PARTIAL', 'CANCELLED', 'EXPIRED')",
                 (intent_id, wave_key, symbol, str(qty), int(reduce_only), now_ms, now_ms),
             )
             return cur.rowcount > 0
@@ -671,6 +690,161 @@ class BybitCwsaExecutor:
             return ("HALT_DAILY_STOP", reason)
         return None
 
+    def _resolve_intent_id(self, conn: sqlite3.Connection, candidate: str) -> str | None:
+        key = str(candidate or "").strip()
+        if not key:
+            return None
+        row = conn.execute(
+            "SELECT intent_id FROM order_intents WHERE intent_id = ?", (key,)
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+        row = conn.execute(
+            "SELECT intent_id FROM order_intents WHERE broker_id = ? "
+            "ORDER BY updated_at_ms DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def _reconcile_snapshot_fills(self, snap: BrokerSnapshot) -> None:
+        if not snap.fills and not snap.orders:
+            return
+        with self._connect() as conn:
+            order_updates: dict[str, BrokerOrder] = {}
+            for order in snap.orders:
+                if order.status not in {"FILLED", "PARTIAL", "CANCELLED", "EXPIRED", "REJECTED"}:
+                    continue
+                intent_id = self._resolve_intent_id(conn, order.intent_id) or self._resolve_intent_id(
+                    conn, order.broker_id
+                )
+                if intent_id is None:
+                    continue
+                row = conn.execute(
+                    "SELECT status FROM order_intents WHERE intent_id = ?", (intent_id,)
+                ).fetchone()
+                if row is not None and str(row[0]) in ("ACCEPTED", "PARTIAL"):
+                    order_updates[intent_id] = order
+
+            touched: set[str] = set(order_updates)
+            for ex in snap.fills:
+                intent_id = self._resolve_intent_id(conn, ex.intent_id)
+                if intent_id is None:
+                    continue
+                intent_row = conn.execute(
+                    "SELECT symbol, quantity FROM order_intents WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()
+                assert intent_row is not None
+                intent_symbol = str(intent_row[0])
+                intent_qty = decimal(intent_row[1])
+                if (
+                    ex.market != intent_symbol
+                    or not ex.quantity.is_finite()
+                    or ex.quantity == _ZERO
+                    or ex.quantity * intent_qty <= _ZERO
+                    or not ex.price.is_finite()
+                    or ex.price <= _ZERO
+                    or not ex.fee.is_finite()
+                    or ex.fee < _ZERO
+                ):
+                    raise ValueError("FILL_CONSERVATION_MISMATCH")
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO order_executions "
+                    "(execution_id, intent_id, symbol, quantity, price, fee, known_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        ex.execution_id,
+                        intent_id,
+                        ex.market,
+                        str(ex.quantity),
+                        str(ex.price),
+                        str(ex.fee),
+                        ex.known_at_ms,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    touched.add(intent_id)
+
+            for intent_id in sorted(touched):
+                intent_row = conn.execute(
+                    "SELECT quantity FROM order_intents WHERE intent_id = ?", (intent_id,)
+                ).fetchone()
+                assert intent_row is not None
+                intent_qty = decimal(intent_row[0])
+                exec_rows = conn.execute(
+                    "SELECT quantity, price, fee FROM order_executions WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchall()
+                if exec_rows:
+                    filled_qty = sum((decimal(r[0]) for r in exec_rows), _ZERO)
+                    if filled_qty * intent_qty < _ZERO or abs(filled_qty) > abs(intent_qty):
+                        raise ValueError("FILL_CONSERVATION_MISMATCH")
+                    abs_qty = sum((abs(decimal(r[0])) for r in exec_rows), _ZERO)
+                    notional = sum((abs(decimal(r[0])) * decimal(r[1]) for r in exec_rows), _ZERO)
+                    avg_px: str | None = str(notional / abs_qty) if abs_qty > _ZERO else None
+                    filled_str: str | None = str(filled_qty)
+                    fee_str: str | None = str(sum((decimal(r[2]) for r in exec_rows), _ZERO))
+                else:
+                    filled_qty = _ZERO
+                    avg_px = filled_str = fee_str = None
+                if intent_id in order_updates:
+                    order = order_updates[intent_id]
+                    snap_broker_id = order.broker_id or None
+                    if order.status == "FILLED":
+                        if (exec_rows and filled_qty == intent_qty) or (
+                            not exec_rows
+                            and not snap.history_complete
+                            and order.filled == order.quantity
+                        ):
+                            new_status: str | None = "FILLED"
+                        elif exec_rows and _ZERO < abs(filled_qty) < abs(intent_qty):
+                            new_status = "PARTIAL"
+                        else:
+                            new_status = None
+                    else:
+                        new_status = order.status
+                    if exec_rows and new_status is not None:
+                        conn.execute(
+                            "UPDATE order_intents SET filled_quantity = ?, avg_price = ?, exec_fee = ?, "
+                            "status = ?, broker_id = COALESCE(broker_id, ?), "
+                            "updated_at_ms = MAX(updated_at_ms, ?) WHERE intent_id = ?",
+                            (
+                                filled_str,
+                                avg_px,
+                                fee_str,
+                                new_status,
+                                snap_broker_id,
+                                snap.observed_at_ms,
+                                intent_id,
+                            ),
+                        )
+                    elif exec_rows:
+                        conn.execute(
+                            "UPDATE order_intents SET filled_quantity = ?, avg_price = ?, exec_fee = ?, "
+                            "broker_id = COALESCE(broker_id, ?), "
+                            "updated_at_ms = MAX(updated_at_ms, ?) WHERE intent_id = ?",
+                            (
+                                filled_str,
+                                avg_px,
+                                fee_str,
+                                snap_broker_id,
+                                snap.observed_at_ms,
+                                intent_id,
+                            ),
+                        )
+                    elif new_status is not None:
+                        conn.execute(
+                            "UPDATE order_intents SET status = ?, broker_id = COALESCE(broker_id, ?), "
+                            "updated_at_ms = MAX(updated_at_ms, ?) WHERE intent_id = ?",
+                            (new_status, snap_broker_id, snap.observed_at_ms, intent_id),
+                        )
+                elif exec_rows:
+                    conn.execute(
+                        "UPDATE order_intents SET filled_quantity = ?, avg_price = ?, exec_fee = ?, "
+                        "updated_at_ms = MAX(updated_at_ms, ?) WHERE intent_id = ?",
+                        (filled_str, avg_px, fee_str, snap.observed_at_ms, intent_id),
+                    )
+
     def step(
         self,
         gateway: Any,
@@ -684,6 +858,7 @@ class BybitCwsaExecutor:
         risk = self._risk_check(snap, now_ms)
         if risk is not None and risk[0] == "BLOCKED":
             return {"status": "BLOCKED", "reason": risk[1], "submitted": 0}
+        self._reconcile_snapshot_fills(snap)
         order_halt = self._get_halt("ORDER_UNKNOWN")
         if order_halt is not None:
             return {"status": "HALTED", "reason": order_halt, "submitted": 0}
@@ -789,7 +964,20 @@ class BybitCwsaExecutor:
                     continue
             reduce_only = _reduce_only_for_delta(current_by_symbol.get(sym, _ZERO), qty_step)
             sym_prefix = sym.split("/")[0][:7]
-            intent_id = f"hy-{wave_key[:12]}-{sym_prefix}-{digest(sym)[:6]}"[:36]
+            base_id = f"hy-{wave_key[:12]}-{sym_prefix}-{digest(sym)[:6]}"[:36]
+            intent_id = base_id
+            if risk is not None:
+                with self._connect() as conn:
+                    attempts = int(
+                        conn.execute(
+                            "SELECT count(*) FROM order_intents "
+                            "WHERE wave_key = ? AND symbol = ? "
+                            "AND status IN ('CANCELLED', 'EXPIRED', 'REJECTED')",
+                            (wave_key, sym),
+                        ).fetchone()[0]
+                    )
+                if attempts > 0:
+                    intent_id = f"{base_id[:32]}-r{attempts}"[:36]
             planned.append(
                 {
                     "intent_id": intent_id,

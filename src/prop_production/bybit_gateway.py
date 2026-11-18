@@ -405,14 +405,35 @@ class BybitDemoGateway:
             self._submitted_targets[intent_id] = (broker_id, symbol)
 
         raw_status = str(getattr(order, "status", "") or "").strip().lower()
+        filled_abs = _finite_decimal(getattr(order, "filled_quantity", None))
+        if filled_abs is None or filled_abs < _ZERO or filled_abs > abs(qty):
+            return Outcome(status="UNKNOWN", broker_id=broker_id, reason="INVALID_FILLED_QTY")
+        if raw_status in ("filled", "closed"):
+            if filled_abs != abs(qty):
+                return Outcome(
+                    status="UNKNOWN", broker_id=broker_id, reason="FALSE_FILLED_QTY_MISMATCH"
+                )
+            return Outcome(status="FILLED", broker_id=broker_id)
+        if raw_status == "rejected":
+            if filled_abs != _ZERO:
+                return Outcome(
+                    status="UNKNOWN", broker_id=broker_id, reason="REJECTED_WITH_ACTUAL_EXECUTIONS"
+                )
+            return Outcome(status="REJECTED", broker_id=broker_id)
+        if raw_status in ("canceled", "cancelled", "deactivated", "expired"):
+            if filled_abs == abs(qty):
+                return Outcome(status="FILLED", broker_id=broker_id)
+            if raw_status in ("deactivated", "expired") and filled_abs == _ZERO:
+                return Outcome(
+                    status="EXPIRED", broker_id=broker_id, reason="ORDER_EXPIRED_ZERO_FILL"
+                )
+            reason = f"IOC_PARTIAL_FILL:{filled_abs}" if filled_abs > _ZERO else "IOC_ZERO_FILL"
+            return Outcome(status="CANCELLED", broker_id=broker_id, reason=reason)
         status_map = {
             "open": "ACCEPTED",
             "new": "ACCEPTED",
             "accepted": "ACCEPTED",
             "partially_filled": "PARTIAL",
-            "filled": "FILLED",
-            "closed": "FILLED",
-            "rejected": "REJECTED",
         }
         mapped = status_map.get(raw_status, "UNKNOWN")
         return Outcome(status=mapped, broker_id=broker_id)

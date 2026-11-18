@@ -153,11 +153,17 @@ def test_unresolved_pending_submit_intent_blocks_new_waves_and_retry_resets_reje
 
     with closing(sqlite3.connect(state_db)) as conn:
         conn.execute(
-            "INSERT INTO order_intents VALUES ('stuck-1', 'wk-0', 'BTC/USDT:USDT', '0.01', 0, "
+            "INSERT INTO order_intents "
+            "(intent_id, wave_key, symbol, quantity, reduce_only, status, broker_id, reason, "
+            "created_at_ms, updated_at_ms) "
+            "VALUES ('stuck-1', 'wk-0', 'BTC/USDT:USDT', '0.01', 0, "
             "'PENDING_SUBMIT', NULL, NULL, 1794683400000, 1794683400000)"
         )
         conn.execute(
-            "INSERT INTO order_intents VALUES ('rej-1', 'wk-1', 'BTC/USDT:USDT', '0.01', 0, "
+            "INSERT INTO order_intents "
+            "(intent_id, wave_key, symbol, quantity, reduce_only, status, broker_id, reason, "
+            "created_at_ms, updated_at_ms) "
+            "VALUES ('rej-1', 'wk-1', 'BTC/USDT:USDT', '0.01', 0, "
             "'REJECTED', NULL, 'RATE_LIMIT', 1794683400000, 1794683400000)"
         )
         conn.commit()

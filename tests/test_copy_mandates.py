@@ -150,3 +150,66 @@ def test_protected_lifecycle_requires_new_generation_to_resume():
     )
     assert denied.effect == "REJECTED"
     assert denied.successor.phase == "PAUSED"
+
+
+def test_lowercase_s_instrument_and_release_contract_guards():
+    from prop_production.copy_mandates import CopyMandate
+
+    parsed = CopyMandate.parse(
+        dict(mandate_body(), allowed_markets=["hyperliquid/mainnet:perp:default/sUSD"])
+    )
+    assert parsed.data["allowed_markets"] == ["hyperliquid/mainnet:perp:default/sUSD"]
+    with pytest.raises(ValueError, match="CWSA_NATIVE_KEY_OR_QUANTITY"):
+        CopyMandate.parse(
+            dict(mandate_body(), allowed_markets=["hyperliquid/mainnet:perp:default/s USD"])
+        )
+
+    key = Ed25519PrivateKey.generate()
+
+    # Duplicate mandate_id across distinct pods must fail.
+    dup_id = release_body(key)
+    second = dict(dup_id["mandates"][0], pod_id="pod-b")
+    dup_id["mandates"].append(second)
+    dup_id["members"].append(dict(dup_id["members"][0], pod_id="pod-b"))
+    dup_id["definition_sha"] = digest(dup_id["members"])
+    dup_id["source_sha"] = digest(
+        {
+            k: dup_id[k]
+            for k in (
+                "research_commit",
+                "decision_sha",
+                "inventory_sha",
+                "definition_sha",
+                "selection_known_at_ms",
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="MANDATE_RELEASE_DUPLICATE_ID"):
+        verifier(key).verify(sign(dup_id, key, "approver"), now_ms=START - 10)
+
+    # Unpinned dex in allowed_markets must fail.
+    bad_dex = release_body(key)
+    bad_dex["mandates"][0]["allowed_markets"] = ["hyperliquid/mainnet:perp:unpinned/BTC"]
+    bad_dex["members"][0]["allowed_markets"] = ["hyperliquid/mainnet:perp:unpinned/BTC"]
+    bad_dex["definition_sha"] = digest(bad_dex["members"])
+    bad_dex["source_sha"] = digest(
+        {
+            k: bad_dex[k]
+            for k in (
+                "research_commit",
+                "decision_sha",
+                "inventory_sha",
+                "definition_sha",
+                "selection_known_at_ms",
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="MANDATE_RELEASE_DEX_SCOPE"):
+        verifier(key).verify(sign(bad_dex, key, "approver"), now_ms=START - 10)
+
+    # Already-expired mandate must fail even if release expires_at_ms is later.
+    expired_mandate = release_body(key)
+    expired_at = expired_mandate["mandates"][0]["effective_until_ms"]
+    expired_mandate["expires_at_ms"] = expired_at + 1000
+    with pytest.raises(ValueError, match="EXPIRED_OR_FUTURE_RELEASE"):
+        verifier(key).verify(sign(expired_mandate, key, "approver"), now_ms=expired_at)

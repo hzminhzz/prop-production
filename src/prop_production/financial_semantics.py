@@ -11,6 +11,7 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Any
 
+from .checkpoint_accounting import _validate_funding_events_shape
 from .checkpoint_admission import validate_history
 from .contracts import ALLOWED_INTENT_STATUSES, is_synthetic_account
 from .copy_mandates import validate_mandate_history
@@ -80,6 +81,8 @@ def validate_transition(
         and isinstance(current.get("reservations"), dict)
     ):
         raise ValueError("GUARDIAN_SEMANTIC_FINANCIAL_SHAPE")
+    if "funding_events" in current:
+        _validate_funding_events_shape(current["funding_events"])
     intents: dict[str, Any] = current["intents"]
     fills: dict[str, Any] = current["fills"]
     positions: dict[str, Any] = current["positions"]
@@ -186,27 +189,35 @@ def validate_transition(
             raise ValueError("GUARDIAN_SEMANTIC_FILL_REWRITTEN")
         if not set(previous["intents"]).issubset(intents):
             raise ValueError("GUARDIAN_SEMANTIC_INTENT_HISTORY_REMOVED")
+        old_funding = previous.get("funding_events")
+        new_funding = current.get("funding_events")
+        if old_funding is not None:
+            if (
+                not isinstance(new_funding, dict)
+                or not set(old_funding).issubset(new_funding)
+                or any(new_funding[key] != old_funding[key] for key in old_funding)
+            ):
+                raise ValueError("GUARDIAN_SEMANTIC_FUNDING_HISTORY_REWRITTEN")
+        elif new_funding is not None and (
+            not isinstance(new_funding, dict) or (new_funding and kind != "RECONCILE")
+        ):
+            raise ValueError("GUARDIAN_SEMANTIC_FUNDING_WITHOUT_RECONCILIATION")
+        protected_finance = (
+            "finance",
+            "positions",
+            "pod_positions",
+            "fills",
+            "intents",
+            "reservations",
+            "funding_events",
+            "pod_funding",
+            "checkpoint_funding_allocations",
+        )
         if kind.startswith("HALT_") and any(
-            previous[field] != current[field]
-            for field in (
-                "finance",
-                "positions",
-                "pod_positions",
-                "fills",
-                "intents",
-                "reservations",
-            )
+            previous.get(field) != current.get(field) for field in protected_finance
         ):
             raise ValueError("GUARDIAN_SEMANTIC_HALT_MUTATED_FINANCE")
         if kind.startswith("RECOVER_AUTH_") and any(
-            previous[field] != current[field]
-            for field in (
-                "finance",
-                "positions",
-                "pod_positions",
-                "fills",
-                "intents",
-                "reservations",
-            )
+            previous.get(field) != current.get(field) for field in protected_finance
         ):
             raise ValueError("GUARDIAN_SEMANTIC_RECOVERY_MUTATED_FINANCE")

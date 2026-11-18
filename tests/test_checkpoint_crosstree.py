@@ -108,3 +108,117 @@ def test_exact_producer_to_sixteen_paper_consumers_and_guardian_readonly_shadow(
         assert not s.journal.snapshot()["intents"]
         assert not s.broker.audit()
         s.journal.verify()
+
+
+def test_research_build_manifest_v2_portfolio_release_v2_and_shadow_candidate(tmp_path):
+    from copy import deepcopy
+    from hashlib import sha256
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    from prop_production.evidence import sign
+    from prop_production.release import ReleaseFloor, ReleaseVerifier
+    from prop_production.shadow_release import verify_candidate
+
+    configured = os.environ.get("PROP_RESEARCH_ROOT")
+    if not configured:
+        pytest.skip("Set PROP_RESEARCH_ROOT to the exact clean companion pin")
+    root = Path(configured)
+    assert (
+        subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+        == RESEARCH_COMMIT
+    )
+    assert not subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=root, text=True
+    ).strip()
+    script = """
+import json, sys, tempfile
+from pathlib import Path
+from copytrade_pm.production_manifest import build_manifest_v2
+from test_production_manifest import fixture_v2_args
+
+with tempfile.TemporaryDirectory() as directory:
+    args = fixture_v2_args(Path(directory))
+    effective_from_ms = ((args["now_ms"] // 300_000) + 1) * 300_000
+    for mandate in args["mandates"]:
+        mandate["effective_from_ms"] = effective_from_ms
+    manifest = build_manifest_v2(**args)
+    print(json.dumps({
+        "manifest": manifest,
+        "reviewer_private_hex": args["release_signer"].private_bytes_raw().hex(),
+        "reviewer_public_hex": args["reviewer"].public_bytes_raw().hex(),
+        "source_public_hex": args["source_observer"].public_bytes_raw().hex(),
+        "now_ms": args["now_ms"],
+        "effective_from_ms": effective_from_ms,
+    }))
+"""
+    proc = subprocess.run(
+        [str(root / ".venv/bin/python"), "-c", script],
+        cwd=root,
+        env={
+            "PATH": os.defpath,
+            "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root / "tests"))),
+        },
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    exported = json.loads(proc.stdout)
+    manifest = exported["manifest"]
+    payload = manifest["payload"]
+    reviewer_pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(exported["reviewer_public_hex"]))
+    source_pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(exported["source_public_hex"]))
+
+    verifier = ReleaseVerifier(
+        reviewer_pub,
+        "approver",
+        payload["account_binding"],
+        payload["risk_policy_sha"],
+        payload["rulebook_sha"],
+    )
+    verified = verifier.verify(manifest, now_ms=exported["now_ms"])
+    assert verified.payload["schema"] == "portfolio_release_v2"
+    assert verified.trading_authorized is False
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    reviewer_priv = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(exported["reviewer_private_hex"])
+    )
+    expected_compat = deepcopy(MANIFEST)
+    expected_compat["repositories"]["copytrade-pm"]["commit"] = verified.payload["research_commit"]
+    reviewer_sha = sha256(reviewer_pub.public_bytes_raw()).hexdigest()
+    app_commit = "a" * 40
+    candidate_body = {
+        "schema": "cwsa_shadow_candidate_v1",
+        "release": manifest,
+        "compatibility": expected_compat,
+        "application_commit": app_commit,
+        "trust_roots": {
+            "release": reviewer_sha,
+            "mandate": reviewer_sha,
+            "source": sha256(source_pub.public_bytes_raw()).hexdigest(),
+        },
+        "created_at_ms": exported["now_ms"],
+        "effective_from_ms": exported["effective_from_ms"],
+        "mode": "SHADOW_ONLY",
+        "trading_authorized": False,
+    }
+    envelope = sign(candidate_body, reviewer_priv, "cwsa-shadow-candidate-v1")
+    with ReleaseFloor(tmp_path / "floor.sqlite", initialize=True) as floor:
+        candidate = verify_candidate(
+            envelope,
+            verifier=verifier,
+            source_key=source_pub,
+            floor=floor,
+            expected_compatibility=expected_compat,
+            application_commit=app_commit,
+            now_ms=exported["now_ms"],
+        )
+        assert candidate.transition.successor == "SHADOW_VERIFIED"
+        assert candidate.transition.effect == "OBSERVATION_ONLY"
+        assert candidate.release.trading_authorized is False
+        assert floor.con.execute("SELECT * FROM releases").fetchall() == []
+        with pytest.raises(ValueError, match="NOT_ACTIVATED"):
+            floor.require_active(candidate.release)
