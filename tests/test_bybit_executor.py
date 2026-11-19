@@ -796,7 +796,7 @@ def test_hip3_dex_prefix_kpepe_scaling_long_symbol_intent_ids_and_lookup_intent_
                 {"instrument": "hyperliquid/mainnet:perp:xyz/GOLD", "quantity": "5"},
                 {"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "1"},
                 {"instrument": "hyperliquid/mainnet:perp:default/kPEPE", "quantity": "20"},
-                {"instrument": "hyperliquid/mainnet:perp:default/BONK", "quantity": "10"},
+                {"instrument": "hyperliquid/mainnet:perp:default/BONK", "quantity": "10000"},
                 {"instrument": "AVALANCHE1", "quantity": "10"},
                 {"instrument": "AVALANCHE2", "quantity": "20"},
             ],
@@ -817,7 +817,7 @@ def test_hip3_dex_prefix_kpepe_scaling_long_symbol_intent_ids_and_lookup_intent_
     assert Decimal(by_market["GOLDUSDC"]["quantity"]) == Decimal("0.5")
     assert Decimal(by_market["BTCUSDC"]["quantity"]) == Decimal("0.1")
     assert Decimal(by_market["1000PEPEUSDC"]["quantity"]) == Decimal("2")
-    assert Decimal(by_market["1000BONKUSDC"]["quantity"]) == Decimal("1000")
+    assert Decimal(by_market["1000BONKUSDC"]["quantity"]) == Decimal("1")
 
     id1 = by_market["AVALANCHEUSDC1"]["intent_id"]
     id2 = by_market["AVALANCHEUSDC2"]["intent_id"]
@@ -834,3 +834,288 @@ def test_hip3_dex_prefix_kpepe_scaling_long_symbol_intent_ids_and_lookup_intent_
     assert ex.lookup_intent_id("ord-shared") == "i-newer"
     assert ex.lookup_intent_id("missing") is None
     assert ex.lookup_intent_id("") is None
+
+
+def test_notional_sizing_basis_divergence_in_load_targets_and_step(tmp_path: Path) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    member_k = {"ACT04": Decimal("0.1"), "ACT08": Decimal("0"), "ACT09": Decimal("0")}
+    markets = {
+        "BTC": MarketSpec(
+            symbol="BTC/USDT:USDT",
+            min_amount=Decimal("0.001"),
+            amount_step=Decimal("0.001"),
+            reference_price=Decimal("125000"),
+        ),
+        "ETH": MarketSpec(
+            symbol="ETH/USDT:USDT",
+            min_amount=Decimal("0.01"),
+            amount_step=Decimal("0.01"),
+        ),
+    }
+    _write_head(
+        source_db,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {
+                    "instrument": "hyperliquid/mainnet:perp:default/BTC",
+                    "quantity": "1",
+                    "mark_price": "100000",
+                },
+                {
+                    "instrument": "hyperliquid/mainnet:perp:default/ETH",
+                    "quantity": "10",
+                },
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+
+    _, _, by_coin = load_cwsa_targets(
+        source_db,
+        member_k,
+        source_marks={"ETH": Decimal("2000")},
+        follower_marks={"BTC": Decimal("125000"), "ETH": Decimal("2500")},
+    )
+    assert by_coin["BTC"] == Decimal("0.08")
+    assert by_coin["ETH"] == Decimal("0.8")
+
+    _, _, by_sym = load_cwsa_targets(
+        source_db,
+        member_k,
+        markets=markets,
+        source_marks={"ETH": Decimal("2000")},
+        follower_marks={"ETH/USDT:USDT": Decimal("2500")},
+    )
+    assert by_sym["BTC/USDT:USDT"] == Decimal("0.08")
+    assert by_sym["ETH/USDT:USDT"] == Decimal("0.8")
+
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k=member_k,
+        allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
+    )
+    _seed_empty_baseline(ex, source_db, markets)
+    _write_head(
+        source_db,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {
+                    "instrument": "hyperliquid/mainnet:perp:default/BTC",
+                    "quantity": "1",
+                    "mark_price": "100000",
+                },
+                {
+                    "instrument": "hyperliquid/mainnet:perp:default/ETH",
+                    "quantity": "10",
+                },
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    snap = replace(_snap(), market_marks=(("ETH/USDT:USDT", Decimal("2500"), _BASE_MS),))
+    gw = _FakeGateway(snap)
+    res = ex.step(
+        gw,
+        markets,
+        _BASE_MS,
+        execute=True,
+        source_marks={"ETH": Decimal("2000")},
+    )
+    assert res["status"] == "EXECUTED"
+    by_market = {item["market"]: Decimal(item["quantity"]) for item in gw.submitted}
+    assert by_market["BTC/USDT:USDT"] == Decimal("0.080")
+    assert by_market["ETH/USDT:USDT"] == Decimal("0.80")
+
+
+@pytest.mark.parametrize(
+    ("coin", "qty", "source_mark"),
+    [
+        ("PEPE", "100000", Decimal("0.00001")),
+        ("kPEPE", "100", Decimal("0.01")),
+    ],
+)
+def test_pepe_and_kpepe_map_to_1000pepe_with_and_without_marks(
+    tmp_path: Path,
+    coin: str,
+    qty: str,
+    source_mark: Decimal,
+) -> None:
+    member_k = {"ACT04": Decimal("0.1"), "ACT08": Decimal("0"), "ACT09": Decimal("0")}
+    markets = {
+        "1000PEPE": MarketSpec(
+            symbol="1000PEPE/USDT:USDT",
+            min_amount=Decimal("1"),
+            amount_step=Decimal("1"),
+            reference_price=Decimal("0.01"),
+        ),
+    }
+
+    source_with_mark = tmp_path / f"{coin}_with_mark.sqlite3"
+    _write_head(
+        source_with_mark,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {
+                    "instrument": f"hyperliquid/mainnet:perp:default/{coin}",
+                    "quantity": qty,
+                    "source_mark": str(source_mark),
+                }
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    _, _, targets_marked = load_cwsa_targets(source_with_mark, member_k, markets=markets)
+    assert targets_marked == {"1000PEPE/USDT:USDT": Decimal("10")}
+
+    ex_marked = BybitCwsaExecutor(
+        state_db=tmp_path / f"{coin}_marked.sqlite",
+        source_db=source_with_mark,
+        member_k=member_k,
+        allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
+    )
+    _seed_empty_baseline(ex_marked, source_with_mark, markets)
+    _write_head(
+        source_with_mark,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {
+                    "instrument": f"hyperliquid/mainnet:perp:default/{coin}",
+                    "quantity": qty,
+                    "source_mark": str(source_mark),
+                }
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    gw_marked = _FakeGateway(_snap())
+    res_marked = ex_marked.step(gw_marked, markets, _BASE_MS, execute=True)
+    assert res_marked["status"] == "EXECUTED"
+    assert len(gw_marked.submitted) == 1
+    assert gw_marked.submitted[0]["market"] == "1000PEPE/USDT:USDT"
+    assert Decimal(gw_marked.submitted[0]["quantity"]) == Decimal("10")
+
+    source_no_mark = tmp_path / f"{coin}_no_mark.sqlite3"
+    markets_no_ref = {
+        "1000PEPE": MarketSpec(
+            symbol="1000PEPE/USDT:USDT",
+            min_amount=Decimal("1"),
+            amount_step=Decimal("1"),
+        ),
+    }
+    _write_head(
+        source_no_mark,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {
+                    "instrument": f"hyperliquid/mainnet:perp:default/{coin}",
+                    "quantity": qty,
+                }
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    _, _, targets_fallback = load_cwsa_targets(source_no_mark, member_k, markets=markets_no_ref)
+    assert targets_fallback == {"1000PEPE/USDT:USDT": Decimal("10")}
+
+    ex_fallback = BybitCwsaExecutor(
+        state_db=tmp_path / f"{coin}_fallback.sqlite",
+        source_db=source_no_mark,
+        member_k=member_k,
+        allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
+    )
+    _seed_empty_baseline(ex_fallback, source_no_mark, markets_no_ref)
+    _write_head(
+        source_no_mark,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {
+                    "instrument": f"hyperliquid/mainnet:perp:default/{coin}",
+                    "quantity": qty,
+                }
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    gw_fallback = _FakeGateway(_snap())
+    res_fallback = ex_fallback.step(gw_fallback, markets_no_ref, _BASE_MS, execute=True)
+    assert res_fallback["status"] == "EXECUTED"
+    assert len(gw_fallback.submitted) == 1
+    assert gw_fallback.submitted[0]["market"] == "1000PEPE/USDT:USDT"
+    assert Decimal(gw_fallback.submitted[0]["quantity"]) == Decimal("10")
+
+
+@pytest.mark.parametrize("bad_mark", ["0", "-10", "NaN", "not-a-number"])
+def test_invalid_source_mark_fails_closed(tmp_path: Path, bad_mark: str) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    member_k = {"ACT04": Decimal("0.1"), "ACT08": Decimal("0"), "ACT09": Decimal("0")}
+    _write_head(
+        source_db,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [
+                {
+                    "instrument": "hyperliquid/mainnet:perp:default/BTC",
+                    "quantity": "1",
+                    "mark_price": bad_mark,
+                }
+            ],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    with pytest.raises(ValueError, match="INVALID_SOURCE_MARK:BTC"):
+        load_cwsa_targets(source_db, member_k)
+
+
+@pytest.mark.parametrize("bad_mark", [Decimal("0"), Decimal("-1"), Decimal("NaN")])
+def test_invalid_explicit_source_mark_fails_closed(tmp_path: Path, bad_mark: Decimal) -> None:
+    source_db = tmp_path / "source.sqlite3"
+    state_db = tmp_path / "exec.sqlite"
+    member_k = {"ACT04": Decimal("0.1"), "ACT08": Decimal("0"), "ACT09": Decimal("0")}
+    markets = _markets()
+    _write_head(
+        source_db,
+        seq=746,
+        next_cp=_BASE_MS + 100_000,
+        positions_by_sid={
+            "ACT04": [{"instrument": "hyperliquid/mainnet:perp:default/BTC", "quantity": "1"}],
+            "ACT08": [],
+            "ACT09": [],
+        },
+    )
+    with pytest.raises(ValueError, match="INVALID_SOURCE_MARK:BTC"):
+        load_cwsa_targets(source_db, member_k, source_marks={"BTC": bad_mark})
+
+    ex = BybitCwsaExecutor(
+        state_db=state_db,
+        source_db=source_db,
+        member_k=member_k,
+        allow_rest_reconciliation=True,
+        reset_time_hhmm="00:00",
+    )
+    with pytest.raises(ValueError, match="INVALID_SOURCE_MARK:BTC"):
+        ex.step(_FakeGateway(_snap()), markets, _BASE_MS, execute=False, source_marks={"BTC": bad_mark})

@@ -81,7 +81,7 @@ def _coin_from_instrument(instrument: object) -> str:
 def _load_cwsa_snapshot(
     source_db: Path,
     member_k: dict[str, Decimal],
-) -> tuple[str, int, dict[str, dict[str, Decimal]], dict[str, str]]:
+) -> tuple[str, int, dict[str, dict[str, Decimal]], dict[str, str], dict[str, Decimal]]:
     """Read latest CWSA 5m wave per source from read-only SQLite."""
     uri = f"file:{source_db}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -90,7 +90,7 @@ def _load_cwsa_snapshot(
     finally:
         conn.close()
 
-    by_source: dict[str, tuple[str, int, str, dict[str, Decimal]]] = {}
+    by_source: dict[str, tuple[str, int, str, dict[str, Decimal], dict[str, Decimal]]] = {}
     for _stream, scope_raw, state_raw in rows:
         scope = json.loads(scope_raw)
         sid = scope.get("source_id")
@@ -102,12 +102,24 @@ def _load_cwsa_snapshot(
         econ_sha = str(state["economic_sha"])
         phase = str(state.get("phase") or "CONTINUOUS")
         pos_map: dict[str, Decimal] = {}
+        pos_marks: dict[str, Decimal] = {}
         for pos in state["positions"]:
             coin = _coin_from_instrument(pos["instrument"])
             qty = decimal(pos["quantity"])
             if qty != _ZERO:
                 pos_map[coin] = pos_map.get(coin, _ZERO) + qty
-        by_source[sid] = (f"{seq}:{next_cp}:{econ_sha}", next_cp, phase, pos_map)
+            raw_mark = pos.get("mark_price")
+            if raw_mark is None:
+                raw_mark = pos.get("source_mark")
+            if raw_mark is not None:
+                try:
+                    mark = decimal(raw_mark)
+                except ValueError as exc:
+                    raise ValueError(f"INVALID_SOURCE_MARK:{coin}") from exc
+                if not mark.is_finite() or mark <= _ZERO:
+                    raise ValueError(f"INVALID_SOURCE_MARK:{coin}")
+                pos_marks[coin] = mark
+        by_source[sid] = (f"{seq}:{next_cp}:{econ_sha}", next_cp, phase, pos_map, pos_marks)
 
     missing = sorted(set(member_k) - set(by_source))
     if missing:
@@ -121,11 +133,13 @@ def _load_cwsa_snapshot(
     wave_parts: dict[str, str] = {}
     positions_by_source: dict[str, dict[str, Decimal]] = {}
     phases: dict[str, str] = {}
+    source_marks: dict[str, Decimal] = {}
     for sid in sorted(member_k):
-        sig, _cp, phase, pos_map = by_source[sid]
+        sig, _cp, phase, pos_map, pos_marks = by_source[sid]
         wave_parts[sid] = sig
         phases[sid] = phase
         positions_by_source[sid] = pos_map
+        source_marks.update(pos_marks)
 
     wave_key = digest(
         {
@@ -134,25 +148,100 @@ def _load_cwsa_snapshot(
             "k": {sid: str(k) for sid, k in sorted(member_k.items())},
         }
     )
-    return wave_key, next_cp_ms, positions_by_source, phases
+    return wave_key, next_cp_ms, positions_by_source, phases, source_marks
+
+
+def _merge_source_marks(
+    snapshot_marks: dict[str, Decimal],
+    explicit_marks: dict[str, Decimal] | None,
+) -> dict[str, Decimal]:
+    merged = dict(snapshot_marks)
+    if explicit_marks:
+        for coin, mark in explicit_marks.items():
+            if not mark.is_finite() or mark <= _ZERO:
+                raise ValueError(f"INVALID_SOURCE_MARK:{coin}")
+            merged[coin] = mark
+    return merged
+
+
+def _size_target_qty(
+    coin: str,
+    raw_scaled_qty: Decimal,
+    spec: MarketSpec | None,
+    *,
+    source_mark: Decimal | None,
+    follower_mark: Decimal | None,
+) -> Decimal:
+    if source_mark is not None and follower_mark is not None:
+        if (
+            not source_mark.is_finite()
+            or source_mark <= _ZERO
+            or not follower_mark.is_finite()
+            or follower_mark <= _ZERO
+        ):
+            raise ValueError(f"INVALID_MARK_PRICE:{coin}")
+        return (raw_scaled_qty * source_mark) / follower_mark
+    if spec is not None and spec.symbol.startswith("1000") and not coin.startswith(("1000", "k")):
+        return raw_scaled_qty / Decimal("1000")
+    return raw_scaled_qty
 
 
 def load_cwsa_targets(
     source_db: Path,
     member_k: dict[str, Decimal],
+    *,
+    markets: dict[str, MarketSpec] | None = None,
+    source_marks: dict[str, Decimal] | None = None,
+    follower_marks: dict[str, Decimal] | None = None,
 ) -> tuple[str, int, dict[str, Decimal]]:
     """Read latest netted CWSA 5m wave for all portfolio members from read-only SQLite."""
-    wave_key, next_cp_ms, positions_by_source, _phases = _load_cwsa_snapshot(source_db, member_k)
-    net: dict[str, Decimal] = {}
+    wave_key, next_cp_ms, positions_by_source, _phases, snapshot_marks = _load_cwsa_snapshot(
+        source_db, member_k
+    )
+    merged_source_marks = _merge_source_marks(snapshot_marks, source_marks)
+    raw_net: dict[str, Decimal] = {}
     for sid, pos_map in positions_by_source.items():
         k = member_k[sid]
         for coin, qty in pos_map.items():
-            net[coin] = net.get(coin, _ZERO) + qty * k
-    return wave_key, next_cp_ms, {c: q for c, q in sorted(net.items()) if q != _ZERO}
+            raw_net[coin] = raw_net.get(coin, _ZERO) + qty * k
+    fm_map = follower_marks or {}
+    if markets is None:
+        sized: dict[str, Decimal] = {}
+        for coin, raw_qty in raw_net.items():
+            sized[coin] = _size_target_qty(
+                coin,
+                raw_qty,
+                None,
+                source_mark=merged_source_marks.get(coin),
+                follower_mark=fm_map.get(coin),
+            )
+        return wave_key, next_cp_ms, {c: q for c, q in sorted(sized.items()) if q != _ZERO}
+    by_symbol: dict[str, Decimal] = {}
+    for coin, raw_qty in raw_net.items():
+        spec = _symbol_for_coin(coin, markets)
+        if spec is None:
+            continue
+        fm = fm_map.get(spec.symbol)
+        if fm is None:
+            fm = fm_map.get(coin)
+        if fm is None:
+            fm = spec.reference_price
+        scaled = _size_target_qty(
+            coin,
+            raw_qty,
+            spec,
+            source_mark=merged_source_marks.get(coin),
+            follower_mark=fm,
+        )
+        by_symbol[spec.symbol] = by_symbol.get(spec.symbol, _ZERO) + scaled
+    return wave_key, next_cp_ms, {s: q for s, q in sorted(by_symbol.items()) if q != _ZERO}
 
 
 def _symbol_for_coin(coin: str, markets: dict[str, MarketSpec]) -> MarketSpec | None:
-    return markets.get(coin) or markets.get(f"1000{coin}")
+    spec = markets.get(coin) or markets.get(f"1000{coin}")
+    if spec is None and len(coin) > 1 and coin[0] == "k" and coin[1:].isupper():
+        spec = markets.get(f"1000{coin[1:]}")
+    return spec
 
 
 def _reduce_only_for_delta(current_qty: Decimal, delta_qty: Decimal) -> bool:
@@ -852,6 +941,7 @@ class BybitCwsaExecutor:
         now_ms: int,
         *,
         execute: bool = False,
+        source_marks: dict[str, Decimal] | None = None,
     ) -> dict[str, Any]:
         """Run one reconcile -> target -> risk -> dispatch cycle."""
         snap: BrokerSnapshot = gateway.observe(now_ms)
@@ -897,9 +987,10 @@ class BybitCwsaExecutor:
             next_cp_ms = now_ms
         else:
             halt_reason = ""
-            wave_key, next_cp_ms, positions_by_source, phases = _load_cwsa_snapshot(
+            wave_key, next_cp_ms, positions_by_source, phases, snapshot_marks = _load_cwsa_snapshot(
                 self._source_db, self._member_k
             )
+            merged_source_marks = _merge_source_marks(snapshot_marks, source_marks)
             non_continuous = [
                 (sid, ph) for sid, ph in sorted(phases.items()) if ph != "CONTINUOUS"
             ]
@@ -926,10 +1017,13 @@ class BybitCwsaExecutor:
                 if spec is None:
                     skipped.append({"coin": coin, "reason": "UNSUPPORTED_BYBIT_USDT_PERP"})
                     continue
-                scaled = (
-                    qty * Decimal("1000")
-                    if spec.symbol.startswith("1000") and not coin.startswith(("1000", "k"))
-                    else qty
+                follower_mark = _symbol_mark_price(spec.symbol, snap, spec)
+                scaled = _size_target_qty(
+                    coin,
+                    qty,
+                    spec,
+                    source_mark=merged_source_marks.get(coin),
+                    follower_mark=follower_mark,
                 )
                 target_by_symbol[spec.symbol] = target_by_symbol.get(spec.symbol, _ZERO) + scaled
 
