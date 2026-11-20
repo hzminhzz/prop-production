@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .deployment_contracts import code_recovery
+from .evidence import digest
 
 UNITS = tuple("prop-production-" + role + ".service" for role in (
     "broker", "guardian", "observer", "watchdog", "bybit-observer"
@@ -25,6 +26,8 @@ UNITS = tuple("prop-production-" + role + ".service" for role in (
 MARKERS = ("COMMIT", "TREE", "SOURCE.tar", "SOURCE.sha256", "compatibility.json")
 ARTIFACT_DIRS = ("source", "connector", "units", "dist", "venv")
 ServiceCall = Callable[[list[str]], None]
+DEFAULT_JOURNAL = Path("/var/lib/prop-production/guardian/account.sqlite")
+RETIREMENT_SCHEMA = "predecessor_retirement_v1"
 
 
 def _sha(path: Path) -> str:
@@ -169,6 +172,90 @@ def _code_transition(source: Path, target: Path, *, target_verified: bool = Fals
     ))
 
 
+def _journal_state(journal: Path) -> dict[str, Any]:
+    """ABSENT or a read-only verified legacy v1 chain; anything else fails closed."""
+    if not os.path.lexists(journal):
+        return {"state": "ABSENT"}
+    from .journal_archive import scan_archive  # heavy imports stay off the activation path
+
+    try:
+        scan = scan_archive(journal)
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        raise ValueError("RETIRE_JOURNAL_UNVERIFIABLE:" + type(exc).__name__) from exc
+    if scan.semantic_events:
+        raise ValueError("RETIRE_JOURNAL_NOT_V1")
+    return {"state": "VERIFIED_V1", "sequence": scan.sequence, "head": scan.head,
+            "legacy_events": scan.legacy_events, "semantic_events": scan.semantic_events,
+            "archive_release_shas": list(scan.release_shas)}
+
+
+def _receipt_path(opt: Path, predecessor: str, candidate: str) -> Path:
+    return opt / "retirements" / f"{predecessor}__{candidate}.json"
+
+
+def retire_predecessor(opt: Path, candidate: Path, *, journal: Path = DEFAULT_JOURNAL) -> dict[str, Any]:
+    """Write the receipt proving a FENCED predecessor is safe to retire. Mutates nothing else."""
+    releases = (opt / "releases").resolve()
+    current = opt / "current"
+    if not current.is_symlink():
+        raise ValueError("RETIRE_CURRENT_NOT_SYMLINK")
+    predecessor = current.resolve(strict=True)
+    if predecessor.parent != releases:
+        raise ValueError("PREVIOUS_RELEASE_OUTSIDE_ROOT")
+    if candidate.is_symlink() or candidate.resolve().parent != releases:
+        raise ValueError("RELEASE_OUTSIDE_ROOT")
+    candidate = candidate.resolve()
+    if candidate == predecessor:
+        raise ValueError("RETIRE_CANDIDATE_IS_PREDECESSOR")
+    verify_bundle(predecessor, expected_commit=predecessor.name)
+    verify_bundle(candidate, expected_commit=candidate.name)
+    transition = _code_transition(predecessor, candidate)
+    if transition["successor"] != "FENCED":
+        raise ValueError("RETIRE_NOT_REQUIRED")
+    record_path = opt / "activation.json"
+    if record_path.exists() and json.loads(record_path.read_text())["phase"] in {
+            "PREPARED", "ROLLBACK_FAILED"}:
+        raise ValueError("RETIRE_ACTIVATION_INTERRUPTED")
+    body: dict[str, Any] = {
+        "schema": RETIREMENT_SCHEMA, "predecessor": predecessor.name,
+        "candidate": candidate.name, "evidence_sha": transition["evidence_sha"],
+        "journal_path": str(journal), "journal": _journal_state(journal),
+        "at_ms": time.time_ns() // 1_000_000,
+        "execution_mode": "SHADOW", "trading_authorized": False,
+    }
+    receipt = {**body, "receipt_sha": digest(body)}
+    directory = opt / "retirements"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    _atomic_json(_receipt_path(opt, predecessor.name, candidate.name), receipt)
+    return receipt
+
+
+def _accepted_retirement(opt: Path, previous: Path, release: Path, transition: dict[str, Any],
+                         journal: Path) -> str | None:
+    """Receipt digest when a valid, current receipt covers exactly this transition."""
+    path = _receipt_path(opt, previous.name, release.name)
+    try:
+        status = path.lstat()
+        if (path.is_symlink() or status.st_uid != os.geteuid() or status.st_mode & 0o077
+                or (opt / "retirements").stat().st_mode & 0o077):
+            return None
+        receipt = json.loads(path.read_text())
+        claimed = receipt.pop("receipt_sha")
+        if (digest(receipt) != claimed or receipt["schema"] != RETIREMENT_SCHEMA
+                or receipt["predecessor"] != previous.name
+                or receipt["candidate"] != release.name
+                or receipt["evidence_sha"] != transition["evidence_sha"]
+                or receipt["execution_mode"] != "SHADOW"
+                or receipt["trading_authorized"] is not False
+                or receipt["journal_path"] != str(journal)
+                or receipt["journal"] != _journal_state(journal)):
+            return None
+        return str(claimed)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error):
+        return None
+
+
 def _restore(opt: Path, unit_dir: Path, record: dict[str, Any], service: ServiceCall,
              *, target: Path | None = None) -> None:
     service(["stop", *UNITS])
@@ -221,7 +308,7 @@ def recover_activation(opt: Path, unit_dir: Path, *, service: ServiceCall = _sys
 def activate_release(
     opt: Path, unit_dir: Path, release: Path, *,
     previous_active: list[str], health_check: Callable[[], None],
-    service: ServiceCall = _systemctl,
+    service: ServiceCall = _systemctl, journal: Path = DEFAULT_JOURNAL,
 ) -> None:
     """Snapshot units and pointer; roll back the exact code set after a failed start."""
     if release.is_symlink() or release.resolve().parent != (opt / "releases").resolve():
@@ -238,12 +325,17 @@ def activate_release(
     previous = current.resolve(strict=True) if current.is_symlink() else None
     if previous is not None and previous.parent != (opt / "releases").resolve():
         raise ValueError("PREVIOUS_RELEASE_OUTSIDE_ROOT")
+    retired: str | None = None
+    fence_cleared = False
     if previous is not None:
         transition = _code_transition(previous, release, target_verified=True)
         if transition["successor"] != "COMPATIBLE":
-            service(["stop", *UNITS])
-            _atomic_json(opt / "code-fence.json", transition)
-            raise ValueError("ACTIVATION_INCOMPATIBLE_DURABLE_CONTRACTS")
+            retired = _accepted_retirement(opt, previous, release, transition, journal)
+            if retired is None:
+                service(["stop", *UNITS])
+                _atomic_json(opt / "code-fence.json", transition)
+                raise ValueError("ACTIVATION_INCOMPATIBLE_DURABLE_CONTRACTS")
+            fence_cleared = True
     if any((unit_dir / unit).is_symlink() for unit in UNITS):
         raise ValueError("UNIT_PATH_IS_SYMLINK")
     if current.exists() and previous is None:
@@ -257,6 +349,8 @@ def activate_release(
     record = {"phase": "PREPARED", "candidate": str(release),
               "previous": str(previous) if previous else None,
               "previous_active": previous_active, "backup": str(backup), "units": units}
+    if retired is not None:
+        record["retired_predecessor_receipt"] = retired
     _atomic_json(record_path, record)
     try:
         service(["stop", *UNITS])
@@ -280,6 +374,17 @@ def activate_release(
         raise
     record["phase"] = "ACTIVE"
     _atomic_json(record_path, record)
+    if fence_cleared:
+        _clear_matching_fence(opt / "code-fence.json", transition["evidence_sha"])
+
+
+def _clear_matching_fence(path: Path, evidence_sha: str) -> None:
+    try:
+        stale = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if isinstance(stale, dict) and stale.get("evidence_sha") == evidence_sha:
+        path.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -323,10 +428,12 @@ def fresh_heartbeats(state: Path, started: float) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("seal", "verify", "activate", "recover", "backup"))
+    parser.add_argument("action", choices=("seal", "verify", "activate", "recover", "backup", "retire-predecessor"))
     parser.add_argument("path", type=Path)
     parser.add_argument("--commit")
     parser.add_argument("--target", type=Path)
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--journal", type=Path, default=DEFAULT_JOURNAL)
     parser.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.action == "verify":
@@ -344,7 +451,14 @@ def main() -> None:
             raise PermissionError("ROOT_RELEASE_AUTHORITY_REQUIRED")
         opt, unit_dir = Path("/opt/prop-production"), Path("/etc/systemd/system")
         with release_lock(opt, args.lock_fd):
-            if args.action == "recover":
+            if args.action == "retire-predecessor":
+                if args.path.resolve() != opt or args.candidate is None:
+                    parser.error("OPT_ROOT and --candidate required")
+                _root_protected_release(args.candidate)
+                _root_protected_release((opt / "current").resolve(strict=True))
+                receipt = retire_predecessor(opt, args.candidate, journal=args.journal)
+                print("PREDECESSOR_RETIREMENT_RECEIPT " + receipt["receipt_sha"])
+            elif args.action == "recover":
                 if args.path.resolve() != opt:
                     raise ValueError("RECOVERY_ROOT")
                 if args.target is not None:
@@ -359,7 +473,8 @@ def main() -> None:
                 activate_release(opt, unit_dir, args.path, previous_active=active,
                                  health_check=lambda: fresh_heartbeats(
                                      Path("/var/lib/prop-production"), started))
-        print("RELEASE_OPERATION_VERIFIED; SHADOW / NO_TRADE")
+        if args.action != "retire-predecessor":
+            print("RELEASE_OPERATION_VERIFIED; SHADOW / NO_TRADE")
 
 
 if __name__ == "__main__":

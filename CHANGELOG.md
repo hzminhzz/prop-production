@@ -5,6 +5,7 @@ All notable changes to `prop-production` are documented in this file.
 ## [Phase D & E — Unified Kernel Cutover] - 2026-11-20
 
 ### Added
+- `deployment retire-predecessor`: audited, fail-closed `predecessor_retirement_v1` receipt that lets `activate` proceed past a FENCED durable-contract transition only when the predecessor journal is absent or a read-only verified legacy v1 chain; scan logic moved to `prop_production.journal_archive` (verifier script unchanged in behavior).
 - `packages/copytrade-kernel`: zero-dependency, `mypy --strict` Python 3.13+ stdlib package hosting `clocks`, `money` (`NativeInstrument`, `FixedKSizing`), `rulebooks` (`RulebookCatalog`), `mandates` (`CopyMandateSpec`, disjoint `MandateLifecycle`, `OpeningMissed` Q14–Q24 ADTs), `accounting` (`account_step`), `risk`, `decision`, and `kernel` (`step_checkpoint`, `effective_policy`, `NetOrderIntent`).
 - `src/prop_production/checkpoint_receiver.py` & `checkpoint_kernel.py`: extracted wire-V3 `CheckpointSourceReceiver` and deep-immutable `KernelState` boundary adapter.
 - `scripts/verify_legacy_v1_journal.py` & `tests/test_verify_legacy_journal.py`: standalone read-only verifier for pre-cutover `portfolio_release_v1` archives.

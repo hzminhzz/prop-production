@@ -113,6 +113,32 @@ contracts. The automatic failed-upgrade recovery restores the captured prior cod
 and units, including a legacy currently running release, without rewriting its files.
 A successful code rollback does not clear HALT, reverse fills or lower the trust floor.
 
+## Retiring a predecessor behind the code fence
+
+When `activate` of a candidate fails with `ACTIVATION_INCOMPATIBLE_DURABLE_CONTRACTS`,
+the units stay stopped and `code-fence.json` is written. The fence is the default and
+is never lifted implicitly. With the services stopped (a live journal has a WAL and
+fails verification), an operator may record that the predecessor is safe to retire:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" /opt/prop-production/releases/CANDIDATE_SHA/venv/bin/python \
+  -m prop_production.deployment retire-predecessor /opt/prop-production \
+  --candidate /opt/prop-production/releases/CANDIDATE_SHA \
+  --journal /var/lib/prop-production/guardian/account.sqlite
+```
+
+It proves: `current` is the predecessor, both bundles verify and are SHADOW with
+`trading_authorized` false, the pair is genuinely `FENCED`, no activation is
+interrupted, and the journal is either absent or a legacy v1 chain that verifies
+read-only (hash chain, snapshot, no semantic-v2 rows). The result is a root-private
+`retirements/PRED__CAND.json` (`predecessor_retirement_v1`, self-digested).
+
+`activate` then accepts the receipt only if its digest, the transition evidence and a
+fresh journal re-check all still match; otherwise the fence behaves exactly as before.
+It never changes `current`, units, journals or `code-fence.json`; only a successful
+activation clears a fence written for the same transition and records
+`retired_predecessor_receipt` in `activation.json`.
+
 ## Service and state ownership
 
 | Unit suffix (prop-production-) | Identity | Responsibility |
