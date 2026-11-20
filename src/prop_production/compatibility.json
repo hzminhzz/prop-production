@@ -4,7 +4,7 @@
   "repositories": {
     "copytrade-pm": {
       "repository": "hzminhzz/copytrade-pm",
-      "commit": "5a673f03e6d5240d27c1e698806df288b301e148"
+      "commit": "e1ec715016bbd9f2b84de0bae46bfa3b25324638"
     },
     "trading-connector": {
       "repository": "hzminhzz/trading-connector",
