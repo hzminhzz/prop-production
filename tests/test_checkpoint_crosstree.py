@@ -79,7 +79,7 @@ def test_exact_producer_to_sixteen_paper_consumers_and_guardian_readonly_shadow(
         # Re-ingesting the actual producer's packets must be idempotent.
         for packet in result["packets"]:
             s.receiver.ingest(json.dumps(packet).encode(), now_ms=s.now)
-        assert s.receiver.due(now_ms=s.now) == []
+        assert not hasattr(s.receiver, "due")
         s.guardian.reconcile(s.now)
         quotes = {
             "BTC": {"bid": "9999", "ask": "10001", "known_at_ms": s.now},
