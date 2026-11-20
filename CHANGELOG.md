@@ -13,7 +13,7 @@ All notable changes to `prop-production` are documented in this file.
 
 ### Changed
 - Consolidated Guardian admission, risk, execution projection, mandate lifecycle, and challenge rulebooks onto `copytrade_kernel`.
-- Updated `src/prop_production/compatibility.json` to pin `copytrade_pm` Phase D/E revision (`e1ec715016bbd9f2b84de0bae46bfa3b25324638`), wire V3, `portfolio_release_v2`, and `checkpoint_decision_q15_v1`.
+- Updated `src/prop_production/compatibility.json` to pin `copytrade_pm` Phase D/E revision (`e9aabc29b046d1a01928c2ed47d6543296a4134c`), wire V3, `portfolio_release_v2`, and `checkpoint_decision_q15_v1`.
 - Updated `AGENTS.md`, `README.md`, `docs/SIZING-POLICY.md`, and `docs/LOCAL-VERIFICATION.md` to reflect the deleted Planner, retired `ALLOCATION_OVER_LIVE_NAV`, and `copytrade-kernel` single authority.
 
 ### Removed
