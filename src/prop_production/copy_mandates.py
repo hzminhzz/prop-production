@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any
 
+from copytrade_kernel import CopyMandateSpec
+from copytrade_kernel.mandates import (
+    MandateEvent as MandateEvent,
+)
+from copytrade_kernel.mandates import (
+    MandatePhase as MandatePhase,
+)
+from copytrade_kernel.mandates import (
+    MandateState as MandateState,
+)
+from copytrade_kernel.mandates import (
+    MandateTransition as MandateTransition,
+)
+from copytrade_kernel.mandates import (
+    transition_mandate as kernel_transition_mandate,
+)
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .checkpoint_source import fields, integer, parse_vector, validate_pins, verified_outcome
-from .contracts import PORTFOLIO_RELEASE_V1, PORTFOLIO_RELEASE_V2
+from .checkpoint_source import fields, integer, validate_pins, verified_outcome
+from .contracts import PORTFOLIO_RELEASE_V2
 from .evidence import canonical, decimal, digest, load_json, require_sha, verify
 
 
@@ -20,59 +35,7 @@ class CopyMandate:
 
     @classmethod
     def parse(cls, value: dict[str, Any]) -> CopyMandate:
-        fields(
-            value,
-            {
-                "schema",
-                "mandate_id",
-                "generation",
-                "source_id",
-                "source_scope_generation",
-                "source_account_sha",
-                "account_id",
-                "pod_id",
-                "k",
-                "allowed_markets",
-                "policy_epoch",
-                "risk_policy_sha",
-                "rulebook_sha",
-                "effective_from_ms",
-                "effective_until_ms",
-                "sizing_policy",
-                "entry_policy",
-                "exit_policy",
-            },
-        )
-        if (
-            value["schema"] != "copy_mandate_v1"
-            or value["sizing_policy"] != "FIXED_K_NATIVE_QUANTITY"
-            or value["entry_policy"] != "ONE_SHOT_CHECKPOINT_V3"
-            or value["exit_policy"] != "NATIVE_SAFE_CROSS_OR_REDUCE_V3"
-        ):
-            raise ValueError("MANDATE_CONTRACT")
-        for key in ("mandate_id", "source_id", "account_id", "pod_id"):
-            if not isinstance(value[key], str) or not 1 <= len(value[key]) <= 100:
-                raise ValueError("MANDATE_IDENTITY")
-        for key in (
-            "source_scope_generation",
-            "source_account_sha",
-            "policy_epoch",
-            "risk_policy_sha",
-            "rulebook_sha",
-        ):
-            require_sha(value[key])
-        if (
-            integer(value["generation"]) == 0
-            or not isinstance(value["k"], str)
-            or len(value["k"]) > 128
-            or not 0 < decimal(value["k"]) <= 10
-            or integer(value["effective_until_ms"]) <= integer(value["effective_from_ms"])
-        ):
-            raise ValueError("MANDATE_GENERATION_K_OR_CLOCK")
-        markets = value["allowed_markets"]
-        if not isinstance(markets, list) or not markets:
-            raise ValueError("MANDATE_MARKETS")
-        parse_vector([{"instrument": market, "quantity": "1"} for market in markets])
+        CopyMandateSpec.parse(value)
         return cls(canonical(value))
 
     @property
@@ -89,106 +52,6 @@ class CopyMandate:
         return digest([body["account_id"], body["mandate_id"], body["generation"]])
 
 
-class MandatePhase(StrEnum):
-    ABSENT = "ABSENT"
-    AWAITING_BASELINE = "AWAITING_BASELINE"
-    ACTIVE = "ACTIVE"
-    PAUSED = "PAUSED"
-    RETIRED = "RETIRED"
-
-
-class MandateEvent(StrEnum):
-    ACTIVATE = "ACTIVATE"
-    COMPLETE_BASELINE = "COMPLETE_BASELINE"
-    PAUSE = "PAUSE"
-    RETIRE = "RETIRE"
-
-
-@dataclass(frozen=True)
-class MandateState:
-    phase: MandatePhase
-    mandate_sha: str
-    sequence: int
-    activated_ms: int | None = None
-    baseline_outcome_id: str | None = None
-
-    @classmethod
-    def initial(cls, mandate: CopyMandate) -> MandateState:
-        return cls(MandatePhase.ABSENT, mandate.sha, 0)
-
-    @classmethod
-    def parse(cls, value: dict[str, Any]) -> MandateState:
-        fields(value, {"phase", "mandate_sha", "sequence", "activated_ms", "baseline_outcome_id"})
-        require_sha(value["mandate_sha"])
-        integer(value["sequence"])
-        if value["activated_ms"] is not None:
-            integer(value["activated_ms"])
-        if value["baseline_outcome_id"] is not None:
-            require_sha(value["baseline_outcome_id"])
-        return cls(
-            MandatePhase(value["phase"]),
-            value["mandate_sha"],
-            value["sequence"],
-            value["activated_ms"],
-            value["baseline_outcome_id"],
-        )
-
-    @property
-    def data(self) -> dict[str, Any]:
-        return {
-            "phase": self.phase.value,
-            "mandate_sha": self.mandate_sha,
-            "sequence": self.sequence,
-            "activated_ms": self.activated_ms,
-            "baseline_outcome_id": self.baseline_outcome_id,
-        }
-
-    @property
-    def sha(self) -> str:
-        return digest(self.data)
-
-
-MandateGuard = Literal[
-    "PROSPECTIVE_ACTIVATION",
-    "POST_ACTIVATION_COMPLETE",
-    "AUTHORIZED_STOP",
-    "ILLEGAL_EDGE",
-    "INVALID_CLOCK",
-]
-MandateEffect = Literal[
-    "AWAIT_BASELINE", "BASELINE_ONLY", "STOP_NEW_RISK_PRESERVE_OBLIGATIONS", "REJECTED"
-]
-
-
-@dataclass(frozen=True)
-class MandateTransition:
-    predecessor: MandateState
-    event: MandateEvent
-    evidence_sha: str
-    at_ms: int
-    guard: MandateGuard
-    successor: MandateState
-    effect: MandateEffect
-    checkpoint_ms: int | None = None
-
-    @property
-    def data(self) -> dict[str, Any]:
-        return {
-            "schema": "copy_mandate_transition_v1",
-            "predecessor": self.predecessor.data,
-            "event": self.event.value,
-            "evidence_sha": self.evidence_sha,
-            "actor": "SOURCE_CONSUMER"
-            if self.event == MandateEvent.COMPLETE_BASELINE
-            else "RELEASE_AUTHORITY",
-            "at_ms": self.at_ms,
-            "guard": self.guard,
-            "successor": self.successor.data,
-            "effect": self.effect,
-            "checkpoint_ms": self.checkpoint_ms,
-        }
-
-
 def transition_mandate(
     mandate: CopyMandate,
     before: MandateState,
@@ -198,49 +61,18 @@ def transition_mandate(
     at_ms: int,
     checkpoint_ms: int | None = None,
 ) -> MandateTransition:
-    integer(at_ms)
-    require_sha(evidence_sha)
-    if before.mandate_sha != mandate.sha:
-        raise ValueError("MANDATE_PREDECESSOR")
-    m = mandate.data
-    body = dict(before.data, sequence=before.sequence + 1)
-    guard: MandateGuard = "ILLEGAL_EDGE"
-    effect: MandateEffect = "REJECTED"
-    if event == MandateEvent.ACTIVATE and before.phase == MandatePhase.ABSENT:
-        if at_ms <= m["effective_from_ms"]:
-            body.update(phase="AWAITING_BASELINE", activated_ms=at_ms)
-            guard, effect = "PROSPECTIVE_ACTIVATION", "AWAIT_BASELINE"
-        else:
-            guard = "INVALID_CLOCK"
-    elif event == MandateEvent.COMPLETE_BASELINE and before.phase == MandatePhase.AWAITING_BASELINE:
-        if (
-            type(checkpoint_ms) is int
-            and m["effective_from_ms"] <= checkpoint_ms <= at_ms
-            and at_ms < m["effective_until_ms"]
-        ):
-            body.update(phase="ACTIVE", baseline_outcome_id=evidence_sha)
-            guard, effect = "POST_ACTIVATION_COMPLETE", "BASELINE_ONLY"
-        else:
-            guard = "INVALID_CLOCK"
-    elif (
-        event == MandateEvent.PAUSE
-        and before.phase in (MandatePhase.AWAITING_BASELINE, MandatePhase.ACTIVE)
-    ) or (
-        event == MandateEvent.RETIRE
-        and before.phase
-        in (MandatePhase.AWAITING_BASELINE, MandatePhase.ACTIVE, MandatePhase.PAUSED)
-    ):
-        if before.activated_ms is not None and at_ms >= before.activated_ms:
-            body["phase"] = "PAUSED" if event == MandateEvent.PAUSE else "RETIRED"
-            guard, effect = "AUTHORIZED_STOP", "STOP_NEW_RISK_PRESERVE_OBLIGATIONS"
-        else:
-            guard = "INVALID_CLOCK"
-    return MandateTransition(
-        before, event, evidence_sha, at_ms, guard, MandateState.parse(body), effect, checkpoint_ms
+    return kernel_transition_mandate(
+        CopyMandateSpec.parse(mandate.data),
+        before,
+        mandate_sha=mandate.sha,
+        event=event,
+        evidence_sha=evidence_sha,
+        at_ms=at_ms,
+        checkpoint_ms=checkpoint_ms,
     )
 
 
-def verify_release_contract(payload: dict[str, Any], authority_public: bytes) -> dict[str, Any]:
+def verify_release_contract(payload: dict[str, Any], authority_public: bytes) -> None:
     extra = {"checkpoint_policy", "checkpoint_scopes", "mandates", "mandate_authority_sha"}
     if not extra.issubset(payload):
         raise ValueError("MANDATE_RELEASE_FIELDS")
@@ -291,13 +123,6 @@ def verify_release_contract(payload: dict[str, Any], authority_public: bytes) ->
             or member["allowed_markets"] != m["allowed_markets"]
         ):
             raise ValueError("MANDATE_RELEASE_MEMBER_DRIFT")
-    # Existing v1 validation is reused for common provenance/risk/identity
-    # fields only. The verified result retains the signed v2 payload.
-    return {
-        k: (PORTFOLIO_RELEASE_V1 if k == "schema" else value)
-        for k, value in payload.items()
-        if k not in extra
-    }
 
 
 def mandate_authority(
@@ -419,7 +244,7 @@ def prepare_control_mandate(
         return MandateState.parse(replay["result"]), None
     entry = state["copy_mandates"][command["owner"]]
     mandate, before = CopyMandate.parse(entry["mandate"]), MandateState.parse(entry["state"])
-    if mandate.sha != command["mandate_sha"] or before.sha != command["predecessor_sha"]:
+    if mandate.sha != command["mandate_sha"] or digest(before.data) != command["predecessor_sha"]:
         raise ValueError("MANDATE_CONTROL_PREDECESSOR")
     transition = transition_mandate(
         mandate,
@@ -571,7 +396,7 @@ def validate_mandate_history(previous: dict[str, Any], current: dict[str, Any], 
                 )
                 if (
                     digest(command) != transition["evidence_sha"]
-                    or command["predecessor_sha"] != before.sha
+                    or command["predecessor_sha"] != digest(before.data)
                     or command["mandate_sha"] != mandate.sha
                     or command["event"] != transition["event"]
                     or not command["issued_ms"] <= transition["at_ms"] < command["expires_ms"]

@@ -6,7 +6,11 @@ import pytest
 import test_checkpoint_guardian as checkpoint_fixture
 from test_checkpoint_guardian import prime
 from test_checkpoint_receiver import fixture_packet
-from test_planner import quote
+
+
+def quote(now):
+    return {"BTC": {"bid": "10000", "ask": "10030", "known_at_ms": now}}
+
 
 system = checkpoint_fixture.system
 

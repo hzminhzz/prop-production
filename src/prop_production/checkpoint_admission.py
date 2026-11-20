@@ -8,6 +8,16 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from hashlib import sha256
 from typing import Any
 
+from copytrade_kernel import (
+    DECISION_SEMANTICS,
+    Q15_REJECTION,
+    CheckpointBatch,
+    CheckpointMs,
+    KernelState,
+    ProspectiveCWSA,
+    require_prospective,
+    step_checkpoint,
+)
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .checkpoint_account_proof import validate as validate_account_proof
@@ -27,6 +37,13 @@ from .checkpoint_execution import (
 )
 from .checkpoint_execution import (
     OpportunityPhase as Phase,
+)
+from .checkpoint_kernel import (
+    VerifiedChange,
+    checkpoint_batch,
+    decision_inputs,
+    kernel_state,
+    provenance,
 )
 from .checkpoint_risk import (
     account_anchor,
@@ -53,6 +70,60 @@ from .v4_market_identity import validate_independent_quotes
 ZERO = Decimal(0)
 TERMINAL = TERMINAL_OPPORTUNITY_PHASES
 POLICY = CHECKPOINT_POLICY_V3
+SEMANTICS_FIELD = "checkpoint_decision_semantics"
+
+
+def prospective_targets(
+    state: KernelState,
+    frame: CheckpointBatch[ProspectiveCWSA],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]], bool]:
+    require_prospective(frame)
+    result = step_checkpoint(state=state, frame=frame)
+    pods = [
+        {"pod_id": owner, "requested_notionals": dict(book)} for owner, book in result.notionals
+    ]
+    blocked = {owner: list(keys) for owner, keys in result.opening_rejections}
+    retry_only = (
+        bool(blocked)
+        and not any(book for _, book in result.notionals)
+        and not any(quantity for book in state.owner_books for _, quantity in book.positions)
+    )
+    return pods, blocked, retry_only
+
+
+def _changes(
+    selected: list[tuple[CopyMandate, dict[str, Any]]],
+    markets: dict[str, Any],
+    checkpoint_ms: int,
+) -> tuple[CheckpointBatch[ProspectiveCWSA], dict[str, str]]:
+    mapping = {spec["source_instrument"]: market for market, spec in markets.items()}
+    if len(mapping) != len(markets):
+        raise ValueError("CHECKPOINT_NATIVE_MARKET_MAPPING")
+    changes = {}
+    for mandate, record in selected:
+        outcome, marks = source_proof(
+            record["proof"],
+            record["source_public"],
+            record["outcome_id"],
+            record["scope"],
+            record["policy"],
+        )
+        instruments = {leg["instrument"] for leg in outcome["positions"]}
+        if set(marks) != instruments:
+            raise ValueError("CHECKPOINT_NATIVE_SOURCE_MARK_UNAVAILABLE")
+        if (
+            not instruments <= set(mandate.data["allowed_markets"])
+            or not instruments <= mapping.keys()
+        ):
+            raise ValueError("CHECKPOINT_NATIVE_MARKET_UNSUPPORTED")
+        changes[mandate.owner] = VerifiedChange(
+            outcome,
+            marks,
+            provenance(record),
+            mandate.data["k"],
+            record["state"]["deadline_ms"],
+        )
+    return checkpoint_batch(changes, mapping, CheckpointMs(checkpoint_ms)), mapping
 
 
 def source_proof(
@@ -141,9 +212,7 @@ def prepare_review(
     quote_envelope: dict[str, Any] | None = None,
     quote_key: Ed25519PublicKey | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    mandate_authority(
-        mandate_key, release.payload, signed=release.signed_envelope is not None
-    )
+    mandate_authority(mandate_key, release.payload, signed=release.signed_envelope is not None)
     integer(now_ms)
     if not isinstance(requests, dict) or not requests:
         raise ValueError("CHECKPOINT_REQUESTS")
@@ -222,6 +291,7 @@ def prepare_review(
     if previous and previous["result"]["status"] in TERMINAL:
         return dict(previous["result"]), None
     next_state = copy.deepcopy(state)
+    next_state[SEMANTICS_FIELD] = DECISION_SEMANTICS
     opportunities = next_state.setdefault("checkpoint_opportunities", {})
     opportunities.update(new_opportunities)
     decisions = next_state.setdefault("checkpoint_decisions", {})
@@ -287,38 +357,21 @@ def prepare_review(
         if owner not in active_owners
     }
     account_proof: dict[str, Any] = {}
+    opening_rejections: dict[str, list[str]] | None = None
     if not terminal_reasons:
         try:
-            mapping = {
-                spec["source_instrument"]: market
-                for market, spec in markets.items()
-                if "source_instrument" in spec
-            }
-            if len(mapping) != len(markets):
-                raise ValueError("CHECKPOINT_NATIVE_MARKET_MAPPING")
-            for identity, (m, _, _) in selected.items():
-                record = opportunities[identity]
-                outcome, marks = source_proof(
-                    record["proof"],
-                    record["source_public"],
-                    record["outcome_id"],
-                    record["scope"],
-                    record["policy"],
-                )
-                if set(marks) != {leg["instrument"] for leg in outcome["positions"]}:
-                    raise ValueError("CHECKPOINT_NATIVE_SOURCE_MARK_UNAVAILABLE")
-                requested = {}
-                for leg in outcome["positions"]:
-                    source = leg["instrument"]
-                    if source not in m.data["allowed_markets"] or source not in mapping:
-                        raise ValueError("CHECKPOINT_NATIVE_MARKET_UNSUPPORTED")
-                    requested[mapping[source]] = str(
-                        decimal(leg["quantity"]) * decimal(marks[source]) * decimal(m.data["k"])
-                    )
-                pods.append({"pod_id": m.owner, "requested_notionals": requested})
+            frame, mapping = _changes(
+                [(m, opportunities[identity]) for identity, (m, _, _) in selected.items()],
+                markets,
+                checkpoint_ms,
+            )
+            inputs_state = kernel_state(state, active_owners, mapping, frame.checkpoint_ms)
+            pods, opening_rejections, retry_only = prospective_targets(inputs_state, frame)
             for owner in frozen:
                 pods.append({"pod_id": owner, "requested_notionals": {}})
             pods.sort(key=lambda pod: pod["pod_id"])
+            if retry_only:
+                raise ValueError(Q15_REJECTION)
             needed = set(next_state["positions"]) | {
                 m for pod in pods for m in pod["requested_notionals"]
             }
@@ -346,36 +399,30 @@ def prepare_review(
             if temporary:
                 result.update(status="PRE_DISPATCH_BLOCKED", reasons=temporary)
             else:
-                finance = dict(
-                    next_state["finance"], pod_loss_used=next_state.get("pod_loss_used", {})
+                step = step_checkpoint(
+                    state=inputs_state,
+                    frame=frame,
+                    inputs=decision_inputs(
+                        state,
+                        policy,
+                        markets,
+                        quotes,
+                        account_proof,
+                        now_ms,
+                        synthetic=gateway.synthetic,
+                    ),
                 )
-                risk = size_book(
-                    pods,
-                    quotes,
-                    markets,
-                    effective_policy(next_state, policy, markets),
-                    finance,
-                    next_state["positions"],
-                    next_state["pod_positions"],
-                    [],
-                    now_ms=now_ms,
-                    quantity_price_policy="EXECUTABLE_SIDE_V3",
-                    frozen_pods=frozen,
-                )
+                execution = step.execution
+                assert execution is not None
+                risk = execution.risk.data()
                 result["risk"] = risk
                 if risk["status"] != "ACCEPTED":
                     terminal_reasons.extend(risk["reasons"])
+                elif execution.projection_error is not None:
+                    terminal_reasons.append(execution.projection_error)
                 else:
-                    result["execution_plan"] = project(
-                        next_state,
-                        risk,
-                        account_proof,
-                        markets,
-                        quotes,
-                        frozen,
-                        now_ms=now_ms,
-                        synthetic=gateway.synthetic,
-                    )
+                    assert execution.execution_plan is not None
+                    result["execution_plan"] = execution.execution_plan.data()
                     if conflicts(next_state, result["execution_plan"], checkpoint_ms):
                         terminal_reasons.append("MARKET_CHECKPOINT_ALREADY_COMMITTED")
         except (ValueError, KeyError) as exc:
@@ -406,6 +453,8 @@ def prepare_review(
             )
     attempt = {
         "at_ms": now_ms,
+        SEMANTICS_FIELD: DECISION_SEMANTICS,
+        "opening_rejections": opening_rejections,
         "projection_version": "checkpoint_execution_projection_v2",
         "account_sha": account_anchor(next_state),
         "quotes": quotes,
@@ -451,9 +500,7 @@ def prepare_reserve(
     decision_id: str,
     now_ms: int,
 ) -> tuple[list[str], str | None, dict[str, Any] | None]:
-    mandate_authority(
-        mandate_key, release.payload, signed=release.signed_envelope is not None
-    )
+    mandate_authority(mandate_key, release.payload, signed=release.signed_envelope is not None)
     record = state.get("checkpoint_decisions", {}).get(decision_id)
     if record is None:
         raise ValueError("CHECKPOINT_DECISION_UNKNOWN")
@@ -488,6 +535,7 @@ def prepare_reserve(
     cfg = execution_policy(state, policy, markets)
     if (
         record["result"]["status"] != "REVIEWABLE"
+        or attempt.get(SEMANTICS_FIELD) != DECISION_SEMANTICS
         or scope_reasons
         or state["halts"]
         or state["reservations"]
@@ -659,6 +707,14 @@ def validate_history(
     *,
     previous_head: str | None = None,
 ) -> None:
+    prior_semantics = previous.get(SEMANTICS_FIELD)
+    semantics = current.get(SEMANTICS_FIELD)
+    if (
+        (SEMANTICS_FIELD in current and semantics != DECISION_SEMANTICS)
+        or (prior_semantics is not None and prior_semantics != semantics)
+        or (prior_semantics != semantics and kind != "CHECKPOINT_REVIEW")
+    ):
+        raise ValueError("CHECKPOINT_DECISION_SEMANTICS_TRANSITION")
     validate_protection(previous, current, kind, previous_head)
     validate_attribution(previous, current, kind)
     validate_claims(previous, current, kind)
@@ -731,6 +787,7 @@ def validate_history(
             raise ValueError("CHECKPOINT_PREMATURE_COMMITMENT")
     old_decisions = previous.get("checkpoint_decisions", {})
     decisions = current.get("checkpoint_decisions", {})
+    new_attempts = 0
     if not set(old_decisions).issubset(decisions):
         raise ValueError("CHECKPOINT_DECISION_REMOVED")
     for identity, record in decisions.items():
@@ -763,13 +820,31 @@ def validate_history(
                 record[k] != prior[k] for k in ("requests", "opportunity_ids", "release_sha")
             ):
                 raise ValueError("CHECKPOINT_DECISION_REWRITE")
-        if len(record["attempts"]) > len(old_decisions.get(identity, {}).get("attempts", [])):
+        prior_count = len(old_decisions.get(identity, {}).get("attempts", []))
+        if len(record["attempts"]) > prior_count:
             if kind != "CHECKPOINT_REVIEW" or record["attempts"][-1][
                 "account_sha"
             ] != account_anchor(previous):
                 raise ValueError("CHECKPOINT_DECISION_ACCOUNT_PREDECESSOR")
+            attempt = record["attempts"][-1]
+            if (
+                len(record["attempts"]) != prior_count + 1
+                or attempt.get(SEMANTICS_FIELD) != semantics
+                or (semantics is None and SEMANTICS_FIELD in attempt)
+            ):
+                raise ValueError("CHECKPOINT_DECISION_SEMANTICS_ATTEMPT")
+            new_attempts += 1
+            if semantics == DECISION_SEMANTICS and attempt["result"] != record["result"]:
+                raise ValueError("CHECKPOINT_DECISION_RESULT_BINDING")
             _verify_attempt(previous, current, record)
         if record["result"]["status"] == "COMMITTED_ONCE":
+            if (
+                semantics == DECISION_SEMANTICS
+                and old_decisions.get(identity, {}).get("result", {}).get("status")
+                != "COMMITTED_ONCE"
+                and record["attempts"][-1].get(SEMANTICS_FIELD) != DECISION_SEMANTICS
+            ):
+                raise ValueError("CHECKPOINT_HISTORICAL_REVIEW_CANNOT_RESERVE")
             plan = record["attempts"][-1]["execution_plan"]
             for opportunity_id in record["opportunity_ids"]:
                 opportunity = rows[opportunity_id]
@@ -778,6 +853,8 @@ def validate_history(
                     "MISSED" if missed else "COMMITTED_ONCE"
                 ) or opportunity["commitment"] != (None if missed else identity):
                     raise ValueError("CHECKPOINT_OPENING_DISPOSITION_REPLAY")
+    if semantics == DECISION_SEMANTICS and kind == "CHECKPOINT_REVIEW" and new_attempts != 1:
+        raise ValueError("CHECKPOINT_DECISION_SEMANTICS_ATTEMPT")
     if kind == "CHECKPOINT_REVIEW" and any(
         previous[k] != current[k]
         for k in (
@@ -839,6 +916,42 @@ def _verify_attempt(
 ) -> None:
     """Journal independently derives requested notionals and risk from retained proof."""
     attempt = record["attempts"][-1]
+    prospective_pods = None
+    replay_inputs: tuple[KernelState, CheckpointBatch[ProspectiveCWSA]] | None = None
+    if attempt.get(SEMANTICS_FIELD) == DECISION_SEMANTICS:
+        if attempt["projection_version"] != "checkpoint_execution_projection_v2":
+            raise ValueError("CHECKPOINT_EXECUTION_PROJECTION_VERSION")
+        if (
+            attempt["risk"] != attempt["result"]["risk"]
+            or attempt["execution_plan"] != attempt["result"]["execution_plan"]
+            or (attempt["risk"] is None and attempt["execution_plan"] is not None)
+        ):
+            raise ValueError("CHECKPOINT_DECISION_RESULT_BINDING")
+        if attempt["opening_rejections"] is not None:
+            rows = [current["checkpoint_opportunities"][key] for key in record["opportunity_ids"]]
+            changes = [
+                (CopyMandate.parse(current["copy_mandates"][row["state"]["owner"]]["mandate"]), row)
+                for row in rows
+            ]
+            frame, mapping = _changes(
+                changes, attempt["markets"], attempt["result"]["checkpoint_ms"]
+            )
+            frame_owners = {outcome.owner for outcome in frame.outcomes}
+            inputs_state = kernel_state(previous, frame_owners, mapping, frame.checkpoint_ms)
+            prospective_pods, blocked, retry_only = prospective_targets(inputs_state, frame)
+            replay_inputs = inputs_state, frame
+            if blocked != attempt["opening_rejections"] or (
+                retry_only
+                and (
+                    attempt["result"]["status"] != "MISSED"
+                    or Q15_REJECTION not in attempt["result"]["reasons"]
+                    or attempt["risk"] is not None
+                    or attempt["execution_plan"] is not None
+                )
+            ):
+                raise ValueError("CHECKPOINT_Q15_REPLAY")
+        elif attempt["risk"] is not None or attempt["execution_plan"] is not None:
+            raise ValueError("CHECKPOINT_Q15_PROOF_REQUIRED")
     if attempt["risk"] is None:
         return
     policy, markets = attempt["policy"], attempt["markets"]
@@ -863,6 +976,8 @@ def _verify_attempt(
         m = CopyMandate.parse(current["copy_mandates"][owner]["mandate"])
         if digest({"policy": policy, "markets": markets}) != m.data["risk_policy_sha"]:
             raise ValueError("CHECKPOINT_RISK_POLICY_PROOF")
+        if prospective_pods is not None:
+            continue
         outcome, marks = source_proof(
             opportunity["proof"],
             opportunity["source_public"],
@@ -879,6 +994,8 @@ def _verify_attempt(
                 decimal(leg["quantity"]) * decimal(marks[source]) * decimal(m.data["k"])
             )
         pods.append({"pod_id": owner, "requested_notionals": expected})
+    if prospective_pods is not None:
+        pods = prospective_pods
     frozen = {
         owner: dict(book)
         for owner, book in previous["pod_positions"].items()
@@ -889,6 +1006,36 @@ def _verify_attempt(
     pods.sort(key=lambda pod: pod["pod_id"])
     if pods != attempt["pods"] or frozen != attempt["frozen_pods"]:
         raise ValueError("CHECKPOINT_REQUEST_OR_RESIDUAL_PROOF")
+    if replay_inputs is not None:
+        inputs_state, frame = replay_inputs
+        execution = step_checkpoint(
+            state=inputs_state,
+            frame=frame,
+            inputs=decision_inputs(
+                previous,
+                policy,
+                markets,
+                attempt["quotes"],
+                attempt["account_proof"],
+                attempt["at_ms"],
+                synthetic=policy["source_mode"] == "SYNTHETIC",
+            ),
+        ).execution
+        assert execution is not None
+        if execution.risk.data() != attempt["risk"]:
+            raise ValueError("CHECKPOINT_RISK_REPLAY")
+        if execution.projection_error is not None:
+            if (
+                attempt["execution_plan"] is not None
+                or attempt["result"]["status"] != "MISSED"
+                or execution.projection_error not in attempt["result"]["reasons"]
+            ):
+                raise ValueError("CHECKPOINT_EXECUTION_REJECTION_REPLAY")
+        elif (
+            None if execution.execution_plan is None else execution.execution_plan.data()
+        ) != attempt["execution_plan"]:
+            raise ValueError("CHECKPOINT_EXECUTION_PROJECTION_REPLAY")
+        return
     finance = dict(previous["finance"], pod_loss_used=previous.get("pod_loss_used", {}))
     computed = size_book(
         pods,

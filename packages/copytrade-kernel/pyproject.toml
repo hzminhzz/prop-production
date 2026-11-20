@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "copytrade-kernel"
+version = "0.1.0"
+description = "Pure checkpoint decisions for Guardian and virtual paper"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.mypy]
+strict = true
+python_version = "3.13"

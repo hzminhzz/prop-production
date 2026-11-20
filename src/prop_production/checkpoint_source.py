@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from hashlib import sha256
 from typing import Any
 
+from copytrade_kernel import NativeInstrument
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .contracts import CHECKPOINT_SCHEMA_V3
@@ -119,12 +120,7 @@ def parse_vector(rows: Any) -> dict[str, Any]:
     for row in rows:
         fields(row, {"instrument", "quantity"})
         key, value = row["instrument"], row["quantity"]
-        if (
-            not isinstance(key, str)
-            or re.fullmatch(r"hyperliquid/mainnet:perp:[^/\s:]+/[^/\s:]+", key) is None
-            or not isinstance(value, str)
-            or len(value) > 128
-        ):
+        if not NativeInstrument.valid(key) or not isinstance(value, str) or len(value) > 128:
             raise ValueError("CWSA_NATIVE_KEY_OR_QUANTITY")
         quantity = decimal(value)
         if not quantity or abs(int(quantity.as_tuple().exponent)) > 128 or key in result:

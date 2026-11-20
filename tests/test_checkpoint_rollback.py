@@ -19,9 +19,17 @@ def legacy_bundle(path):
     seal_bundle(path)
 
 
+def pre_q15_bundle(path):
+    file = path / "compatibility.json"
+    body = json.loads(file.read_text())
+    body["contracts"].pop("checkpoint_decision_semantics")
+    file.write_text(json.dumps(body))
+    seal_bundle(path)
+
+
 def test_incompatible_automatic_rollback_stops_without_rewinding(tmp_path):
     opt, units, candidate, previous, journal = layout(tmp_path)
-    legacy_bundle(previous)
+    pre_q15_bundle(previous)
     floor = tmp_path / "floor"
     floor.write_bytes(b"trusted generation 7; immutable")
     source = tmp_path / "source"
@@ -78,7 +86,7 @@ def test_direct_downgrade_cannot_bypass_recovery_guard(tmp_path):
 
 def test_recovery_target_cannot_escape_release_root(tmp_path):
     opt, units, candidate, previous, journal = layout(tmp_path)
-    legacy_bundle(previous)
+    pre_q15_bundle(previous)
 
     def fail():
         raise RuntimeError("synthetic fail")

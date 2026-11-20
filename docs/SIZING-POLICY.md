@@ -1,6 +1,6 @@
 # Signed copy-sizing policy — owner decision, 2026-11-06
 
-**Status:** architectural admission contract implemented in Planner / release verifier, tested with signed *synthetic* fixtures. No live broker order authorization, no production deployment. This document supersedes the claim that leader whole-account NAV is universally mandatory.
+**Status:** architectural admission contract implemented once in `copytrade-kernel` and enforced by the signed release verifier and Guardian, tested with signed *synthetic* fixtures. The Planner and the NAV-relative path are deleted. No live broker order authorization, no production deployment. This document supersedes the claim that leader whole-account NAV is universally mandatory.
 
 ## Default: fixed-k risk-budgeted mirroring
 
@@ -22,9 +22,9 @@ A target is **an intent**, not an order. Guardian re-verifies source signature, 
 
 Complete *selected scope* does not mean reconstructing every unrelated parent or subaccount. If the copied strategy spans multiple named child accounts, those scopes must be explicit and captured. Do not silently omit selected positions, hedges or markets. Source-only spot/vault positions are not follower perp signals. A parent-only policy must not claim it copied a source's unrelated child exposures.
 
-## Fidelity mode: explicitly opt-in
+## Retired: NAV-relative fidelity mode
 
-`ALLOCATION_OVER_LIVE_NAV` (legacy v1): signed source NAV must be positive and independently verified; follower exposure equals source quantity × source mark ÷ source NAV × follower allocation. This mode remains strict to preserve source-equity-relative fidelity studies and existing release compatibility.
+`ALLOCATION_OVER_LIVE_NAV` (legacy v1) sized follower exposure as source quantity × source mark ÷ source NAV × follower allocation. It is **retired**: the live release verifier accepts only `portfolio_release_v2` with `FIXED_K_NATIVE_QUANTITY` mandates, and `ALLOCATION_OVER_LIVE_NAV` is refused. No study or review can obtain NAV-relative sizing from the runtime. Historical signed `portfolio_release_v1` archives remain auditable read-only through `scripts/verify_legacy_v1_journal.py`, which needs the original envelope, the trusted public key and the release scope supplied explicitly and attests nothing when they are absent.
 
 **Missing leader NAV does not block fixed-k research or planning.** Keep whole-account NAV as an optional descriptive/fidelity diagnostic. Do not generate synthetic NAV or collapse the two policies into a hidden fallback.
 
@@ -36,6 +36,6 @@ No source NAV inference from Vike `summary`, spot quote collateral, unified/port
 
 ## Compatibility and tests
 
-The existing signed release `portfolio_release_v1` still accepts only known member fields. Fixed-k members must additionally carry `k`; equity-relative members must **not** carry it. Cross-policy changes alter the signed `definition_sha` and release digest and must pass the trusted release flow. Production route remains disabled by default. Guardian independently recomputes proposals from signed source receipts, and tests reject unsigned k changes, invalid k, incomplete selected scope and stale/mismatched clocks.
+The signed release `portfolio_release_v2` accepts only known member fields and requires one native `copy_mandate_v1` per member whose `k`, markets, scope and hashes agree with it. Fixed-k members must carry `k`; the retired equity-relative member shape has no release schema. Any change alters the signed `definition_sha` and release digest and must pass the trusted release flow. Production route remains disabled by default. Guardian independently recomputes proposals from signed source receipts, and tests reject unsigned k changes, invalid k, incomplete selected scope and stale/mismatched clocks.
 
 Do not promote passing synthetic tests to real source or financial eligibility. Existing production gates unrelated to leader NAV remain independent and are not waived.

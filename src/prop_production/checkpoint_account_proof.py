@@ -7,9 +7,10 @@ from dataclasses import asdict
 from decimal import Decimal
 from typing import Any
 
+from copytrade_kernel.risk import validate_quotes
+
 from .evidence import canonical, decimal
 from .gateway import BrokerSnapshot, execution_capability, snapshot_from_wire
-from .planner import validate_quotes
 
 
 def _decimal_wire(value: Any) -> str:

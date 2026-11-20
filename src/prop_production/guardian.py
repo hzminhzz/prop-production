@@ -4,26 +4,24 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any
 
+from copytrade_kernel import DecisionMs
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .checkpoint_accounting import add, apply_fill, apply_funding
 from .checkpoint_admission import prepare_reserve, prepare_review
+from .checkpoint_receiver import CheckpointSourceReceiver
 from .checkpoint_risk import loss_limit
 from .contracts import (
     ALLOWED_BROKER_ORDER_STATUSES,
     CHECKPOINT_POLICY_V3,
-    PORTFOLIO_RELEASE_V1,
     PORTFOLIO_RELEASE_V2,
     SYNTHETIC_ENDPOINT,
     TERMINAL_INTENT_STATUSES,
-    DecisionReceipt,
-    TargetBatchProposal,
     is_synthetic_account,
-    require_synthetic_execution,
 )
 from .copy_mandates import (
     MandateState,
@@ -31,17 +29,12 @@ from .copy_mandates import (
     prepare_baseline_mandate,
     prepare_control_mandate,
 )
-from .evidence import canonical, decimal, digest, load_json
+from .evidence import decimal, digest, load_json
 from .finance import Rulebook, account_step
 from .gateway import BrokerGateway, BrokerOrder, BrokerSnapshot, Execution, FundingEvent
 from .guardian_protection import prepare_protective_reduction
 from .journal import Journal, State, StorageUnavailable
-from .planner import compile_pods, validate_quotes
 from .release import ReleaseFloor, VerifiedRelease
-from .risk import size_book
-from .v4_market_identity import validate_independent_quotes
-from .v4_source_receiver import SourcePacketReceiver
-from .v4_timing import V4ShadowProjection
 
 TERMINAL = TERMINAL_INTENT_STATUSES
 ZERO = Decimal("0")
@@ -88,7 +81,10 @@ class Guardian:
             raise ValueError("GUARDIAN_RECOVERY_SIGNER_MUST_BE_DISTINCT")
         self.recovery_key = recovery_key
         self.expected_recovery_key_sha = expected_recovery_key_sha
-        if not is_synthetic_account(journal.snapshot()["account_binding"]) and recovery_key is not None:
+        if (
+            not is_synthetic_account(journal.snapshot()["account_binding"])
+            and recovery_key is not None
+        ):
             current_sha = sha256(recovery_key.public_bytes_raw()).hexdigest()
             if (
                 not isinstance(expected_recovery_key_sha, str)
@@ -108,17 +104,18 @@ class Guardian:
             raise ValueError("POLICY_BINDING")
         floor.require_active(release)
         source_public = source_key.public_bytes_raw().hex()
-        if release.payload["schema"] == PORTFOLIO_RELEASE_V2:
-            if (
-                mandate_key is None
-                or release.signed_envelope is None
-                or sha256(mandate_key.public_bytes_raw()).hexdigest()
-                != release.payload["mandate_authority_sha"]
-            ):
-                raise ValueError("CHECKPOINT_MANDATE_AUTHORITY_NOT_PINNED")
-            pinned = journal.snapshot().get("checkpoint_source_public")
-            if pinned is not None and pinned != source_public:
-                raise ValueError("CHECKPOINT_SOURCE_AUTHORITY_CHANGED")
+        if release.payload["schema"] != PORTFOLIO_RELEASE_V2:
+            raise ValueError("UNSUPPORTED_RELEASE_SCHEMA")
+        if (
+            mandate_key is None
+            or release.signed_envelope is None
+            or sha256(mandate_key.public_bytes_raw()).hexdigest()
+            != release.payload["mandate_authority_sha"]
+        ):
+            raise ValueError("CHECKPOINT_MANDATE_AUTHORITY_NOT_PINNED")
+        pinned = journal.snapshot().get("checkpoint_source_public")
+        if pinned is not None and pinned != source_public:
+            raise ValueError("CHECKPOINT_SOURCE_AUTHORITY_CHANGED")
         active = journal.snapshot().get("active_release_sha")
         if active != release.release_sha:
 
@@ -126,26 +123,23 @@ class Guardian:
                 if active is not None:
                     _halt(s, "RELEASE_CHANGED_REQUIRES_REVIEW")
                 s["active_release_sha"] = release.release_sha
-                if release.payload["schema"] == PORTFOLIO_RELEASE_V2:
-                    s["checkpoint_source_public"] = source_public
-                    assert mandate_key is not None and release.signed_envelope is not None
-                    s["checkpoint_release"] = {
-                        "envelope": load_json(release.signed_envelope),
-                        "authority_public": mandate_key.public_bytes_raw().hex(),
-                    }
+                s["checkpoint_source_public"] = source_public
+                assert mandate_key is not None and release.signed_envelope is not None
+                s["checkpoint_release"] = {
+                    "envelope": load_json(release.signed_envelope),
+                    "authority_public": mandate_key.public_bytes_raw().hex(),
+                }
                 s["runtime"]["permit"] = None
 
             journal.update("BIND_RELEASE_DISARMED", 0, bind)
 
-    def _verify_checkpoint_source(self, receiver: SourcePacketReceiver) -> None:
+    def _verify_checkpoint_source(self, receiver: CheckpointSourceReceiver) -> None:
         p = self.release.payload
         if (
             receiver.wire_version != 3
-            or receiver.checkpoint is None
             or receiver.source_key.public_bytes_raw() != self.source_key.public_bytes_raw()
             or receiver.release.release_sha != self.release.release_sha
-            or receiver.checkpoint.pins
-            != {"policy": p["checkpoint_policy"], "scopes": p["checkpoint_scopes"]}
+            or receiver.pins != {"policy": p["checkpoint_policy"], "scopes": p["checkpoint_scopes"]}
         ):
             raise ValueError("CHECKPOINT_SOURCE_AUTHORITY")
 
@@ -197,15 +191,14 @@ class Guardian:
         return state_obj
 
     def baseline_copy_mandate(
-        self, owner: str, receiver: SourcePacketReceiver, *, now_ms: int
+        self, owner: str, receiver: CheckpointSourceReceiver, *, now_ms: int
     ) -> MandateState:
         self._verify_checkpoint_source(receiver)
-        assert receiver.checkpoint is not None
         entry = self.journal.snapshot()["copy_mandates"][owner]
         state_obj, update = prepare_baseline_mandate(
             entry,
             outcomes=receiver.checkpoint_outcomes(now_ms=now_ms),
-            packet_for=receiver.checkpoint.packet_for,
+            packet_for=receiver.packet_for,
             now_ms=now_ms,
         )
         if update is not None:
@@ -222,7 +215,7 @@ class Guardian:
 
     def review_checkpoints(
         self,
-        receiver: SourcePacketReceiver,
+        receiver: CheckpointSourceReceiver,
         requests: dict[str, str],
         *,
         quotes: dict[str, Any],
@@ -230,8 +223,28 @@ class Guardian:
         quote_envelope: dict[str, Any] | None = None,
         quote_key: Ed25519PublicKey | None = None,
     ) -> dict[str, Any]:
+        return self.process_checkpoint(
+            receiver,
+            requests,
+            quotes=quotes,
+            now_ms=DecisionMs(now_ms),
+            quote_envelope=quote_envelope,
+            quote_key=quote_key,
+        )
+
+    def process_checkpoint(
+        self,
+        receiver: CheckpointSourceReceiver,
+        requests: dict[str, str],
+        *,
+        quotes: dict[str, Any],
+        now_ms: DecisionMs,
+        quote_envelope: dict[str, Any] | None = None,
+        quote_key: Ed25519PublicKey | None = None,
+    ) -> dict[str, Any]:
+        """Review a signed prospective checkpoint and durably record its decision."""
         self._verify_checkpoint_source(receiver)
-        assert receiver.checkpoint is not None
+        clock = now_ms.value
         result, next_state = prepare_review(
             self.journal.snapshot(),
             journal_sequence=self.journal.sequence,
@@ -241,26 +254,25 @@ class Guardian:
             policy=self.policy,
             markets=self.markets,
             gateway=self.gateway,
-            scope_reasons=self._scope(now_ms),
-            source_outcomes=receiver.checkpoint_outcomes(now_ms=now_ms),
-            packet_for=receiver.checkpoint.packet_for,
+            scope_reasons=self._scope(clock),
+            source_outcomes=receiver.checkpoint_outcomes(now_ms=clock),
+            packet_for=receiver.packet_for,
             requests=requests,
             quotes=quotes,
-            now_ms=now_ms,
+            now_ms=clock,
             quote_envelope=quote_envelope,
             quote_key=quote_key,
         )
         if next_state is not None:
             self.journal.commit(
-                "CHECKPOINT_REVIEW", now_ms, next_state, expected_sequence=self.journal.sequence
+                "CHECKPOINT_REVIEW", clock, next_state, expected_sequence=self.journal.sequence
             )
         return result
 
     def reserve_checkpoint(
-        self, decision_id: str, *, receiver: SourcePacketReceiver, now_ms: int
+        self, decision_id: str, *, receiver: CheckpointSourceReceiver, now_ms: int
     ) -> list[str]:
         self._verify_checkpoint_source(receiver)
-        assert receiver.checkpoint is not None
         ids, commit_kind, next_state = prepare_reserve(
             self.journal.snapshot(),
             journal_sequence=self.journal.sequence,
@@ -273,7 +285,7 @@ class Guardian:
             gateway=self.gateway,
             scope_reasons=self._scope(now_ms),
             source_outcomes=receiver.checkpoint_outcomes(now_ms=now_ms),
-            packet_for=receiver.checkpoint.packet_for,
+            packet_for=receiver.packet_for,
             decision_id=decision_id,
             now_ms=now_ms,
         )
@@ -347,425 +359,6 @@ class Guardian:
         if not self.journal.storage_healthy:
             reasons.append("HALT_STORAGE")
         return reasons
-
-    def decide(
-        self, proposal: TargetBatchProposal, quotes: dict[str, Any], now_ms: int
-    ) -> DecisionReceipt:
-        if self.release.payload["schema"] != PORTFOLIO_RELEASE_V1:
-            raise ValueError("CHECKPOINT_RELEASE_REQUIRES_CHECKPOINT_ADMISSION")
-        proposal = TargetBatchProposal.from_dict(proposal.data)
-        p = proposal.data
-        state = self.journal.snapshot()
-        existing = state["decisions"].get(p["proposal_id"])
-        if existing:
-            if existing["proposal_sha"] != digest(p):
-                raise ValueError("PROPOSAL_PAYLOAD_CONFLICT")
-            return DecisionReceipt.from_dict(existing["receipt"])
-        reasons = self._scope(now_ms)
-        status = "BLOCKED"
-        if (
-            p["release_sha"] != self.release.release_sha
-            or p["account_binding"] != state["account_binding"]
-        ):
-            reasons.append("RELEASE_OR_ACCOUNT_SCOPE")
-        if p["broker_epoch"] != state["runtime"]["broker_epoch"]:
-            reasons.append("BROKER_EPOCH")
-        if (
-            p["decision_ms"] > now_ms
-            or now_ms - p["decision_ms"] > 5000
-            or not any(r["local_known_ms"] == p["first_known_ms"] for r in p["source_receipts"])
-        ):
-            reasons.append("CAUSAL_CLOCK")
-        if p["quote_sha"] != digest(quotes):
-            reasons.append("QUOTE_BINDING")
-        for market, quote in quotes.items():
-            try:
-                mark = decimal(state.get("last_marks", {})[market])
-                if not decimal(quote["bid"]) <= mark <= decimal(quote["ask"]):
-                    raise ValueError("QUOTE_NOT_BROKER_MARK_BOUND")
-                if decimal(quote["ask"]) / decimal(quote["bid"]) > Decimal("1.01"):
-                    raise ValueError("SPREAD_OUTSIDE_ENVELOPE")
-            except (KeyError, ValueError, TypeError, ZeroDivisionError):
-                reasons.append("INDEPENDENT_MARKET_EVIDENCE_MISMATCH")
-        if state["halts"]:
-            reasons.extend(state["halts"])
-        if state["runtime"]["certainty"] != "COHERENT":
-            reasons.append("RECONCILIATION_UNCERTAIN")
-        if (
-            state["runtime"].get("last_snapshot_ms") is None
-            or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000
-        ):
-            reasons.append("BROKER_STALE")
-        if state["reservations"] or any(
-            i["status"] not in TERMINAL for i in state["intents"].values()
-        ):
-            reasons.append("PENDING_RESERVATION")
-        try:
-            expected = compile_pods(
-                p["source_receipts"], self.release, self.source_key, p["decision_ms"]
-            )
-            if canonical(expected) != canonical(p["pods"]):
-                raise ValueError("SOURCE_REQUEST_MISMATCH")
-            for receipt in p["source_receipts"]:
-                b = receipt["envelope"]["payload"]
-                cursor = state["source_cursors"].get(b["source_identity"], -1)
-                if b["sequence"] < cursor:
-                    raise ValueError("SOURCE_CURSOR_ROLLBACK")
-        except (ValueError, KeyError, TypeError) as exc:
-            reasons.append(str(exc) if isinstance(exc, ValueError) else "SOURCE_INVALID")
-            status = "REJECTED"
-        risk: dict[str, Any] = {}
-        if not reasons:
-            pending = [
-                {
-                    "market": i["market"],
-                    "remaining": str(decimal(i["quantity"]) - decimal(i["filled"])),
-                }
-                for i in state["intents"].values()
-                if i["status"] not in TERMINAL
-            ]
-            risk = size_book(
-                p["pods"],
-                quotes,
-                self.markets,
-                self.policy,
-                dict(state["finance"], pod_loss_used=state.get("pod_loss_used", {})),
-                state["positions"],
-                state["pod_positions"],
-                pending,
-                now_ms=now_ms,
-            )
-            status = "PREVIEW" if risk["status"] == "ACCEPTED" else risk["status"]
-            reasons.extend(risk["reasons"])
-        body: dict[str, Any] = {
-            "schema": "guardian_decision_v1",
-            "proposal_id": p["proposal_id"],
-            "release_sha": self.release.release_sha,
-            "status": status,
-            "reasons": sorted(set(reasons)),
-            "risk": risk,
-            "known_at_ms": now_ms,
-            "journal_epoch": state["runtime"]["boot_epoch"],
-            "broker_epoch": state["runtime"]["broker_epoch"],
-            "quote_sha": p["quote_sha"],
-            "scenario_sha": digest(self.policy["scenarios"]),
-            "rulebook_sha": self.rules.sha,
-            "requested_pods": p["pods"],
-            "trading_authorized": False,
-        }
-        body["decision_id"] = digest(body)
-
-        def record(s: State) -> None:
-            s["decisions"][p["proposal_id"]] = {
-                "proposal_sha": digest(p),
-                "receipt": body,
-                "proposal": p,
-                "quotes": quotes,
-                "decision_sequence": self.journal.sequence + 1,
-                "intent_ids": [],
-            }
-
-        self.journal.update("DECISION", now_ms, record)
-        return DecisionReceipt.from_dict(body)
-
-    def preview_v4(
-        self, projection: V4ShadowProjection, action_id: str, quotes: dict[str, Any], now_ms: int
-    ) -> DecisionReceipt:
-        """Protected SHADOW review of authenticated V4 source eligibility.
-
-        Must run with the Guardian-owned projection, never on Planner-submitted
-        target quantities. The receipt deliberately cannot be reserved or
-        dispatched: only the separately authorized production path may do so.
-        """
-        if (
-            projection.release.release_sha != self.release.release_sha
-            or projection.source_key.public_bytes_raw() != self.source_key.public_bytes_raw()
-            or self.release.payload["source_mode"] != "PROSPECTIVE"
-        ):
-            raise ValueError("V4_PROJECTION_AUTHORITY")
-        action = projection.current_action(action_id, now_ms)
-        if action["trading_authorized"] is not False or action["due_ms"] > now_ms:
-            raise ValueError("V4_ACTION_NOT_ELIGIBLE")
-        proposal_id = digest(
-            {
-                "schema": "v4_shadow_proposal_v1",
-                "release_sha": self.release.release_sha,
-                "source_action_id": action_id,
-            }
-        )
-        state = self.journal.snapshot()
-        previous = state["decisions"].get(proposal_id)
-        if previous is not None:
-            return DecisionReceipt.from_dict(previous["receipt"])
-        reasons = self._scope(now_ms)
-        if state["halts"]:
-            reasons.extend(state["halts"])
-        if state["runtime"]["certainty"] != "COHERENT":
-            reasons.append("RECONCILIATION_UNCERTAIN")
-        if (
-            state["runtime"].get("last_snapshot_ms") is None
-            or not 0 <= now_ms - state["runtime"]["last_snapshot_ms"] <= 5000
-        ):
-            reasons.append("BROKER_STALE")
-        if state["reservations"] or any(
-            intent["status"] not in TERMINAL for intent in state["intents"].values()
-        ):
-            reasons.append("PENDING_RESERVATION")
-        try:
-            validate_quotes(quotes, now_ms)
-            for market, quote in quotes.items():
-                mark = decimal(state.get("last_marks", {})[market])
-                if not decimal(quote["bid"]) <= mark <= decimal(quote["ask"]) or decimal(
-                    quote["ask"]
-                ) / decimal(quote["bid"]) > Decimal("1.01"):
-                    raise ValueError("INDEPENDENT_MARKET_EVIDENCE_MISMATCH")
-        except (KeyError, ValueError, TypeError, ZeroDivisionError):
-            reasons.append("INDEPENDENT_MARKET_EVIDENCE_MISMATCH")
-        pods = []
-        try:
-            pods = projection.eligible_pods(now_ms)
-        except (ValueError, KeyError, TypeError) as exc:
-            reasons.append(str(exc) if isinstance(exc, ValueError) else "V4_SOURCE_UNAVAILABLE")
-        risk: dict[str, Any] = {}
-        if not reasons:
-            pending = [
-                {
-                    "market": intent["market"],
-                    "remaining": str(decimal(intent["quantity"]) - decimal(intent["filled"])),
-                }
-                for intent in state["intents"].values()
-                if intent["status"] not in TERMINAL
-            ]
-            risk = size_book(
-                pods,
-                quotes,
-                self.markets,
-                self.policy,
-                dict(state["finance"], pod_loss_used=state.get("pod_loss_used", {})),
-                state["positions"],
-                state["pod_positions"],
-                pending,
-                now_ms=now_ms,
-            )
-            if risk["status"] != "ACCEPTED":
-                reasons.extend(risk.get("reasons", ["RISK_BLOCKED"]))
-        status = "SHADOW_PREVIEW" if not reasons else "BLOCKED"
-        receipt = {
-            "schema": "guardian_v4_shadow_decision_v1",
-            "proposal_id": proposal_id,
-            "release_sha": self.release.release_sha,
-            "source_action_id": action_id,
-            "status": status,
-            "reasons": sorted(set(reasons)),
-            "risk": risk,
-            "known_at_ms": now_ms,
-            "journal_epoch": state["runtime"]["boot_epoch"],
-            "broker_epoch": state["runtime"]["broker_epoch"],
-            "quote_sha": digest(quotes),
-            "requested_pods": pods,
-            "trading_authorized": False,
-            "broker_mutations": 0,
-        }
-        receipt["decision_id"] = digest(receipt)
-
-        def record(s: State) -> None:
-            s["decisions"][proposal_id] = {
-                "proposal_sha": digest(action),
-                "receipt": receipt,
-                "proposal": None,
-                "quotes": quotes,
-                "decision_sequence": self.journal.sequence + 1,
-                "intent_ids": [],
-            }
-
-        self.journal.update("V4_SHADOW_DECISION", now_ms, record)
-        return DecisionReceipt.from_dict(receipt)
-
-    def preview_attested_v4(
-        self,
-        projection: V4ShadowProjection,
-        action_id: str,
-        quote_envelope: dict[str, Any],
-        quote_key: Ed25519PublicKey,
-        catalog: frozenset[str],
-        now_ms: int,
-    ) -> DecisionReceipt:
-        """Source T+300 with independently signed follower bid/ask.
-
-        This path is source-only SHADOW and can NEVER reserve or dispatch.
-        Missing provider quote provenance fails before any financial journal
-        change; the source-observer signer is not an independent quote key.
-        """
-        quotes = validate_independent_quotes(
-            quote_envelope,
-            quote_key=quote_key,
-            source_key=self.source_key,
-            release=self.release,
-            catalog=catalog,
-            now_ms=now_ms,
-        )
-        return self.preview_v4(projection, action_id, quotes, now_ms)
-
-    def reserve(self, decision_id: str, now_ms: int) -> list[str]:
-        state = self.journal.snapshot()
-        record = next(
-            (d for d in state["decisions"].values() if d["receipt"]["decision_id"] == decision_id),
-            None,
-        )
-        if record is None:
-            raise ValueError("DECISION_UNKNOWN")
-        if record.get("reservation_committed"):
-            return list(record["intent_ids"])
-        receipt = record["receipt"]
-        reasons = self._scope(now_ms)
-        if (
-            reasons
-            or receipt["release_sha"] != self.release.release_sha
-            or receipt["status"] != "PREVIEW"
-            or state["halts"]
-            or state["runtime"]["certainty"] != "COHERENT"
-            or receipt["broker_epoch"] != state["runtime"]["broker_epoch"]
-            or receipt["journal_epoch"] != state["runtime"]["boot_epoch"]
-            or record["decision_sequence"] != self.journal.sequence
-            or not 0 <= now_ms - receipt["known_at_ms"] <= 5000
-            or state["reservations"]
-        ):
-            raise ValueError("RESERVATION_NOT_PERMITTED")
-        # This binary has no live authorizer. Authenticated remote gateways are read-only.
-        require_synthetic_execution(
-            gateway_synthetic=self.gateway.synthetic,
-            gateway_endpoint=getattr(self.gateway, "endpoint", None),
-            source_mode=self.release.payload["source_mode"],
-            rules_status=self.rules.status,
-            account_binding=state["account_binding"],
-        )
-        risk = receipt["risk"]
-        intents = []
-        for market in sorted(set(risk["targets"]) | set(state["positions"])):
-            quantity = decimal(risk["targets"].get(market, "0")) - decimal(
-                state["positions"].get(market, "0")
-            )
-            if not quantity:
-                continue
-            quote = record["quotes"][market]
-            slip = decimal(self.policy["shortfall_bps"]) / 10000
-            price = (
-                decimal(quote["ask"]) * (1 + slip)
-                if quantity > 0
-                else decimal(quote["bid"]) * (1 - slip)
-            )
-            tick = decimal(self.markets[market]["price_tick"])
-            price = (price / tick).to_integral_value(
-                rounding=ROUND_FLOOR if quantity > 0 else ROUND_CEILING
-            ) * tick
-            intent_id = digest(
-                {
-                    "account": state["account_binding"],
-                    "decision": decision_id,
-                    "market": market,
-                    "quantity": str(quantity),
-                }
-            )
-            changes = {
-                pod: str(
-                    decimal(target.get(market, "0"))
-                    - decimal(state["pod_positions"].get(pod, {}).get(market, "0"))
-                )
-                for pod, target in risk["pod_targets"].items()
-            }
-            intents.append(
-                {
-                    "intent_id": intent_id,
-                    "account_binding": state["account_binding"],
-                    "endpoint": SYNTHETIC_ENDPOINT,
-                    "decision_id": decision_id,
-                    "release_sha": self.release.release_sha,
-                    "market": market,
-                    "quantity": str(quantity),
-                    "limit_price": str(price),
-                    "reduce_only": False,
-                    "status": "QUEUED",
-                    "filled": "0",
-                    "broker_id": None,
-                    "broker_epoch": receipt["broker_epoch"],
-                    "boot_epoch": receipt["journal_epoch"],
-                    "expires_at_ms": receipt["known_at_ms"] + 5000,
-                    "created_at_ms": now_ms,
-                    "pod_changes": changes,
-                    "proof_sha": digest(receipt),
-                    "reservation_id": decision_id,
-                }
-            )
-        ids = [i["intent_id"] for i in intents]
-        # Exact opposing pod targets can cross internally only in the synthetic fixture.
-        # There is no external execution, cash movement, fee, or broker position.
-        # A nonzero broker delta must never take this path: its pod attribution is
-        # determined by independently observed broker fills instead.
-        internal_cross: dict[str, dict[str, str]] = {}
-        if not ids:
-            for pod, book in risk["pod_targets"].items():
-                delta = {
-                    market: str(
-                        decimal(quantity)
-                        - decimal(state["pod_positions"].get(pod, {}).get(market, "0"))
-                    )
-                    for market, quantity in book.items()
-                }
-                for market, quantity in state["pod_positions"].get(pod, {}).items():
-                    if market not in delta:
-                        delta[market] = str(-decimal(quantity))
-                if any(decimal(quantity) for quantity in delta.values()):
-                    internal_cross[pod] = delta
-            if any(
-                sum((decimal(book.get(market, "0")) for book in internal_cross.values()), ZERO)
-                for market in {m for book in internal_cross.values() for m in book}
-            ):
-                raise ValueError("INTERNAL_CROSS_NOT_NET_ZERO")
-
-        def commit(s: State) -> None:
-            if internal_cross:
-                for pod, deltas in internal_cross.items():
-                    book = s["pod_positions"].setdefault(pod, {})
-                    for market, quantity in deltas.items():
-                        book[market] = str(decimal(book.get(market, "0")) + decimal(quantity))
-                s.setdefault("internal_allocations", []).append(
-                    {
-                        "decision_id": decision_id,
-                        "known_at_ms": now_ms,
-                        "pod_deltas": internal_cross,
-                        "scope": "SYNTHETIC_ZERO_BROKER_NET",
-                    }
-                )
-            if ids:
-                s["reservations"][decision_id] = {
-                    "loss": risk["worst_loss"],
-                    "margin": risk["stressed_margin"],
-                    "cost": risk["cost_reserve"],
-                    "intent_ids": ids,
-                }
-            for intent in intents:
-                s["intents"][intent["intent_id"]] = intent
-            for item in record["proposal"]["source_receipts"]:
-                b = item["envelope"]["payload"]
-                s["source_cursors"][b["source_identity"]] = max(
-                    s["source_cursors"].get(b["source_identity"], -1), b["sequence"]
-                )
-            s["decisions"][receipt["proposal_id"]]["intent_ids"] = ids
-            s["decisions"][receipt["proposal_id"]]["reservation_committed"] = True
-            s["runtime"].update(
-                permit={
-                    "decision_id": decision_id,
-                    "boot_epoch": receipt["journal_epoch"],
-                    "broker_epoch": receipt["broker_epoch"],
-                    "expires_at_ms": receipt["known_at_ms"] + 5000,
-                },
-                state="SHADOW_READY",
-            )
-
-        self._boundary("before_reservation")
-        self.journal.update("RESERVE_AND_OUTBOX", now_ms, commit)
-        self._boundary("after_reservation")
-        return ids
 
     def dispatch(self, intent_id: str, now_ms: int) -> None:
         state = self.journal.snapshot()
@@ -926,9 +519,7 @@ class Guardian:
             (f.known_at_ms, 0, f.execution_id, f) for f in snapshot.fills
         ]
         if snapshot.funding_events:
-            timeline.extend(
-                (e.known_at_ms, 1, e.funding_id, e) for e in snapshot.funding_events
-            )
+            timeline.extend((e.known_at_ms, 1, e.funding_id, e) for e in snapshot.funding_events)
         timeline.sort(key=lambda item: (item[0], item[1], item[2]))
         for _ts, _rank, _item_id, item in timeline:
             if isinstance(item, Execution):
@@ -1049,9 +640,7 @@ class Guardian:
                 state.setdefault("funding_events", {})[ev.funding_id] = body
                 new_funding = add(new_funding, ev.amount)
                 for pod, share in shares.items():
-                    used[pod] = str(
-                        add(decimal(used.get(pod, "0")), max(ZERO, -decimal(share)))
-                    )
+                    used[pod] = str(add(decimal(used.get(pod, "0")), max(ZERO, -decimal(share))))
         known_orders: dict[str, BrokerOrder] = {}
         for order in snapshot.orders:
             if order.intent_id in known_orders and order != known_orders[order.intent_id]:
@@ -1116,9 +705,9 @@ class Guardian:
         if old_cash is not None and snapshot.cash is not None:
             # Only actual fills and verified funding flows with retained,
             # independently checked basis explain checkpoint realized cash.
-            if snapshot.cash - decimal(old_cash) != add(
-                new_realized, -new_fees, new_funding
-            ) and ("POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors):
+            if snapshot.cash - decimal(old_cash) != add(new_realized, -new_fees, new_funding) and (
+                "POD_REALIZED_ATTRIBUTION_UNVERIFIED" not in errors
+            ):
                 errors.append("BROKER_CASH_ATTRIBUTION_UNKNOWN")
         finance, finance_errors = account_step(state["finance"], snapshot, self.rules, now_ms)
         previous_day = state["finance"].get("day")

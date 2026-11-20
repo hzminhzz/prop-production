@@ -73,5 +73,8 @@ operation with dedicated credentials.
 
 Follower equity/headroom, selected source identity and scope, causal clocks,
 reconciliation, actual follower economics, four-week paper evidence and independent
-G0–G4 attestations retain their owning gates. Leader NAV is required only by explicit
-`ALLOCATION_OVER_LIVE_NAV`, never the default `FIXED_K_NATIVE_QUANTITY`.
+G0–G4 attestations retain their owning gates. Sizing comes only from the signed
+`FIXED_K_NATIVE_QUANTITY` member `k`; the retired `ALLOCATION_OVER_LIVE_NAV` mode is
+refused by the live release verifier. Pre-cutover `portfolio_release_v1` archives stay
+auditable only through `scripts/verify_legacy_v1_journal.py`, which needs the original
+signed envelope and trusted public key supplied explicitly.

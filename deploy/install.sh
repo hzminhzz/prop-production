@@ -20,9 +20,9 @@ git fetch origin "$DEFAULT_BRANCH"
 RELEASE_SHA=$(git rev-parse "origin/$DEFAULT_BRANCH")
 [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ] || { echo "REFUSING: app HEAD is not approved default"; exit 1; }
 [ -z "$(git status --porcelain=v1 --untracked-files=all)" ] || { echo "REFUSING: dirty app source"; exit 1; }
-pin_field() { PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.compatibility --field "$1"; }
+pin_field() { PYTHONPATH="$REPO/src:$REPO/packages/copytrade-kernel/src" "$ROOT_PYTHON" -m prop_production.compatibility --field "$1"; }
 EXPECTED_CONNECTOR_SHA=$(pin_field connector)
-PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.compatibility --check-project "$REPO/pyproject.toml" --field sha
+PYTHONPATH="$REPO/src:$REPO/packages/copytrade-kernel/src" "$ROOT_PYTHON" -m prop_production.compatibility --check-project "$REPO/pyproject.toml" --field sha
 [ "$(git -C "$CONNECTOR_SRC" rev-parse HEAD)" = "$EXPECTED_CONNECTOR_SHA" ] || { echo "REFUSING: connector revision mismatch"; exit 1; }
 [ -z "$(git -C "$CONNECTOR_SRC" status --porcelain=v1 --untracked-files=all)" ] || { echo "REFUSING: dirty connector source"; exit 1; }
 
@@ -47,7 +47,7 @@ exec 9>"$OPT/.deployment.lock"
 flock -n 9 || { echo "REFUSING: another deployment owns the lock"; exit 1; }
 RELEASE_DIR="$OPT/releases/$RELEASE_SHA"
 release_complete() {
-    PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment verify "$1" --commit "$RELEASE_SHA"
+    PYTHONPATH="$REPO/src:$REPO/packages/copytrade-kernel/src" "$ROOT_PYTHON" -m prop_production.deployment verify "$1" --commit "$RELEASE_SHA"
 }
 if [ -e "$RELEASE_DIR" ]; then
     release_complete "$RELEASE_DIR" || {
@@ -70,7 +70,7 @@ else
     "$RELEASE_DIR/venv/bin/python" -c 'import ccxt; from prop_production.compatibility import BYBIT_CCXT; assert ccxt.__version__ == BYBIT_CCXT'
     chown -R root:root "$RELEASE_DIR"
     chmod -R go-w "$RELEASE_DIR"
-    PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment seal "$RELEASE_DIR"
+    PYTHONPATH="$REPO/src:$REPO/packages/copytrade-kernel/src" "$ROOT_PYTHON" -m prop_production.deployment seal "$RELEASE_DIR"
 fi
 OPT_VENV="$RELEASE_DIR/venv"
 
@@ -114,7 +114,7 @@ chown -R prop-watchdog:prop "$STATE/watchdog"; chmod 0750 "$STATE/watchdog"
 # an older trust floor or rewinds a financial journal.
 if [ -f "$STATE/trust/floor.sqlite" ]; then
     BACKUP="$STATE/trust/floor.sqlite.pre-upgrade.$(date +%s%N)"
-    PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment backup \
+    PYTHONPATH="$REPO/src:$REPO/packages/copytrade-kernel/src" "$ROOT_PYTHON" -m prop_production.deployment backup \
         "$STATE/trust/floor.sqlite" --target "$BACKUP"
 fi
 chown root:prop "$STATE/trust"; chmod 0750 "$STATE/trust"
@@ -158,5 +158,5 @@ done
 # services, switches one immutable code set, and verifies fresh role heartbeats.
 # Failure restores the previous code+units. Interrupted activation has a durable
 # recovery record; no financial database is ever restored automatically.
-PYTHONPATH="$REPO/src" "$ROOT_PYTHON" -m prop_production.deployment activate "$RELEASE_DIR" --lock-fd 9
+PYTHONPATH="$REPO/src:$REPO/packages/copytrade-kernel/src" "$ROOT_PYTHON" -m prop_production.deployment activate "$RELEASE_DIR" --lock-fd 9
 printf 'DEPLOYED_SHADOW commit=%s\n' "$RELEASE_SHA"

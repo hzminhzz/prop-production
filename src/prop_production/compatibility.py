@@ -11,6 +11,8 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
+from copytrade_kernel import DECISION_SEMANTICS
+
 
 def load_manifest() -> dict[str, Any]:
     value = json.loads(files("prop_production").joinpath("compatibility.json").read_text())
@@ -27,18 +29,17 @@ def load_manifest() -> dict[str, Any]:
             raise ValueError("COMPATIBILITY_REPOSITORY_PIN")
     contracts = value["contracts"]
     if (
-        contracts["portfolio_release"] != "portfolio_release_v1"
-        or contracts.get("portfolio_release_versions")
-        != ["portfolio_release_v1", "portfolio_release_v2"]
+        contracts["portfolio_release"] != "portfolio_release_v2"
+        or contracts.get("portfolio_release_versions") != ["portfolio_release_v2"]
         or contracts.get("checkpoint_source") != "cwsa_checkpoint_packet_v3"
+        or contracts.get("checkpoint_decision_semantics") != DECISION_SEMANTICS
         or contracts.get("copy_mandate") != "copy_mandate_v1"
         or contracts["propr_evidence"] != "propr_native_evidence_v1"
         or contracts["bybit_evidence"] != "bybit_demo_snapshot_v1"
         or contracts["default_sizing_policy"] != "FIXED_K_NATIVE_QUANTITY"
-        or contracts["legacy_sizing_policy"] != "ALLOCATION_OVER_LIVE_NAV"
         or contracts["execution_mode"] != "SHADOW"
-        or contracts.get("source_wire_versions") != [1, 2, 3]
-        or contracts.get("active_source_wire") != 1
+        or contracts.get("source_wire_versions") != [3]
+        or contracts.get("active_source_wire") != 3
         or contracts["trading_authorized"] is not False
     ):
         raise ValueError("COMPATIBILITY_CONTRACT")

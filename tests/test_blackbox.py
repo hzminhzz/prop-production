@@ -1,5 +1,6 @@
-def test_separate_process_guardian_matches_hidden_broker_and_rational_oracle(tmp_path):
+def test_judge_exact_v3(tmp_path):
     from prop_production.judge.runner import run_fixture
+
     first = run_fixture(tmp_path / "one", seed=17)
     second = run_fixture(tmp_path / "two", seed=17)
     assert first["verdict"] == "BOUNDED_SAFETY_VERIFIED"
@@ -9,8 +10,9 @@ def test_separate_process_guardian_matches_hidden_broker_and_rational_oracle(tmp
     assert first["trading_authorized"] is False
 
 
-def test_blackbox_unknown_post_and_out_of_envelope_breach_are_explicit(tmp_path):
+def test_judge_v3_failures(tmp_path):
     from prop_production.judge.runner import run_fixture
+
     timeout = run_fixture(tmp_path / "timeout", seed=18, scenario="ACCEPT_THEN_TIMEOUT")
     assert timeout["verdict"] == "BOUNDED_SAFETY_VERIFIED"
     assert timeout["sends"] == 1

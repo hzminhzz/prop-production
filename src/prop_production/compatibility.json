@@ -12,17 +12,21 @@
     }
   },
   "contracts": {
-    "portfolio_release": "portfolio_release_v1",
-    "portfolio_release_versions": ["portfolio_release_v1", "portfolio_release_v2"],
+    "portfolio_release": "portfolio_release_v2",
+    "portfolio_release_versions": [
+      "portfolio_release_v2"
+    ],
     "checkpoint_source": "cwsa_checkpoint_packet_v3",
+    "checkpoint_decision_semantics": "checkpoint_decision_q15_v1",
     "copy_mandate": "copy_mandate_v1",
     "propr_evidence": "propr_native_evidence_v1",
     "bybit_evidence": "bybit_demo_snapshot_v1",
     "default_sizing_policy": "FIXED_K_NATIVE_QUANTITY",
-    "legacy_sizing_policy": "ALLOCATION_OVER_LIVE_NAV",
     "execution_mode": "SHADOW",
-    "source_wire_versions": [1, 2, 3],
-    "active_source_wire": 1,
+    "source_wire_versions": [
+      3
+    ],
+    "active_source_wire": 3,
     "trading_authorized": false
   },
   "dependencies": {

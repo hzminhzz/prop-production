@@ -53,6 +53,7 @@ class FakeBroker:
         self.fault_mode = "NONE"
         self.fill_on_submit = True
         self.maintenance_rate = Decimal("0.01")
+        self.fee_rate = Decimal("0.001")
         self.execution_position_mode = "ONE_WAY"
         self.cross_zero_supported = True
         self.reduce_only_supported = True
@@ -140,7 +141,7 @@ class FakeBroker:
                 return
             quantity = max(quantity, -old_q) if quantity < 0 else min(quantity, -old_q)
         execution_price = decimal(price or self.__truth["marks"][market])
-        fee = abs(quantity * execution_price) * Decimal("0.001")
+        fee = abs(quantity * execution_price) * self.fee_rate
         closed = min(abs(old_q), abs(quantity)) if old_q * quantity < 0 else ZERO
         realized = closed * (execution_price - entry) * (1 if old_q > 0 else -1)
         new_q = old_q + quantity

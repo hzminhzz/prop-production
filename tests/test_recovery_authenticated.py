@@ -6,15 +6,14 @@ from hashlib import sha256
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from test_guardian import setup_system
-from test_planner import quote
+from test_guardian import NOW, reserve, review, setup_system
 
 from prop_production.evidence import digest, sign
 from prop_production.gateway import BrokerOrder
 from prop_production.recovery import require_real_remediation, snapshot_receipt
 
 
-def request_for(journal, key, proof_sha, *, now=301010, **changes):
+def request_for(journal, key, proof_sha, *, now=NOW + 10, **changes):
     state = journal.snapshot()
     payload = {
         "schema": "guardian_recovery_request_v2",
@@ -41,8 +40,8 @@ def request_for(journal, key, proof_sha, *, now=301010, **changes):
 def test_protected_recovery_requires_fresh_independent_broker_remediation(tmp_path):
     guardian, broker, journal, proposal, floor = setup_system(tmp_path)
     key = Ed25519PrivateKey.generate()
-    journal.halt("BROKER_UNREACHABLE", 301001)
-    now = 301010
+    journal.halt("BROKER_UNREACHABLE", NOW + 1)
+    now = NOW + 10
     snapshot = broker.observe(now)
     sha = digest(snapshot_receipt(snapshot))
     request = request_for(journal, key, sha, now=now)
@@ -79,8 +78,8 @@ def test_protected_recovery_requires_fresh_independent_broker_remediation(tmp_pa
 def test_protected_recovery_rejects_signed_only_or_wrong_authority(tmp_path, violation):
     guardian, broker, journal, proposal, floor = setup_system(tmp_path)
     key = Ed25519PrivateKey.generate()
-    journal.halt("BROKER_UNREACHABLE", 301001)
-    now = 301010
+    journal.halt("BROKER_UNREACHABLE", NOW + 1)
+    now = NOW + 10
     proof_sha = digest(snapshot_receipt(broker.observe(now)))
     request = request_for(journal, key, proof_sha, now=now)
     revoked = set()
@@ -126,6 +125,7 @@ def test_guardian_pinned_recovery_authority_owns_financial_clearance(tmp_path):
             guardian.markets,
             broker,
             recovery_key=guardian.source_key,
+            mandate_key=guardian.mandate_key,
         )
     secured = Guardian(
         journal,
@@ -137,9 +137,10 @@ def test_guardian_pinned_recovery_authority_owns_financial_clearance(tmp_path):
         guardian.markets,
         broker,
         recovery_key=recovery_key.public_key(),
+        mandate_key=guardian.mandate_key,
     )
-    journal.halt("BROKER_UNREACHABLE", 301001)
-    now = 301010
+    journal.halt("BROKER_UNREACHABLE", NOW + 1)
+    now = NOW + 10
     evidence_sha = digest(snapshot_receipt(broker.observe(now)))
     request = request_for(journal, recovery_key, evidence_sha, now=now)
     secured.recover_authenticated(request, now)
@@ -159,7 +160,10 @@ def test_nonfixture_recovery_rejects_unpinned_fresh_operator_key(tmp_path):
         forged = request_for(journal, key, "f" * 64, now=200)
         with pytest.raises(ValueError, match="TRUST_FLOOR_MISSING"):
             journal.recover_authenticated(
-                forged, recovery_key=key.public_key(), gateway=None, now_ms=200,
+                forged,
+                recovery_key=key.public_key(),
+                gateway=None,
+                now_ms=200,
             )
         assert "BROKER_UNREACHABLE" in journal.snapshot()["halts"]
 
@@ -184,9 +188,9 @@ def test_recovery_rejects_revoked_non_broker_order_status(tmp_path):
     guardian, broker, journal, proposal, floor = setup_system(tmp_path)
     key = Ed25519PrivateKey.generate()
     try:
-        now = 301000
-        decision = guardian.decide(proposal, quote(), now)
-        ids = guardian.reserve(decision.data["decision_id"], now)
+        now = NOW
+        decision = review(guardian, proposal, now)
+        ids = reserve(guardian, proposal, decision["decision_id"], now)
         intent_id = ids[0]
         journal.halt("BROKER_UNREACHABLE", now + 1)
         state = journal.snapshot()

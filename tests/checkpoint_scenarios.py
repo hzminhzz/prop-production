@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_checkpoint_receiver import KEY
 from test_copy_mandates import START, mandate_body, release_body
 
+from prop_production.checkpoint_receiver import CheckpointSourceReceiver
 from prop_production.copy_mandates import CopyMandate
 from prop_production.evidence import digest, sign
 from prop_production.finance import Rulebook
@@ -18,7 +19,6 @@ from prop_production.journal import Journal
 from prop_production.judge.broker import FakeBroker
 from prop_production.release import ReleaseFloor, ReleaseVerifier
 from prop_production.risk import fixture_markets, fixture_policy
-from prop_production.v4_source_receiver import SourcePacketReceiver
 
 
 def quotes(now):
@@ -101,7 +101,7 @@ def scenario(
     floor.accept(release)
     journal = Journal(root / "guardian.sqlite3", "fixture-account", initialize=True)
     broker = FakeBroker(root / "broker.sqlite3")
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         root / "source.sqlite3", release=release, source_key=KEY.public_key(), wire_version=3
     )
     guardian = Guardian(

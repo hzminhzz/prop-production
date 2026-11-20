@@ -9,27 +9,25 @@ No live broker mutation route is installed or authorized.
 
 - `copytrade-pm`: research, SQLite metadata authority and immutable portfolio exports.
 - `trading-connector`: reusable provider transports and exact account/order evidence.
-- `prop-production`: Planner, Account Guardian, financial journal, risk supervision,
+- `prop-production`: Account Guardian, financial journal, risk supervision,
   reconciliation, watchdog and independently checked bounded-safety evidence.
 
-The Planner has no broker credentials. Only a separately isolated Guardian could
+The `copytrade-kernel` package has no broker credentials or IO. Only a separately isolated Guardian could
 hold financial mutation authority; this release provides zero-capital interfaces.
 
-**Sizing policy:** risk-budgeted fixed-k mirroring is the approved default for new design work; leader whole-account NAV is *not* an admission prerequisite for `FIXED_K_NATIVE_QUANTITY`. The signed policy requires an explicit k and complete selected account-position scope, while Guardian still controls follower equity, risk, limits, and execution. Existing `ALLOCATION_OVER_LIVE_NAV` releases retain strict NAV requirements. See [the sizing policy](docs/SIZING-POLICY.md).
+**Sizing policy:** risk-budgeted fixed-k mirroring is the approved default for new design work; leader whole-account NAV is *not* an admission prerequisite for `FIXED_K_NATIVE_QUANTITY`. The signed policy requires an explicit k and complete selected account-position scope, while Guardian still controls follower equity, risk, limits, and execution. The retired NAV-relative path is covered by archival journal verification. See [the sizing policy](docs/SIZING-POLICY.md).
 
 ## Shared checkpoint policy (nonactivating implementation)
 
 [2026-11-11 five-minute source checkpoint / Guardian Execution Lane design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md) records owner-approved Q1–Q24 (Q2=B, Q13=B). CWSA uses native Hyperliquid REST complete-position checkpoints as the **approved future** source of truth; Vike remains a raw-event/research/comparison transport. Durable checkpoint outcomes are distinct from change signals; missing checkpoints and copy activation create nonactionable baselines. Frozen signed copy mandates independently constrain pod sizing/markets and Guardian risk, with safe one-order netting, bounded pre-dispatch-only re-evaluation, fresh full-target opportunities on new source increases, and pause distinct from explicit flatten. Guardian retains independent financial execution, unknown-outcome and intragrid risk protection. Failures isolate independently verifiable wallet scopes; material mandate revisions preserve old financial effects; broker UNKNOWN remains outstanding risk; qualification is capability-specific. Every new source/mandate/opportunity lifecycle must use explicit owner-local typed transitions, not inferred service/boolean states or a new global state machine. The signed V3 receiver, immutable mandate lifecycle, one-shot Guardian admission, pod accounting, safe reversal policy and isolated worker rehearsal are implemented. See the [integration evidence](docs/CHECKPOINT-INTEGRATION-325.md), [release and rollback contract](docs/CHECKPOINT-SHADOW-RELEASE-327.md), and [adversarial acceptance map](docs/CANONICAL-5M-ACCEPTANCE-20261112.md). This strategy is separate from installed T0+300. Production source limits, real prospective mandate approvals, matched follower economics, native mutation qualification and action-specific authorization remain independent gates; code availability grants none of them.
 
-## Official V4 position-source SHADOW integration
+## Phase D checkpoint decision contract
 
-The additive, externally authenticated source export, per-transition T+300
-eligibility projection and Guardian-owned SHADOW risk preview are documented in
-[the V4 integration runbook](docs/V4-SHADOW-INTEGRATION-20261108.md) and
-[protected source operations](docs/V4-PROTECTED-SOURCE-OPERATIONS-20261109.md).
-They do not replace the installed synthetic Planner or authorize broker orders.
-The protected cross-user transfer and signed prospective release still require
-independent verification before a deployable integrated service exists.
+The protected source receiver accepts CWSA wire V3 and signed portfolio releases V2.
+New reviews persist `checkpoint_decision_q15_v1` and use the shared
+[`copytrade-kernel`](packages/copytrade-kernel/README.md). Historical attempts replay
+with their original decision and execution projection versions. To verify a closed
+archive copy, use `uv run --frozen python scripts/verify_legacy_v1_journal.py PATH`.
 
 ## Execution Session (nonactivating)
 
@@ -52,7 +50,7 @@ schemas come from [compatibility.json](src/prop_production/compatibility.json).
 From a clean reviewed commit, verify the application and both companions:
 
 ```bash
-PYTHONPATH=src python3 -m prop_production.compatibility
+PYTHONPATH=src:packages/copytrade-kernel/src python3 -m prop_production.compatibility
 export PROP_RESEARCH_ROOT=/absolute/path/to/clean/pinned-copytrade-pm
 export PROP_CONNECTOR_ROOT=/absolute/path/to/clean/pinned-trading-connector
 bash scripts/verify-local.sh all

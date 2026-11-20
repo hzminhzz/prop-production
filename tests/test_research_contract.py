@@ -1,6 +1,17 @@
+"""Protected research checkout, and the PM-signed V2 release acceptance proof.
+
+Phase D pins the exact sibling worktree ``../copytrade-pm-phase-d`` (the same
+topology the path-sourced ``copytrade-kernel`` dependency already requires).
+Gate finding F2 therefore restores the cross-repository release-acceptance
+proof as an unconditional test over synthetic fixtures: it fails loudly when
+the companion is missing instead of skipping behind an unset pin. The companion
+is imported, never written: bytecode writing is disabled for the child.
+"""
+
 import json
 import os
 import subprocess
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -13,11 +24,25 @@ def test_research_checkout_rejects_untracked_importable_modules(tmp_path, monkey
     root.mkdir()
     (root / "src").mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
-    subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture",
-                    "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty",
-                    "-qm", "initial"], check=True)
-    revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
-                              check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
     monkeypatch.setattr(research_bridge, "RESEARCH_COMMIT", revision)
     research_bridge.verify_checkout(root)
     (root / "src" / "untracked_runtime.py").write_text("UNREVIEWED = True\n")
@@ -25,57 +50,81 @@ def test_research_checkout_rejects_untracked_importable_modules(tmp_path, monkey
         research_bridge.verify_checkout(root)
 
 
-@pytest.mark.parametrize("policy_name", ["ALLOCATION_OVER_LIVE_NAV", "FIXED_K_NATIVE_QUANTITY"])
-def test_actual_research_sqlite_export_is_accepted_by_production_verifier(policy_name):
-    root = os.getenv("PROP_RESEARCH_ROOT")
-    if not root:
-        pytest.skip("Explicit pinned research checkout required for cross-repository integration")
-    research = Path(root)
-    from prop_production.research_bridge import verify_checkout
-    verify_checkout(research)
-    program = """
-import json, sys, tempfile
+def companion_root() -> Path:
+    pinned = os.environ.get("PROP_RESEARCH_ROOT")
+    if pinned:
+        return Path(pinned).expanduser().resolve()
+    return Path(__file__).resolve().parents[2] / "copytrade-pm-phase-d"
+
+
+COMPANION_PROGRAM = r"""
+import json, tempfile
 from pathlib import Path
-from test_production_manifest import fixture_policy
-from copytrade_pm.production_manifest import store_policy, build_manifest, sign
+
+from copytrade_pm.production_manifest import build_manifest_v2
+from test_production_manifest import fixture_v2_args
+
 with tempfile.TemporaryDirectory() as directory:
-    mode = sys.argv[1]
-    db, metadata, policy, reviewer, source = fixture_policy(Path(directory), sizing_policy=mode)
-    if mode == 'FIXED_K_NATIVE_QUANTITY':
-        body = policy['payload']
-        for member in body['members']:
-            member['sizing_policy'] = mode
-            member['k'] = '0.04'
-        for index, envelope in enumerate(body['source_attestations']):
-            proof = envelope['payload']
-            proof['nav'] = None
-            body['source_attestations'][index] = sign(proof, source, 'source-observer')
-        policy = sign(body, reviewer, 'research-release-policy')
-    store_policy(db, 'A', metadata, policy, reviewer.public_key())
-    manifest = build_manifest(db=db, portfolio_id='A', asof='2026-11-04T06:00:00+00:00',
-        reviewer=reviewer.public_key(), source_observer=source.public_key(),
-        release_signer=reviewer, now_ms=metadata['asof_ms'])
-    print(json.dumps({'manifest':manifest, 'public':reviewer.public_key().public_bytes_raw().hex(),
-                      'now_ms':metadata['asof_ms'],
-                      'source_nav_values':[x['payload']['nav'] for x in policy['payload']['source_attestations']]}))
+    args = fixture_v2_args(Path(directory))
+    manifest = build_manifest_v2(**args)
+    print(json.dumps({
+        "manifest": manifest,
+        "public": args["reviewer"].public_bytes_raw().hex(),
+        "now_ms": args["now_ms"],
+        "release_signer_public": args["release_signer"].public_key().public_bytes_raw().hex(),
+    }))
 """
-    process = subprocess.run([str(research / ".venv/bin/python"), "-c", program, policy_name], check=True,
-                             capture_output=True, text=True, timeout=30,
-                             env={"PATH": os.defpath, "PYTHONPATH": str(research / "src") + ":" + str(research / "tests")})
-    evidence = json.loads(process.stdout)
+
+
+def test_pm_signed_v2_release_is_accepted_by_the_production_verifier():
+    """F2: a copytrade-pm-signed V2 manifest must pass the production verifier."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     from prop_production.release import ReleaseVerifier
-    payload = evidence["manifest"]["payload"]
-    verifier = ReleaseVerifier(Ed25519PublicKey.from_public_bytes(bytes.fromhex(evidence["public"])),
-                               "approver", "fixture-account",
-                               payload["risk_policy_sha"], payload["rulebook_sha"])
-    verified = verifier.verify(evidence["manifest"], now_ms=evidence["now_ms"])
+
+    companion = companion_root()
+    interpreter = companion / ".venv" / "bin" / "python"
+    assert (companion / "src" / "copytrade_pm" / "production_manifest.py").is_file(), (
+        f"pinned companion worktree missing: {companion}"
+    )
+    assert interpreter.is_file(), f"pinned companion interpreter missing: {interpreter}"
+    process = subprocess.run(
+        [str(interpreter), "-c", COMPANION_PROGRAM],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={
+            "PATH": os.defpath,
+            "PYTHONPATH": f"{companion / 'src'}:{companion / 'tests'}",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    )
+    evidence = json.loads(process.stdout)
+    signed = evidence["manifest"]
+    payload = signed["payload"]
+    verified = ReleaseVerifier(
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(evidence["public"])),
+        "approver",
+        payload["account_binding"],
+        payload["risk_policy_sha"],
+        payload["rulebook_sha"],
+    ).verify(signed, now_ms=evidence["now_ms"])
+
+    assert verified.payload["schema"] == "portfolio_release_v2"
+    assert verified.payload == payload
+    assert verified.release_sha == signed["sha256"]
+    assert verified.trading_authorized is False
+    assert verified.signed_envelope is not None
     assert len(verified.payload["members"]) == 3
     assert verified.payload["batch_seconds"] == 300
-    assert verified.trading_authorized is False
-
-    assert all(member["sizing_policy"] == policy_name for member in verified.payload["members"])
-    if policy_name == "FIXED_K_NATIVE_QUANTITY":
-        assert all(nav is None for nav in evidence["source_nav_values"])
-        assert all(member["k"] == "0.04" for member in verified.payload["members"])
+    assert all(
+        member["sizing_policy"] == "FIXED_K_NATIVE_QUANTITY" and member["k"] == "0.04"
+        for member in verified.payload["members"]
+    )
+    assert len(verified.payload["mandates"]) == len(verified.payload["members"])
+    assert all(mandate["k"] == "0.04" for mandate in verified.payload["mandates"])
+    assert (
+        verified.payload["mandate_authority_sha"]
+        == sha256(bytes.fromhex(evidence["release_signer_public"])).hexdigest()
+    )

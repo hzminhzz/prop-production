@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from test_v4_timing import MARKET, setup
+from test_checkpoint_receiver import KEY, fresh_release
 
 from prop_production.evidence import sign
 from prop_production.v4_market_identity import (
@@ -16,6 +16,8 @@ from prop_production.v4_market_identity import (
     validate_independent_quotes,
     validate_release_markets,
 )
+
+MARKET = "hyperliquid/mainnet:perp:default/BTC"
 
 
 def catalog(tmp_path):
@@ -41,8 +43,8 @@ def catalog(tmp_path):
 
 
 def fixture(tmp_path):
-    projection, release, source = setup(tmp_path)
-    projection.close()
+    release, _ = fresh_release(tmp_path)
+    source = KEY
     path, pin = catalog(tmp_path)
     market_set = load_display_catalog(path, pin)
     issuer = Ed25519PrivateKey.generate()

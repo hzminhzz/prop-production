@@ -20,7 +20,9 @@ from prop_production.bybit_gateway import (
 @pytest.fixture(scope="module", autouse=True)
 def _isolate_connector_sys_modules() -> Any:
     """Keep prop_production's own CLI module-isolation test clean when running the full suite."""
-    before = {name for name in sys.modules if name == "connectors" or name.startswith("connectors.")}
+    before = {
+        name for name in sys.modules if name == "connectors" or name.startswith("connectors.")
+    }
     yield
     for name in list(sys.modules):
         if (name == "connectors" or name.startswith("connectors.")) and name not in before:
@@ -66,10 +68,19 @@ def _mock_rest_exchange(*, empty_books: bool = False) -> AsyncMock:
     ex.close = AsyncMock(return_value=None)
     ex.fetch_time = AsyncMock(return_value=1_700_000_005_000)
     ex.market = lambda native_symbol: {
-        "BTCUSDT": {"id": "BTCUSDT", "symbol": "BTC/USDT:USDT", "linear": True, "swap": True, "settle": "USDT"},
+        "BTCUSDT": {
+            "id": "BTCUSDT",
+            "symbol": "BTC/USDT:USDT",
+            "linear": True,
+            "swap": True,
+            "settle": "USDT",
+        },
     }[native_symbol]
     ex.private_get_v5_user_query_api = AsyncMock(
-        return_value={"retCode": 0, "result": {"userID": "778899", "apiKey": "demo-key", "uta": "1", "readOnly": "0"}}
+        return_value={
+            "retCode": 0,
+            "result": {"userID": "778899", "apiKey": "demo-key", "uta": "1", "readOnly": "0"},
+        }
     )
     ex.private_get_v5_account_info = AsyncMock(
         return_value={"retCode": 0, "result": {"unifiedMarginStatus": 6}}
@@ -99,7 +110,11 @@ def _mock_rest_exchange(*, empty_books: bool = False) -> AsyncMock:
         ex.fetch_canceled_and_closed_orders = AsyncMock(return_value=[])
         ex.fetch_my_trades = AsyncMock(return_value=[])
         ex.fetch_ticker = AsyncMock(
-            return_value={"last": 50000.0, "info": {"markPrice": "50000.0"}, "timestamp": 1_700_000_005_000}
+            return_value={
+                "last": 50000.0,
+                "info": {"markPrice": "50000.0"},
+                "timestamp": 1_700_000_005_000,
+            }
         )
         return ex
 
@@ -179,7 +194,9 @@ def _mock_rest_exchange(*, empty_books: bool = False) -> AsyncMock:
             ]
         return []
 
-    async def _fetch_closed_orders(*, since: int | None = None, params: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _fetch_closed_orders(
+        *, since: int | None = None, params: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         if params.get("subType") == "linear" and params.get("settleCoin") == "USDT":
             return [
                 {
@@ -212,7 +229,9 @@ def _mock_rest_exchange(*, empty_books: bool = False) -> AsyncMock:
     ex.fetch_open_orders = AsyncMock(side_effect=_fetch_open_orders)
     ex.fetch_canceled_and_closed_orders = AsyncMock(side_effect=_fetch_closed_orders)
 
-    async def _fetch_my_trades(*, symbol: str | None = None, since: int | None = None, params: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _fetch_my_trades(
+        *, symbol: str | None = None, since: int | None = None, params: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         if params.get("settleCoin") == "USDT":
             return [
                 {
@@ -324,14 +343,20 @@ def test_ccxt_snapshot_is_guardian_ready_and_fails_closed_on_drift() -> None:
 
 
 def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> None:
-    BybitClient, _, _, Mode, BybitInvalidOrderError, (BybitNetworkError, BybitDemoReconciler) = _connector_symbols()
+    BybitClient, _, _, Mode, BybitInvalidOrderError, (BybitNetworkError, BybitDemoReconciler) = (
+        _connector_symbols()
+    )
     ex = _mock_rest_exchange()
     ws = _mock_ws_exchange()
     ro_client = BybitClient(_demo_config(mode=Mode.READ_ONLY), exchange=ex)
-    ro_reconciler = BybitDemoReconciler(ro_client, ws_exchange=ws, now_ms_fn=lambda: 1_700_000_005_100)
+    ro_reconciler = BybitDemoReconciler(
+        ro_client, ws_exchange=ws, now_ms_fn=lambda: 1_700_000_005_100
+    )
     ro_gateway = BybitDemoGateway(ro_reconciler, expected_demo_uid="778899")
     with pytest.raises(PermissionError, match="REMOTE_MUTATION_UNAVAILABLE"):
-        ro_gateway.submit({"intent_id": "i-1", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False})
+        ro_gateway.submit(
+            {"intent_id": "i-1", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False}
+        )
 
     ex_exec = _mock_rest_exchange()
     ex_exec.create_order = AsyncMock(
@@ -351,7 +376,9 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
     )
     ex_exec.cancel_order = AsyncMock(return_value={})
     exec_client = BybitClient(_demo_config(mode=Mode.EXECUTION), exchange=ex_exec)
-    exec_reconciler = BybitDemoReconciler(exec_client, ws_exchange=_mock_ws_exchange(), now_ms_fn=lambda: 1_700_000_005_100)
+    exec_reconciler = BybitDemoReconciler(
+        exec_client, ws_exchange=_mock_ws_exchange(), now_ms_fn=lambda: 1_700_000_005_100
+    )
 
     with BybitDemoGateway(exec_reconciler, expected_demo_uid="778899") as gateway:
         snap = gateway.observe(1_700_000_005_500)
@@ -380,7 +407,12 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
         # Ambiguous network error MUST return UNKNOWN and NEVER retry
         ex_exec.create_order = AsyncMock(side_effect=BybitNetworkError("socket timeout"))
         ambiguous = gateway.submit(
-            {"intent_id": "intent-43", "market": "BTC/USDT:USDT", "quantity": "0.02", "reduce_only": False}
+            {
+                "intent_id": "intent-43",
+                "market": "BTC/USDT:USDT",
+                "quantity": "0.02",
+                "reduce_only": False,
+            }
         )
         assert ambiguous.status == "UNKNOWN"
         assert ex_exec.create_order.call_count == 1
@@ -388,7 +420,12 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
         # Explicit exchange validation failure maps to REJECTED
         ex_exec.create_order = AsyncMock(side_effect=BybitInvalidOrderError("min qty"))
         rejected = gateway.submit(
-            {"intent_id": "intent-44", "market": "BTC/USDT:USDT", "quantity": "0.0001", "reduce_only": False}
+            {
+                "intent_id": "intent-44",
+                "market": "BTC/USDT:USDT",
+                "quantity": "0.0001",
+                "reduce_only": False,
+            }
         )
         assert rejected.status == "REJECTED"
 
@@ -410,7 +447,13 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
             }
         )
         ioc_partial = gateway.submit(
-            {"intent_id": "intent-45", "market": "BTC/USDT:USDT", "quantity": "0.1", "price": "50000.0", "reduce_only": False}
+            {
+                "intent_id": "intent-45",
+                "market": "BTC/USDT:USDT",
+                "quantity": "0.1",
+                "price": "50000.0",
+                "reduce_only": False,
+            }
         )
         assert ioc_partial.status == "CANCELLED"
         assert ioc_partial.broker_id == "ord-ioc-partial"
@@ -434,7 +477,13 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
             }
         )
         ioc_zero = gateway.submit(
-            {"intent_id": "intent-46", "market": "BTC/USDT:USDT", "quantity": "0.1", "price": "50000.0", "reduce_only": False}
+            {
+                "intent_id": "intent-46",
+                "market": "BTC/USDT:USDT",
+                "quantity": "0.1",
+                "price": "50000.0",
+                "reduce_only": False,
+            }
         )
         assert ioc_zero.status == "CANCELLED"
         assert ioc_zero.broker_id == "ord-ioc-zero"
@@ -457,7 +506,12 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
             }
         )
         false_fill = gateway.submit(
-            {"intent_id": "intent-47", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False}
+            {
+                "intent_id": "intent-47",
+                "market": "BTC/USDT:USDT",
+                "quantity": "0.1",
+                "reduce_only": False,
+            }
         )
         assert false_fill.status == "UNKNOWN"
         assert false_fill.broker_id == "ord-false-fill"
@@ -467,13 +521,20 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
 
         # Filled status with missing filled_quantity must fail closed as UNKNOWN.
         ex_exec.create_order = AsyncMock(
-            return_value=SimpleNamespace(order_id="ord-none-fill", status="filled", filled_quantity=None)
+            return_value=SimpleNamespace(
+                order_id="ord-none-fill", status="filled", filled_quantity=None
+            )
         )
         orig_create = exec_client.create_order
         exec_client.create_order = ex_exec.create_order  # type: ignore[method-assign]
         try:
             none_fill = gateway.submit(
-                {"intent_id": "intent-48", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False}
+                {
+                    "intent_id": "intent-48",
+                    "market": "BTC/USDT:USDT",
+                    "quantity": "0.1",
+                    "reduce_only": False,
+                }
             )
             assert none_fill.status == "UNKNOWN"
             assert none_fill.broker_id == "ord-none-fill"
@@ -498,7 +559,12 @@ def test_bybit_demo_gateway_lifecycle_submit_cancel_and_non_retry_unknown() -> N
             }
         )
         rej_filled = gateway.submit(
-            {"intent_id": "intent-49", "market": "BTC/USDT:USDT", "quantity": "0.1", "reduce_only": False}
+            {
+                "intent_id": "intent-49",
+                "market": "BTC/USDT:USDT",
+                "quantity": "0.1",
+                "reduce_only": False,
+            }
         )
         assert rej_filled.status == "UNKNOWN"
         assert rej_filled.broker_id == "ord-rej-filled"
@@ -547,7 +613,9 @@ def test_ccxt_hedge_mode_order_fails_closed() -> None:
 
     ex.fetch_open_orders = AsyncMock(side_effect=_hedge_orders)
     client = BybitClient(_demo_config(), exchange=ex)
-    reconciler = BybitDemoReconciler(client, ws_exchange=_mock_ws_exchange(), now_ms_fn=lambda: 1_700_000_005_100)
+    reconciler = BybitDemoReconciler(
+        client, ws_exchange=_mock_ws_exchange(), now_ms_fn=lambda: 1_700_000_005_100
+    )
     with pytest.raises(BybitSnapshotError, match="demo_orders_ccxt: hedge mode order unsupported"):
         asyncio.run(reconciler.catch_up())
     snap = reconciler.snapshot()
@@ -555,14 +623,17 @@ def test_ccxt_hedge_mode_order_fails_closed() -> None:
     assert "CATCH_UP_FAILED:BybitSnapshotError" in snap.uncertainty_reasons
 
 
-def test_guardian_reconciles_coherent_with_bybit_demo_gateway_and_halts_when_stale(tmp_path: Any) -> None:
+def test_guardian_reconciles_coherent_with_bybit_demo_gateway_and_halts_when_stale(
+    tmp_path: Any,
+) -> None:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from test_copy_mandates import START, release_body
 
     from prop_production.evidence import digest, sign
     from prop_production.finance import Rulebook
     from prop_production.guardian import Guardian
     from prop_production.journal import Journal
-    from prop_production.release import ReleaseFloor, ReleaseVerifier, fixture_release
+    from prop_production.release import ReleaseFloor, ReleaseVerifier
     from prop_production.risk import fixture_markets, fixture_policy
 
     uid = "778899"
@@ -575,13 +646,17 @@ def test_guardian_reconciles_coherent_with_bybit_demo_gateway_and_halts_when_sta
         evidence_sha=digest("test-only bybit demo rulebook"),
     )
     policy, markets = fixture_policy(), fixture_markets()
-    body = fixture_release()
+    body = release_body(key)
     body["account_binding"] = binding
     body["risk_policy_sha"] = digest({"policy": policy, "markets": markets})
     body["rulebook_sha"] = rules.sha
+    for mandate in body["mandates"]:
+        mandate.update(
+            account_id=binding, risk_policy_sha=body["risk_policy_sha"], rulebook_sha=rules.sha
+        )
     release = ReleaseVerifier(
         key.public_key(), "approver", binding, body["risk_policy_sha"], rules.sha
-    ).verify(sign(body, key, "approver"), now_ms=1000)
+    ).verify(sign(body, key, "approver"), now_ms=START - 10)
 
     floor = ReleaseFloor(tmp_path / "release.sqlite", initialize=True)
     floor.accept(release)
@@ -599,7 +674,17 @@ def test_guardian_reconciles_coherent_with_bybit_demo_gateway_and_halts_when_sta
         )
 
         with BybitDemoGateway(reconciler, expected_demo_uid=uid) as gateway:
-            guardian = Guardian(journal, release, floor, key.public_key(), rules, policy, markets, gateway)
+            guardian = Guardian(
+                journal,
+                release,
+                floor,
+                Ed25519PrivateKey.generate().public_key(),
+                rules,
+                policy,
+                markets,
+                gateway,
+                mandate_key=key.public_key(),
+            )
             res = guardian.reconcile(1_700_000_006_000)
             assert res["certainty"] == "COHERENT"
             assert res["flat_confirmed"] is True

@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .contracts import PORTFOLIO_RELEASE_V1, PORTFOLIO_RELEASE_V2, SYNTHETIC_ACCOUNT
+from .contracts import PORTFOLIO_RELEASE_V2, SYNTHETIC_ACCOUNT
 from .copy_mandates import verify_release_contract
 from .evidence import canonical, decimal, digest, load_json, require_sha, verify
 
@@ -126,12 +126,6 @@ class ReleaseVerifier:
     ) -> VerifiedRelease:
         original = verify(envelope, self.key, self.authority)
         p = original
-        if original.get("schema") == PORTFOLIO_RELEASE_V2:
-            p = verify_release_contract(p, self.key.public_bytes_raw())
-            if type(now_ms) is not int or any(
-                m["effective_until_ms"] <= now_ms for m in original["mandates"]
-            ):
-                raise ValueError("EXPIRED_OR_FUTURE_RELEASE")
         required = {
             "schema",
             "generation",
@@ -150,8 +144,12 @@ class ReleaseVerifier:
             "batch_seconds",
             "source_mode",
         }
-        if set(p) != required or p["schema"] != PORTFOLIO_RELEASE_V1:
+        required |= {"checkpoint_policy", "checkpoint_scopes", "mandates", "mandate_authority_sha"}
+        if set(p) != required or p.get("schema") != PORTFOLIO_RELEASE_V2:
             raise ValueError("UNSUPPORTED_RELEASE_SCHEMA")
+        verify_release_contract(p, self.key.public_bytes_raw())
+        if type(now_ms) is not int or any(m["effective_until_ms"] <= now_ms for m in p["mandates"]):
+            raise ValueError("EXPIRED_OR_FUTURE_RELEASE")
         if type(p["generation"]) is not int or p["generation"] < 1:
             raise ValueError("INVALID_GENERATION")
         if (
@@ -223,7 +221,7 @@ class ReleaseVerifier:
                 # stressed pod loss, margin, exposure, and follower drawdown.
                 if not 0 < decimal(m["k"]) <= decimal("10"):
                     raise ValueError("INVALID_FIXED_K")
-            elif mode != "ALLOCATION_OVER_LIVE_NAV":
+            else:
                 raise ValueError("INVALID_SIZING_POLICY")
         if digest(members) != p["definition_sha"]:
             raise ValueError("DEFINITION_DRIFT")
@@ -261,12 +259,13 @@ def fixture_release() -> dict[str, Any]:
             "identity_known_at_ms": 1,
             "account_scope": ["fixture-leader"],
             "allocation": "2000",
-            "sizing_policy": "ALLOCATION_OVER_LIVE_NAV",
+            "sizing_policy": "FIXED_K_NATIVE_QUANTITY",
+            "k": "0.025",
             "allowed_markets": ["BTC", "ETH"],
         }
     ]
     p: dict[str, Any] = {
-        "schema": PORTFOLIO_RELEASE_V1,
+        "schema": PORTFOLIO_RELEASE_V2,
         "generation": 1,
         "account_binding": SYNTHETIC_ACCOUNT,
         "created_at_ms": 10,

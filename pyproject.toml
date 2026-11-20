@@ -26,7 +26,7 @@ prop-production = "prop_production.cli:main"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/prop_production"]
+packages = ["src/prop_production", "packages/copytrade-kernel/src/copytrade_kernel"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -43,7 +43,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["src"]
+files = ["src", "packages/copytrade-kernel/src"]
 
 [[tool.mypy.overrides]]
 module = ["connectors.*", "dotenv"]

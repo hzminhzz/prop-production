@@ -97,8 +97,8 @@ def gap_packet():
     return sign(body, KEY, "cwsa-checkpoint-v3"), now
 
 
-def test_existing_worker_shadow_baseline_gap_halt_and_restart_preserve_authority(tmp_path):
-    root = tmp_path / "rehearsal"
+def test_v3_worker_gap_restart(tmp_path):
+    root = tmp_path / "v3"
     authority, mandate = setup(root)
     floor_before = (root / "trust/floor.sqlite").read_bytes()
     workers = []

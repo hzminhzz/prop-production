@@ -16,12 +16,11 @@ from prop_production.gateway import ReadOnlyGateway
 def test_checkpoint_compatibility_contracts_are_explicit():
     contracts = MANIFEST["contracts"]
     assert contracts["portfolio_release_versions"] == [
-        "portfolio_release_v1",
         "portfolio_release_v2",
     ]
     assert contracts["checkpoint_source"] == "cwsa_checkpoint_packet_v3"
     assert contracts["copy_mandate"] == "copy_mandate_v1"
-    assert contracts["active_source_wire"] == 1
+    assert contracts["active_source_wire"] == 3
     assert contracts["trading_authorized"] is False
 
 
@@ -167,7 +166,9 @@ with tempfile.TemporaryDirectory() as directory:
     exported = json.loads(proc.stdout)
     manifest = exported["manifest"]
     payload = manifest["payload"]
-    reviewer_pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(exported["reviewer_public_hex"]))
+    reviewer_pub = Ed25519PublicKey.from_public_bytes(
+        bytes.fromhex(exported["reviewer_public_hex"])
+    )
     source_pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(exported["source_public_hex"]))
 
     verifier = ReleaseVerifier(

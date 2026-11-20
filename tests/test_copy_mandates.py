@@ -83,15 +83,19 @@ def verifier(key):
     )
 
 
-def test_new_signed_release_preserves_distinct_legacy_contract():
+def test_native_v2_preserves_signed_payload_and_rejects_v1():
     key = Ed25519PrivateKey.generate()
     v = verifier(key)
     new = v.verify(sign(release_body(key), key, "approver"), now_ms=START - 10)
     assert new.payload["schema"] == "portfolio_release_v2"
     assert new.payload["mandates"][0]["k"] == "0.025"
-    old = v.verify(sign(fixture_release(), key, "approver"), now_ms=20)
-    assert old.payload["schema"] == "portfolio_release_v1"
-    assert old.payload["batch_seconds"] == 300
+    assert new.payload == release_body(key)
+    assert new.release_sha == digest(release_body(key))
+    with pytest.raises(ValueError, match="UNSUPPORTED_RELEASE_SCHEMA"):
+        v.verify(
+            sign(dict(release_body(key), schema="portfolio_release_v1"), key, "approver"),
+            now_ms=START - 10,
+        )
     assert new.trading_authorized is False
 
 

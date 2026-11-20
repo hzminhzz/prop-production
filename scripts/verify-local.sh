@@ -32,12 +32,12 @@ else
 fi
 
 pin_field() {
-    PYTHONPATH="$APP_ROOT/src" python3 -m prop_production.compatibility --field "$1"
+    PYTHONPATH="$APP_ROOT/src:$APP_ROOT/packages/copytrade-kernel/src" python3 -m prop_production.compatibility --field "$1"
 }
 RESEARCH_SHA="$(pin_field research)"
 CONNECTOR_SHA="$(pin_field connector)"
 COMPATIBILITY_SHA="$(pin_field sha)"
-PYTHONPATH="$APP_ROOT/src" python3 -m prop_production.compatibility \
+PYTHONPATH="$APP_ROOT/src:$APP_ROOT/packages/copytrade-kernel/src" python3 -m prop_production.compatibility \
     --check-project "$APP_ROOT/pyproject.toml" --field sha
 if [[ "$MODE" == "all" ]]; then
     : "${PROP_RESEARCH_ROOT:?BLOCKED: set PROP_RESEARCH_ROOT to the pinned copytrade-pm worktree}"

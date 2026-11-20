@@ -8,6 +8,9 @@ from decimal import Decimal, localcontext
 from fractions import Fraction
 from typing import Any, Literal
 
+from copytrade_kernel.money import add as add
+from copytrade_kernel.money import finite as finite
+
 from .contracts import CHECKPOINT_POLICY_V3
 from .evidence import decimal, digest
 
@@ -85,26 +88,6 @@ def advance_basis(
         after,
         str(realized),
     )
-
-
-def finite(value: Fraction) -> Decimal:
-    """Convert a terminating rational without ambient Decimal-context rounding."""
-    denominator, twos, fives = value.denominator, 0, 0
-    while denominator % 2 == 0:
-        denominator //= 2
-        twos += 1
-    while denominator % 5 == 0:
-        denominator //= 5
-        fives += 1
-    if denominator != 1:
-        raise ValueError("NONTERMINATING_ATTRIBUTION_AMOUNT")
-    places = max(twos, fives)
-    coefficient = value.numerator * 2 ** (places - twos) * 5 ** (places - fives)
-    return Decimal((int(coefficient < 0), tuple(map(int, str(abs(coefficient)))), -places))
-
-
-def add(*values: Decimal) -> Decimal:
-    return finite(sum((Fraction(v) for v in values), Fraction(0)))
 
 
 def split(total: Decimal, weights: dict[str, Decimal]) -> dict[str, Decimal]:
@@ -521,7 +504,9 @@ def validate_attribution(previous: dict[str, Any], current: dict[str, Any], kind
         for key in ("pod_funding", "checkpoint_funding_allocations")
     ):
         raise ValueError("CHECKPOINT_POD_LEDGER_CONSERVATION")
-    if not funding_allocations and previous.get("pod_funding", {}) != current.get("pod_funding", {}):
+    if not funding_allocations and previous.get("pod_funding", {}) != current.get(
+        "pod_funding", {}
+    ):
         raise ValueError("CHECKPOINT_POD_LEDGER_CONSERVATION")
     for funding_id in current.get("funding_events", {}):
         if funding_id not in current.get("checkpoint_funding_allocations", {}):

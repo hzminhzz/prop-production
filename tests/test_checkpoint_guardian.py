@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_checkpoint_receiver import KEY, fixture_packet
 from test_copy_mandates import START, release_body
 
+from prop_production.checkpoint_receiver import CheckpointSourceReceiver
 from prop_production.evidence import digest, sign
 from prop_production.finance import Rulebook
 from prop_production.guardian import Guardian
@@ -15,7 +16,6 @@ from prop_production.journal import Journal
 from prop_production.judge.broker import FakeBroker
 from prop_production.release import ReleaseFloor, ReleaseVerifier
 from prop_production.risk import fixture_markets, fixture_policy
-from prop_production.v4_source_receiver import SourcePacketReceiver
 
 
 @pytest.fixture
@@ -56,7 +56,7 @@ def system(tmp_path):
             broker,
             mandate_key=authority.public_key(),
         )
-        receiver = SourcePacketReceiver(
+        receiver = CheckpointSourceReceiver(
             tmp_path / "source.sqlite3",
             release=release,
             source_key=KEY.public_key(),
@@ -152,33 +152,8 @@ def test_journal_oracle_rejects_implicit_mandate_activation(system):
     assert system.broker.audit() == []
 
 
-def test_checkpoint_release_cannot_use_legacy_admission(system):
-    with pytest.raises(ValueError, match="CHECKPOINT_ADMISSION"):
-        system.guardian.decide(None, {}, START)
-    assert not system.journal.snapshot()["intents"]
-
-
-def test_synthetic_endpoint_mismatch_rejected_before_reservation(tmp_path, system):
-    from test_guardian import setup_system
-    from test_planner import quote
-
-    legacy_root = tmp_path / "legacy"
-    legacy_root.mkdir()
-    legacy_guardian, legacy_broker, legacy_journal, proposal, floor = setup_system(legacy_root)
-    try:
-        legacy_decision = legacy_guardian.decide(proposal, quote(), 301000)
-        legacy_broker.endpoint = "https://unexpected.example"
-        with pytest.raises(PermissionError, match="REMOTE_MUTATION_UNAVAILABLE"):
-            legacy_guardian.reserve(legacy_decision.data["decision_id"], 301000)
-        legacy_state = legacy_journal.snapshot()
-        assert not legacy_state["intents"]
-        assert not legacy_state["reservations"]
-        assert not legacy_state["halts"]
-        assert legacy_broker.audit() == []
-    finally:
-        legacy_journal.close()
-        legacy_broker.close()
-        floor.close()
+def test_synthetic_endpoint_mismatch_rejected_before_reservation(system):
+    from checkpoint_scenarios import quotes as quote
 
     m, now = prime(system)
     outcome = json.loads(fixture_packet())["payload"]["transitions"][-1]["effect"]

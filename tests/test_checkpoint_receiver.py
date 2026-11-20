@@ -5,10 +5,9 @@ from hashlib import sha256
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from test_v4_source_receiver import fresh_release
 
+from prop_production.checkpoint_receiver import CheckpointSourceReceiver
 from prop_production.evidence import canonical, digest, sign
-from prop_production.v4_source_receiver import SourcePacketReceiver
 
 KEY = Ed25519PrivateKey.from_private_bytes(b"c" * 32)
 POLICY = {
@@ -32,9 +31,16 @@ SCOPE = {
 PINS = {"policy": POLICY, "scopes": {"fixture-leader": SCOPE}}
 
 
+def fresh_release(_path):
+    from test_copy_mandates import START, release_body, verifier
+
+    key = Ed25519PrivateKey.generate()
+    return verifier(key).verify(sign(release_body(key), key, "approver"), now_ms=START - 10), key
+
+
 def test_existing_receiver_supports_separately_pinned_checkpoint_schema(tmp_path):
     release, _key = fresh_release(tmp_path)
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         tmp_path / "checkpoint.sqlite3",
         release=release,
         source_key=KEY.public_key(),
@@ -42,13 +48,12 @@ def test_existing_receiver_supports_separately_pinned_checkpoint_schema(tmp_path
         checkpoint_pins=PINS,
     )
     assert receiver.checkpoint_status()["source_count"] == 0
-    assert receiver.due(now_ms=1) == []
     receiver.close()
 
 
 def test_partial_and_forged_checkpoint_packets_do_not_advance(tmp_path):
     release, _key = fresh_release(tmp_path)
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         tmp_path / "checkpoint.sqlite3",
         release=release,
         source_key=KEY.public_key(),
@@ -85,7 +90,7 @@ def test_two_independent_consumers_preserve_one_cwsa_change_and_restart(tmp_path
     now = body["issued_ms"]
     expected = body["transitions"][-1]["effect"]["signal_id"]
     for name in ("paper", "shadow"):
-        receiver = SourcePacketReceiver(
+        receiver = CheckpointSourceReceiver(
             tmp_path / (name + ".sqlite3"),
             release=release,
             source_key=KEY.public_key(),
@@ -96,9 +101,8 @@ def test_two_independent_consumers_preserve_one_cwsa_change_and_restart(tmp_path
         outcomes = receiver.checkpoint_outcomes(now_ms=now)
         assert [item["opening_candidate"] for item in outcomes] == [False, True]
         assert outcomes[-1]["outcome"]["signal_id"] == expected
-        assert receiver.due(now_ms=now + 300_000) == []
         receiver.close()
-        receiver = SourcePacketReceiver(
+        receiver = CheckpointSourceReceiver(
             tmp_path / (name + ".sqlite3"),
             release=release,
             source_key=KEY.public_key(),
@@ -118,7 +122,7 @@ def test_two_independent_consumers_preserve_one_cwsa_change_and_restart(tmp_path
 )
 def test_signed_but_inconsistent_proofs_cannot_advance(tmp_path, fault):
     release, _key = fresh_release(tmp_path)
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         tmp_path / "negative.sqlite3",
         release=release,
         source_key=KEY.public_key(),
@@ -151,7 +155,7 @@ def test_signed_but_inconsistent_proofs_cannot_advance(tmp_path, fault):
 
 def test_later_source_fence_revokes_unconsumed_opening_candidate(tmp_path):
     release, _key = fresh_release(tmp_path)
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         tmp_path / "fence.sqlite3",
         release=release,
         source_key=KEY.public_key(),
@@ -181,16 +185,16 @@ def test_later_source_fence_revokes_unconsumed_opening_candidate(tmp_path):
     receiver.close()
 
 
-def test_existing_handoff_and_inbox_keep_checkpoint_proof_bytes(tmp_path):
-    from test_v4_source_handoff import copy_once, directories
-    from test_v4_source_receiver import private_packet
-
-    from prop_production.v4_source_receiver import consume_once
+def test_inbox_keeps_checkpoint_proof_bytes(tmp_path):
+    from prop_production.checkpoint_receiver import consume_once
 
     release, _key = fresh_release(tmp_path)
-    src, dst = directories(tmp_path)
-    private_packet(src, fixture_packet(), 1)
-    assert copy_once(src, dst, KEY)["transferred"] == 1
+    dst = tmp_path / "inbox"
+    dst.mkdir(mode=0o700)
+    raw = fixture_packet()
+    spool = dst / ("00000000000000000001-" + sha256(raw).hexdigest()[:16] + ".json")
+    spool.write_bytes(raw)
+    spool.chmod(0o600)
     now = json.loads(fixture_packet())["payload"]["issued_ms"]
     result = consume_once(
         state_db=tmp_path / "inbox.sqlite3",
@@ -204,6 +208,15 @@ def test_existing_handoff_and_inbox_keep_checkpoint_proof_bytes(tmp_path):
     assert result["processed_source_events"] == 3
     assert result["opening_candidates"] == 1
     assert result["order_route"] == "NONE"
+    assert spool.read_bytes() == raw
+    receiver = CheckpointSourceReceiver(
+        tmp_path / "inbox.sqlite3", release=release, source_key=KEY.public_key()
+    )
+    try:
+        outcome = json.loads(raw)["payload"]["transitions"][-1]["effect"]["outcome_id"]
+        assert receiver.packet_for(outcome) == json.loads(raw)
+    finally:
+        receiver.close()
 
 
 def crash_receiver(root, release_body, point):
@@ -215,7 +228,7 @@ def crash_receiver(root, release_body, point):
 
     payload = json.loads(release_body)
     release = VerifiedRelease(canonical(payload), digest(payload), "approver")
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         Path(root) / "crash.sqlite3",
         release=release,
         source_key=KEY.public_key(),
@@ -255,7 +268,7 @@ def test_receiver_sigkill_never_commits_partial_source_packet(tmp_path, point):
         timeout=15,
     )
     assert result.returncode == -signal.SIGKILL
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         tmp_path / "crash.sqlite3",
         release=release,
         source_key=KEY.public_key(),
@@ -271,7 +284,7 @@ def test_receiver_sigkill_never_commits_partial_source_packet(tmp_path, point):
 
 def test_fabricated_continuous_genesis_is_rejected(tmp_path):
     release, _key = fresh_release(tmp_path)
-    receiver = SourcePacketReceiver(
+    receiver = CheckpointSourceReceiver(
         tmp_path / "genesis.sqlite3",
         release=release,
         source_key=KEY.public_key(),

@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from decimal import Decimal
 from typing import Any
+
+from copytrade_kernel.risk import effective_policy as kernel_effective_policy
+from copytrade_kernel.risk import validate_quotes
 
 from .checkpoint_account_proof import capture
 from .checkpoint_account_proof import validate as validate_account_proof
 from .checkpoint_source import integer
 from .evidence import decimal, digest
 from .gateway import BrokerGateway, execution_capability
-from .planner import validate_quotes
 
 
 def loss_limit(state: dict[str, Any], owner: str, policy: dict[str, Any]) -> Decimal:
@@ -30,8 +31,7 @@ def effective_policy(
     markets: dict[str, Any],
 ) -> dict[str, Any]:
     """Intersect approved constraints while any previous owner retains exposure."""
-    result = deepcopy(policy)
-    scenarios = {digest(s): s for s in policy["scenarios"]}
+    retained = []
     for owner, book in state["pod_positions"].items():
         held = {market for market, quantity in book.items() if decimal(quantity)}
         if not held:
@@ -47,26 +47,8 @@ def effective_policy(
             contract["markets"].get(market) != markets.get(market) for market in held
         ):
             raise ValueError("RETAINED_NATIVE_SPEC_REQUALIFICATION_REQUIRED")
-        for field in ("minimum_headroom", "shortfall_bps", "margin_multiplier"):
-            result[field] = str(max(decimal(result[field]), decimal(prior[field])))
-        for field in ("made_limit", "pod_loss_budget", "hedge_tolerance"):
-            result[field] = str(min(decimal(result[field]), decimal(prior[field])))
-        for field in ("quote_max_age_ms", "account_max_age_ms"):
-            result["checkpoint_execution"][field] = min(
-                result["checkpoint_execution"][field],
-                prior["checkpoint_execution"][field],
-            )
-        result["checkpoint_execution"]["max_gross_notional"] = str(
-            min(
-                decimal(result["checkpoint_execution"]["max_gross_notional"]),
-                decimal(prior["checkpoint_execution"]["max_gross_notional"]),
-            )
-        )
-        scenarios.update({digest(s): s for s in prior["scenarios"]})
-    # Preserve the original signed ordering when there is no additional scenario.
-    seen = {digest(s) for s in result["scenarios"]}
-    result["scenarios"].extend(scenarios[k] for k in sorted(set(scenarios) - seen))
-    return result
+        retained.append(prior)
+    return kernel_effective_policy(policy, tuple(retained), scenario_identity=digest)
 
 
 def execution_policy(

@@ -9,12 +9,12 @@ from test_checkpoint_netting import decide, reserve
 from test_checkpoint_receiver import KEY
 from test_copy_mandates import START
 
+from prop_production.checkpoint_receiver import CheckpointSourceReceiver
 from prop_production.copy_mandates import CopyMandate
 from prop_production.evidence import digest, sign
 from prop_production.guardian import Guardian
 from prop_production.journal import Journal
 from prop_production.release import ReleaseVerifier
-from prop_production.v4_source_receiver import SourcePacketReceiver
 
 
 def stop(s, owner, event="RETIRE"):
@@ -165,7 +165,7 @@ def test_replacement_preserves_old_effects_and_source_history_across_restart(
         assert new.owner not in state["pod_positions"]
         assert s.receiver.checkpoint_outcomes(now_ms=s.now) == source_history
         s.receiver.close()
-        s.receiver = SourcePacketReceiver(
+        s.receiver = CheckpointSourceReceiver(
             s.root / "source.sqlite3",
             release=s.release,
             source_key=KEY.public_key(),

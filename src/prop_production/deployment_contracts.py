@@ -35,7 +35,7 @@ def durable_contracts(manifest: dict[str, Any]) -> tuple[str, ...]:
         raise ValueError("CODE_RECOVERY_CONTRACTS")
     result = {"release:" + v for v in versions}
     result.update("source:" + str(v) for v in c["source_wire_versions"])
-    for key in ("checkpoint_source", "copy_mandate"):
+    for key in ("checkpoint_source", "copy_mandate", "checkpoint_decision_semantics"):
         if key in c:
             if type(c[key]) is not str:
                 raise ValueError("CODE_RECOVERY_CONTRACTS")
