@@ -228,11 +228,11 @@ def test_packaged_systemd_units_and_acyclic_module_graph(tmp_path):
         assert callable(getattr(module, "main", None))
         if unit == "prop-production-broker.service":
             assert argv[2:] == ["prop_production.judge.broker", "/var/lib/prop-production"]
-        elif unit in {"prop-production-guardian.service", "prop-production-planner.service"}:
+        elif unit == "prop-production-guardian.service":
             role = argv[3]
             assert argv[2] == "prop_production.driver"
             assert role in PERIODIC and PERIODIC[role] is not None
-            assert role in {"planner", "guardian"}
+            assert role == "guardian"
 
     rejected = subprocess.run(
         [sys.executable, "-m", "prop_production.worker", "broker", str(tmp_path)],

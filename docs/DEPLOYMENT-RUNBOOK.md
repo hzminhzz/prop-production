@@ -26,7 +26,7 @@ New releases live at `/opt/prop-production/releases/<approved-commit>/` and cont
 | compatibility.json | Copy of the authoritative commit-bound contract manifest |
 | connector/ | Tracked connector source at the exact companion commit, including native SDK |
 | venv/ / dist/ | Non-editable frozen dependencies and built application wheel |
-| units/ | The six unit definitions that belong to this code bundle |
+| units/ | The five unit definitions that belong to this code bundle |
 | BUNDLE.json | Derived hashes, modes and symlink targets for the complete installed code set |
 
 Runtime provider PYTHONPATH points inside `current/connector`. No deployment
@@ -61,7 +61,7 @@ changed existing release is preserved for inspection; it is not deleted or reuse
 
 The installer takes a deployment lock. Activation snapshots the previous pointer,
 unit bytes and active-service set to root-private recovery storage, then stops
-exactly the six listed services. It installs the candidate units, switches the
+exactly the five listed services. It installs the candidate units, switches the
 pointer atomically, starts them, checks activity and requires fresh Guardian,
 Propr, Bybit and watchdog heartbeat files. A failed step restores the exact old
 pointer/unit set and starts only the previously active services. Financial journals
@@ -84,7 +84,7 @@ systemctl show prop-production-guardian.service \
 ```
 
 Bundle receipts and private health evidence may require root read access. Check all
-six exact units, their journal errors and fresh role evidence. The Guardian account
+five exact units, their journal errors and fresh role evidence. The Guardian account
 journal has a separate read-only status surface:
 
 ```bash
@@ -119,7 +119,6 @@ A successful code rollback does not clear HALT, reverse fills or lower the trust
 | --- | --- | --- |
 | broker | prop-runtime | Synthetic SHADOW broker/socket server |
 | guardian | prop-runtime | Guardian finance, durable intent and risk authority |
-| planner | prop-planner | Unprivileged proposals |
 | observer | prop-observer | Read-only Propr native account evidence |
 | watchdog | prop-watchdog | Independent operational assessment |
 | bybit-observer | prop-bybit | Dedicated Bybit Demo read-only observation |

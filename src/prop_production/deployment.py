@@ -20,7 +20,7 @@ from typing import Any
 from .deployment_contracts import code_recovery
 
 UNITS = tuple("prop-production-" + role + ".service" for role in (
-    "broker", "guardian", "planner", "observer", "watchdog", "bybit-observer"
+    "broker", "guardian", "observer", "watchdog", "bybit-observer"
 ))
 MARKERS = ("COMMIT", "TREE", "SOURCE.tar", "SOURCE.sha256", "compatibility.json")
 ARTIFACT_DIRS = ("source", "connector", "units", "dist", "venv")

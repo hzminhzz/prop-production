@@ -76,7 +76,7 @@ OPT_VENV="$RELEASE_DIR/venv"
 
 # Service identities preserve the existing IPC uid contract.
 getent group prop >/dev/null || groupadd --system prop
-for role in runtime planner observer watchdog bybit; do
+for role in runtime observer watchdog bybit; do
     id "prop-$role" >/dev/null 2>&1 || useradd --system --no-create-home \
         --shell /usr/sbin/nologin --gid prop "prop-$role"
 done
@@ -103,7 +103,6 @@ chown prop-bybit:prop "$STATE/health/bybit"; chmod 0750 "$STATE/health/bybit"
 chown prop-bybit:prop "$STATE/bybit"; chmod 0700 "$STATE/bybit"
 chown -R prop-runtime:prop "$STATE/broker" "$STATE/guardian" "$STATE/judge"
 for role in broker guardian judge; do chmod 0700 "$STATE/$role"; done
-chown -R prop-planner:prop "$STATE/planner"; chmod 0700 "$STATE/planner"
 [ -d "$STATE/observer" ] || mkdir -p "$STATE/observer"
 chown -R prop-observer:prop "$STATE/observer"; chmod 0750 "$STATE/observer"
 [ -d "$STATE/watchdog" ] || mkdir -p "$STATE/watchdog"

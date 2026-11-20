@@ -17,4 +17,4 @@ All notable changes to `prop-production` are documented in this file.
 - Updated `AGENTS.md`, `README.md`, `docs/SIZING-POLICY.md`, and `docs/LOCAL-VERIFICATION.md` to reflect the deleted Planner, retired `ALLOCATION_OVER_LIVE_NAV`, and `copytrade-kernel` single authority.
 
 ### Removed
-- Deleted dead V1/V4 paths and legacy Planner (`v4_timing.py`, `v4_source_handoff.py`, `v4_source_receiver.py`, `planner.py`, and associated V4/planner test modules).
+- Deleted dead V1/V4 paths and legacy Planner (`v4_timing.py`, `v4_source_handoff.py`, `v4_source_receiver.py`, `planner.py`, `deploy/prop-production-planner.service`, and associated V4/planner test modules).

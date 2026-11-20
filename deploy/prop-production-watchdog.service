@@ -2,7 +2,7 @@
 # runtime; it can never authorize trading and holds no broker credentials.
 [Unit]
 Description=prop-production independent watchdog
-After=prop-production-broker.service prop-production-guardian.service prop-production-planner.service prop-production-observer.service
+After=prop-production-broker.service prop-production-guardian.service prop-production-observer.service
 
 [Service]
 Type=simple
