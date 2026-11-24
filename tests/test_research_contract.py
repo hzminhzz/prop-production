@@ -54,7 +54,11 @@ def companion_root() -> Path:
     pinned = os.environ.get("PROP_RESEARCH_ROOT")
     if pinned:
         return Path(pinned).expanduser().resolve()
-    return Path(__file__).resolve().parents[2] / "copytrade-pm-phase-d"
+    dev_root = Path(__file__).resolve().parents[2]
+    sibling = dev_root / "copytrade-pm"
+    if sibling.is_dir():
+        return sibling
+    return dev_root / "copytrade-pm-phase-d"
 
 
 COMPANION_PROGRAM = r"""
