@@ -2,6 +2,12 @@
 
 All notable changes to `prop-production` are documented in this file.
 
+## [Phase D Onboarding & Companion Test Fallback] - 2026-11-24
+
+### Changed
+- Streamlined `AGENTS.md` using `writing-for-agents` context pointers and updated `README.md` to reflect `FactStore`/`RosterStore`, `packages/copytrade-kernel`, and `deployment retire-predecessor`.
+- Updated `tests/test_research_contract.py` (`companion_root()`) to prefer the standard sibling `copytrade-pm` checkout when `PROP_RESEARCH_ROOT` is unset.
+
 ## [Phase D & E — Unified Kernel Cutover] - 2026-11-20
 
 ### Added

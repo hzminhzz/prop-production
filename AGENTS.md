@@ -1,28 +1,28 @@
-# prop-production execution contract
+# prop-production
 
-Default mode is **SHADOW / NO_TRADE**. Never commit credentials, wallet identities, private account responses, datasets, or signing secrets. Mode flags, passing tests, or service restarts never grant live trading authority; keep `IMPLEMENTED`, `ENGINEERING_VERIFIED`, `DEPLOYED`, `RUNNING_OBSERVED`, `SCIENTIFICALLY_QUALIFIED`, and `TRADING_AUTHORIZED` strictly separate.
+Account-guarded copytrading execution application. Default mode is **SHADOW / NO_TRADE**; default branch is `feat/account-guardian-program`.
 
-## Orientation & scope
+## Hard guardrails
 
-- **Branch & worktrees:** Default branch is `feat/account-guardian-program` (recheck before pushing). Preserve concurrent sessions and use isolated worktrees when dirty. Read `README.md`, the owning module, and behavioral tests before editing.
-- **Capability-scoped gates:** Read [capability-scoped readiness](docs/CAPABILITY-SCOPED-READINESS-20261107.md). Source `OBSERVE` and read-only `PAPER` collection are decoupled from protected trading attestations (`read_only_collection=EVIDENCE_COLLECTED` preserves `BLOCKED_PAPER_ADMISSION` without executable follower economics). `DEMO`/`LIVE` require account-bound reconciliation, equity, signed release, risk checks, and explicit authorization.
-- **Durable navigation:** Use OptMem for cross-session context, then verify directly against Git, SQLite, and OS state. Execute directly unless delegation is explicitly requested.
+- **No secrets or PII in Git:** Keep credentials, wallet identities, private account responses, datasets, and signing keys outside Git.
+- **Keep readiness dimensions separate:** `IMPLEMENTED`, `ENGINEERING_VERIFIED`, `DEPLOYED`, `RUNNING_OBSERVED`, `SCIENTIFICALLY_QUALIFIED`, and `TRADING_AUTHORIZED` are independent claims; passing tests or restarts never authorize trading.
+- **Cross-repo pins:** `src/prop_production/compatibility.json` is the sole companion/schema pin authority.
 
-## Authority boundaries
+## Ownership & invariants
 
-- **Domain owners:** Research facts (`FactStore`) and seat rosters (`RosterStore`) belong to `copytrade-pm`; provider protocol belongs to `trading-connector`; `packages/copytrade-kernel` (`copytrade-kernel`), Guardian account finance, and committed intents belong to this app alone. Never place network I/O inside a SQL transaction or let a connector journal replace a Guardian intent.
-- **Challenge Rulebooks:** All 6 prop-firm challenge rulebook families (`northbook`, `vanta-trading`, `hyrotrader`, `crypto-fund-trader`, `hypernova`, `propr`; 36 variants) are canonicalized in `packages/copytrade-kernel` via `Rulebook.from_challenge(key)` / `Rulebook.list_challenges()` and `prop-production rulebooks`. See [challenge rulebooks](docs/CHALLENGE-RULEBOOKS.md).
-- **Propr native evidence (Planner retired):** Consume read-only Propr evidence strictly via `connectors/propr/native_evidence.py` and `BrokerGateway`, preserving native identity, timestamps, and `RECONCILIATION_UNCERTAIN`. Never derive cash as `equity - unrealized_pnl` or treat REST snapshots as coherent history. Legacy `planner.py`, `prop-production-planner.service`, and V4 T0+300 receivers were removed in Phase D (see [CHANGELOG.md](CHANGELOG.md)).
-- **Bybit Demo:** Independently authenticated read-only observer (`BYBIT_MODE=read_only`, pinned `BybitClient`, explicit Demo UID/key/endpoint). Never fall back to `BYBIT_PROP_*` or mainnet/testnet credentials. See [Bybit Demo integration](docs/BYBIT-DEMO-INTEGRATION.md).
-- **Execution Session diagnostics:** `prop-production session --path` is a strictly read-only, unverified-claims diagnostic—never a broker permit, financial attestation, or HALT-clear signal. Native Propr order authority is currently unavailable. See [Execution Session v1](docs/EXECUTION-SESSION-20261111.md).
+- **Domain split:** `packages/copytrade-kernel` (shared decision engine, `RulebookCatalog`, `account_step`, Q14–Q24 mandates), Account Guardian finance, and durable intents belong here (`copytrade-pm` owns `FactStore`/`RosterStore`; `trading-connector` owns provider transports). Never place network I/O inside a SQL transaction or let a connector journal replace a Guardian intent.
+- **Explicit typed transitions:** Keep explicit predecessor/trigger/guard/next-state/durable-effect contracts (`CWSA V3 -> checkpoint review -> durable intent -> BrokerGateway`). Commit reservations and intent before dispatch; persist `HALT` across restart and midnight; treat unknown outcomes as outstanding risk and missing evidence as `BLOCKED`.
+- **Sizing (`FIXED_K_NATIVE_QUANTITY`):** Target notional is `k * leader native qty * source mark` at an independent follower quote; `source nav=null` is valid.
 
-## Checkpoint lifecycle & sizing
+## Context pointers
 
-- **Explicit transitions only:** Keep typed predecessor/trigger/guard/next-state/durable-effect contracts; never build implicit FSMs over `is_active`, `ready`, age, missing rows, or service health. Existing broker order journals remain the only protected financial truth: shared CWSA continuity does not reset on single-mandate change, and HALTs/unknown orders cannot clear from source health. See [CWSA/Guardian design ADR](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md), [adversarial acceptance map](docs/CANONICAL-5M-ACCEPTANCE-20261112.md), [integration evidence](docs/CHECKPOINT-INTEGRATION-325.md), and [nonactivating release/recovery contract](docs/CHECKPOINT-SHADOW-RELEASE-327.md).
-- **Default sizing (`FIXED_K_NATIVE_QUANTITY`):** Follower target notional is `k * leader native qty * source mark`, sized at an independent follower quote and Guardian risk-checked. `source nav=null` is valid and MUST NOT fail on `SOURCE_NAV` or trigger parent/subaccount/Vike NAV reconstruction. Enforce signed releases, causal clocks, risk/drawdown/margin/HALT gates, and note gap/slippage around pod stops. See [sizing policy](docs/SIZING-POLICY.md).
-
-## Verification & deployment
-
-- **Pins & local gates:** `src/prop_production/compatibility.json` is the sole companion/schema pin authority. Before merge, run commit-bound local verification with both pinned companions per [local verification](docs/LOCAL-VERIFICATION.md).
-- **Invariants under test:** Exercise `CLI`, `CWSA V3 -> checkpoint review -> durable intent -> BrokerGateway` with exact decimal accounting. Commit reservations and intent before dispatch; unknown outcome is not failure; persist `HALT` across restart and midnight; missing evidence is `BLOCKED`. Outside Judge must never import Guardian risk or finance as its oracle.
-- **Protected installation:** Follow [deployment runbook](docs/DEPLOYMENT-RUNBOOK.md). Bundle app, connector, and units together, use named rollback without rewinding journals or the trust floor, use `deployment retire-predecessor` (`predecessor_retirement_v1`) when advancing across a FENCED durable-contract boundary, and verify live process/release identity rather than symlink presence. Keep `IMPLEMENTED`, `ENGINEERING_VERIFIED`, `DEPLOYED`, `RUNNING_OBSERVED`, `SCIENTIFICALLY_QUALIFIED`, and `TRADING_AUTHORIZED` distinct when closing tickets.
+| Branch | Read first |
+|---|---|
+| Architecture, recent Phase-D changes, shared kernel | [README.md](README.md), [CHANGELOG.md](CHANGELOG.md), [packages/copytrade-kernel/README.md](packages/copytrade-kernel/README.md) |
+| Capability-scoped gates, sizing policy, challenge rulebooks | [docs/CAPABILITY-SCOPED-READINESS-20261107.md](docs/CAPABILITY-SCOPED-READINESS-20261107.md), [docs/SIZING-POLICY.md](docs/SIZING-POLICY.md), [docs/CHALLENGE-RULEBOOKS.md](docs/CHALLENGE-RULEBOOKS.md) |
+| CWSA V3 / Guardian lifecycle, acceptance, release & recovery | [docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md](docs/ADR-CANONICAL-5M-CHECKPOINT-GRILL-20261111.md), [docs/CANONICAL-5M-ACCEPTANCE-20261112.md](docs/CANONICAL-5M-ACCEPTANCE-20261112.md), [docs/CHECKPOINT-INTEGRATION-325.md](docs/CHECKPOINT-INTEGRATION-325.md), [docs/CHECKPOINT-SHADOW-RELEASE-327.md](docs/CHECKPOINT-SHADOW-RELEASE-327.md) |
+| Propr read-only evidence (`BrokerGateway`, never derive cash as `equity - unrealized_pnl`) | [docs/NATIVE-CONNECTOR-INTEGRATION.md](docs/NATIVE-CONNECTOR-INTEGRATION.md) |
+| Bybit Demo observer (`BYBIT_MODE=read_only`, dedicated Demo credentials) | [docs/BYBIT-DEMO-INTEGRATION.md](docs/BYBIT-DEMO-INTEGRATION.md) |
+| Read-only session diagnostics (`prop-production session --path`) | [docs/EXECUTION-SESSION-20261111.md](docs/EXECUTION-SESSION-20261111.md) |
+| Local verification (`bash scripts/verify-local.sh app|all`) | [docs/LOCAL-VERIFICATION.md](docs/LOCAL-VERIFICATION.md) |
+| Protected deployment (`deploy/install.sh`, `deployment retire-predecessor`, non-rewinding rollback) | [docs/DEPLOYMENT-RUNBOOK.md](docs/DEPLOYMENT-RUNBOOK.md) |
