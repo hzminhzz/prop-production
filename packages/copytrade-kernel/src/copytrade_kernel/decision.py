@@ -83,6 +83,7 @@ class DecisionInputs:
     market: MarketContext
     policy: RiskPolicy
     now_ms: DecisionMs
+    deadband_sub_lot: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +156,7 @@ def plan_execution(
             quotes,
             frozen,
             permits=permits,
+            deadband_sub_lot=inputs.deadband_sub_lot,
         )
     except ValueError as exc:
         return ExecutionDecision(frozen_risk, None, str(exc), ())

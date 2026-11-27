@@ -3,9 +3,17 @@
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 from typing import Any, Literal
 
 from .money import add, decimal
+
+
+def _is_sub_lot(quantity: Decimal, spec: dict[str, Any], quote: dict[str, Any]) -> bool:
+    executable = decimal(quote["ask"] if quantity > 0 else quote["bid"])
+    return abs(quantity) < decimal(spec["min_qty"]) or abs(quantity * executable) < decimal(
+        spec["min_notional"]
+    )
 
 
 @dataclass(frozen=True)
@@ -57,6 +65,7 @@ def project(
     version: Literal[
         "checkpoint_execution_projection_v1", "checkpoint_execution_projection_v2"
     ] = "checkpoint_execution_projection_v2",
+    deadband_sub_lot: bool = False,
 ) -> dict[str, Any]:
     if version not in {
         "checkpoint_execution_projection_v1",
@@ -114,6 +123,32 @@ def project(
         market: str(add(*(decimal(book.get(market, "0")) for book in books.values())))
         for market in all_markets
     }
+    if deadband_sub_lot:
+        for market in all_markets:
+            if market in fenced_markets:
+                continue
+            old = decimal(state["positions"].get(market, "0"))
+            target = decimal(targets[market])
+            quantity = add(target, -old)
+            if not quantity or target == 0:
+                continue
+            spec = markets[market]
+            step = decimal(spec["qty_step"])
+            if quantity % step:
+                continue
+            if _is_sub_lot(quantity, spec, quotes[market]):
+                for owner in sorted(set(books) | set(state["pod_positions"])):
+                    if owner in frozen:
+                        continue
+                    prev = state["pod_positions"].get(owner, {}).get(market)
+                    if prev is None or decimal(prev) == 0:
+                        if owner in books:
+                            books[owner].pop(market, None)
+                    else:
+                        books.setdefault(owner, {})[market] = prev
+                targets[market] = str(
+                    add(*(decimal(book.get(market, "0")) for book in books.values()))
+                )
     reducing = {}
     for market in all_markets:
         old, target = decimal(state["positions"].get(market, "0")), decimal(targets[market])
@@ -138,12 +173,7 @@ def project(
                 raise ValueError("INDEPENDENT_ENTRY_BASIS_UNQUALIFIED")
         spec = markets[market]
         step = decimal(spec["qty_step"])
-        executable = decimal(quotes[market]["ask"] if quantity > 0 else quotes[market]["bid"])
-        if (
-            quantity % step
-            or abs(quantity) < decimal(spec["min_qty"])
-            or abs(quantity * executable) < decimal(spec["min_notional"])
-        ):
+        if quantity % step or _is_sub_lot(quantity, spec, quotes[market]):
             raise ValueError("NATIVE_ADJUSTMENT_LOT")
     return ExecutionProjection(
         version,
